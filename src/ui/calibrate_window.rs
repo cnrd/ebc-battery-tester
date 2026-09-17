@@ -1,5 +1,5 @@
+use crate::core::{ApiCommand, CalibrationCommand};
 use crate::device;
-use crate::device::OutboundFrame;
 use crate::session::DeviceSession;
 
 #[derive(Default)]
@@ -41,7 +41,10 @@ impl CalibrateWindow {
                     );
                     if ui.button("Calibrate").clicked() {
                         let mv = (self.voltage_low * 1000.0) as u16;
-                        session.send_cmd(OutboundFrame::CalibrateVoltageLow(mv), ui.ctx());
+                        session.send_command(
+                            ApiCommand::Calibration(CalibrationCommand::VoltageLow(mv)),
+                            ui.ctx(),
+                        );
                     }
                     ui.end_row();
                     ui.label("High (~4 V):");
@@ -55,7 +58,10 @@ impl CalibrateWindow {
                     );
                     if ui.button("Calibrate").clicked() {
                         let mv = (self.voltage_high * 1000.0) as u16;
-                        session.send_cmd(OutboundFrame::CalibrateVoltageHigh(mv), ui.ctx());
+                        session.send_command(
+                            ApiCommand::Calibration(CalibrationCommand::VoltageHigh(mv)),
+                            ui.ctx(),
+                        );
                     }
                     ui.end_row();
                 });
@@ -89,7 +95,10 @@ impl CalibrateWindow {
                         .clicked()
                     {
                         let ma = (self.current_low * 1000.0) as u16;
-                        session.send_cmd(OutboundFrame::CalibrateCurrentLow(ma), ui.ctx());
+                        session.send_command(
+                            ApiCommand::Calibration(CalibrationCommand::CurrentLow(ma)),
+                            ui.ctx(),
+                        );
                     }
                     ui.end_row();
                     ui.label("High (~2 A):");
@@ -107,7 +116,10 @@ impl CalibrateWindow {
                         .clicked()
                     {
                         let ma = (self.current_high * 1000.0) as u16;
-                        session.send_cmd(OutboundFrame::CalibrateCurrentHigh(ma), ui.ctx());
+                        session.send_command(
+                            ApiCommand::Calibration(CalibrationCommand::CurrentHigh(ma)),
+                            ui.ctx(),
+                        );
                     }
                     ui.end_row();
                 });
@@ -125,7 +137,10 @@ impl CalibrateWindow {
                             self.open = false;
                         }
                         if ui.button("OK").clicked() {
-                            session.send_cmd(OutboundFrame::CalibrateConfirm, ui.ctx());
+                            session.send_command(
+                                ApiCommand::Calibration(CalibrationCommand::Confirm),
+                                ui.ctx(),
+                            );
                             self.open = false;
                         }
                     });

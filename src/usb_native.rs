@@ -1,9 +1,8 @@
 use std::io::{Read as _, Write as _};
 
-use crate::device::{
-    ConnectionStatus, DeviceEvent, OUTBOUND_FRAME_SIZE, OutboundFrame, UsbDeviceInfo,
-};
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use crate::device::{ConnectionStatus, OUTBOUND_FRAME_SIZE, OutboundFrame, UsbDeviceInfo};
+use crate::transport::{DeviceEvent, EventSender, TransportCommand};
+use futures::channel::mpsc::UnboundedReceiver;
 use serialport::SerialPortType;
 
 const BAUD_RATE: u32 = 9600;
@@ -14,7 +13,7 @@ pub const fn is_remote_transport() -> bool {
 }
 
 #[expect(clippy::needless_pass_by_value)]
-pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
+pub fn enumerate_devices(event_tx: EventSender) {
     let all_ports = serialport::available_ports().unwrap_or_default();
     log::debug!("All serial ports: {all_ports:?}");
     let devices = all_ports
@@ -33,17 +32,11 @@ pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
             None
         })
         .collect();
-    event_tx
-        .unbounded_send(DeviceEvent::DevicesUpdated(devices))
-        .ok();
+    event_tx.send(DeviceEvent::DevicesUpdated(devices));
 }
 
-pub fn spawn_device_worker(
-    ctx: egui::Context,
-    cmd_rx: UnboundedReceiver<OutboundFrame>,
-    event_tx: UnboundedSender<DeviceEvent>,
-) {
-    std::thread::spawn(move || device_thread(ctx, cmd_rx, event_tx));
+pub fn spawn_device_worker(cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: EventSender) {
+    std::thread::spawn(move || device_thread(cmd_rx, event_tx));
 }
 
 fn find_ch340_port(idx: usize) -> Option<String> {
@@ -71,43 +64,27 @@ fn connect(idx: usize) -> Result<Box<dyn serialport::SerialPort>, String> {
 }
 
 #[expect(clippy::needless_pass_by_value)]
-fn device_thread(
-    ctx: egui::Context,
-    mut cmd_rx: UnboundedReceiver<OutboundFrame>,
-    event_tx: UnboundedSender<DeviceEvent>,
-) -> ! {
+fn device_thread(mut cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: EventSender) -> ! {
     let mut port: Option<Box<dyn serialport::SerialPort>> = None;
     let mut buffer: Vec<u8> = Vec::new();
 
     loop {
         loop {
             match cmd_rx.try_recv() {
-                Ok(OutboundFrame::Connect(idx)) => {
-                    event_tx
-                        .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Connecting))
-                        .ok();
-                    ctx.request_repaint();
+                Ok(TransportCommand::Connect(idx)) => {
+                    event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Connecting));
                     match connect(idx) {
                         Ok(p) => {
                             port = Some(p);
-                            event_tx
-                                .unbounded_send(DeviceEvent::StatusChanged(
-                                    ConnectionStatus::Connected,
-                                ))
-                                .ok();
+                            event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Connected));
                         }
                         Err(e) => {
                             log::error!("Failed to connect: {e}");
-                            event_tx
-                                .unbounded_send(DeviceEvent::StatusChanged(
-                                    ConnectionStatus::Error(e),
-                                ))
-                                .ok();
+                            event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(e)));
                         }
                     }
-                    ctx.request_repaint();
                 }
-                Ok(OutboundFrame::Disconnect) => {
+                Ok(TransportCommand::Disconnect) => {
                     if let Some(ref mut p) = port {
                         let bytes: [u8; OUTBOUND_FRAME_SIZE] = OutboundFrame::Disconnect.into();
                         if let Err(e) = p.write_all(&bytes) {
@@ -116,12 +93,9 @@ fn device_thread(
                     }
                     port = None;
                     buffer.clear();
-                    event_tx
-                        .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Disconnected))
-                        .ok();
-                    ctx.request_repaint();
+                    event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Disconnected));
                 }
-                Ok(frame) => {
+                Ok(TransportCommand::Protocol(frame)) => {
                     if let Some(ref mut p) = port {
                         let bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
                         if let Err(e) = p.write_all(&bytes) {
@@ -129,6 +103,7 @@ fn device_thread(
                         }
                     }
                 }
+                Ok(TransportCommand::Remote(_)) => {}
                 Err(_) => break,
             }
         }
@@ -139,8 +114,7 @@ fn device_thread(
                 Ok(n) if n > 0 => {
                     buffer.extend_from_slice(&temp_buffer[..n]);
                     for (frame, raw) in crate::device::process_buffer(&mut buffer) {
-                        event_tx.unbounded_send(DeviceEvent::Frame(frame, raw)).ok();
-                        ctx.request_repaint();
+                        event_tx.send(DeviceEvent::Frame(frame, raw));
                     }
                 }
                 Ok(_) => {}
@@ -149,12 +123,9 @@ fn device_thread(
                     log::error!("Serial read error: {e}");
                     port = None;
                     buffer.clear();
-                    event_tx
-                        .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
-                            "Read error: connection lost".to_owned(),
-                        )))
-                        .ok();
-                    ctx.request_repaint();
+                    event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
+                        "Read error: connection lost".to_owned(),
+                    )));
                 }
             }
         } else {

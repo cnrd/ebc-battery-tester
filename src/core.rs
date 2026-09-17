@@ -6,7 +6,6 @@ use crate::device::{
     DeviceMode, MAX_CHARGE_CURRENT_MA, MAX_CHARGE_CUTOFF_CURRENT_MA, MAX_CUTOFF_TIME_MIN,
     MAX_DISCHARGE_CURRENT_MA, MAX_POWER_W, MAX_VOLTAGE_MV, MIN_CHARGE_CURRENT_MA,
     MIN_CHARGE_CUTOFF_CURRENT_MA, MIN_DISCHARGE_CURRENT_MA, MIN_POWER_W, MIN_VOLTAGE_MV,
-    OutboundFrame,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -251,71 +250,6 @@ pub enum ApiCommand {
     Calibration(CalibrationCommand),
 }
 
-impl ApiCommand {
-    /// Converts a direct protocol command into its remote API equivalent.
-    /// Browser-owned timer synchronization is deliberately omitted.
-    pub fn from_outbound(frame: &OutboundFrame) -> Option<Self> {
-        match *frame {
-            OutboundFrame::Connect(_) => Some(Self::Connect),
-            OutboundFrame::Disconnect => Some(Self::Disconnect),
-            OutboundFrame::Stop => Some(Self::Stop),
-            OutboundFrame::StartConstantCurrentDischarge(
-                current_ma,
-                cutoff_voltage_mv,
-                cutoff_time_min,
-            ) => Some(Self::Start(TestConfiguration::DischargeConstantCurrent {
-                current_ma,
-                cutoff_voltage_mv,
-                cutoff_time_min,
-            })),
-            OutboundFrame::AdjustConstantCurrentDischarge(
-                current_ma,
-                cutoff_voltage_mv,
-                cutoff_time_min,
-            ) => Some(Self::Adjust(TestConfiguration::DischargeConstantCurrent {
-                current_ma,
-                cutoff_voltage_mv,
-                cutoff_time_min,
-            })),
-            OutboundFrame::StartConstantPowerDischarge(
-                power_w,
-                cutoff_voltage_mv,
-                cutoff_time_min,
-            ) => Some(Self::Start(TestConfiguration::DischargeConstantPower {
-                power_w,
-                cutoff_voltage_mv,
-                cutoff_time_min,
-            })),
-            OutboundFrame::StartConstantVoltageCharge(
-                current_ma,
-                voltage_mv,
-                cutoff_current_ma,
-            ) => Some(Self::Start(TestConfiguration::ChargeConstantVoltage {
-                current_ma,
-                voltage_mv,
-                cutoff_current_ma,
-            })),
-            OutboundFrame::ContinueConstantCurrentDischarge(..)
-            | OutboundFrame::ContinueConstantPowerDischarge(..)
-            | OutboundFrame::ContinueConstantVoltageCharge(..) => Some(Self::Resume),
-            OutboundFrame::TimerSync(_) => None,
-            OutboundFrame::CalibrateVoltageLow(value) => {
-                Some(Self::Calibration(CalibrationCommand::VoltageLow(value)))
-            }
-            OutboundFrame::CalibrateVoltageHigh(value) => {
-                Some(Self::Calibration(CalibrationCommand::VoltageHigh(value)))
-            }
-            OutboundFrame::CalibrateCurrentLow(value) => {
-                Some(Self::Calibration(CalibrationCommand::CurrentLow(value)))
-            }
-            OutboundFrame::CalibrateCurrentHigh(value) => {
-                Some(Self::Calibration(CalibrationCommand::CurrentHigh(value)))
-            }
-            OutboundFrame::CalibrateConfirm => Some(Self::Calibration(CalibrationCommand::Confirm)),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationError {
     pub field: String,
@@ -402,22 +336,14 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn websocket_events_and_remote_commands_round_trip() {
-        let command =
-            ApiCommand::from_outbound(&OutboundFrame::StartConstantPowerDischarge(20, 3000, 45));
-        assert_eq!(
-            command,
-            Some(ApiCommand::Start(
-                TestConfiguration::DischargeConstantPower {
-                    power_w: 20,
-                    cutoff_voltage_mv: 3000,
-                    cutoff_time_min: 45,
-                }
-            ))
-        );
-        assert_eq!(
-            ApiCommand::from_outbound(&OutboundFrame::TimerSync(1)),
-            None
-        );
+        let command = ApiCommand::Start(TestConfiguration::DischargeConstantPower {
+            power_w: 20,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 45,
+        });
+        let json = serde_json::to_string(&command).expect("serialize command");
+        let decoded: ApiCommand = serde_json::from_str(&json).expect("deserialize command");
+        assert_eq!(decoded, command);
 
         let event = WebSocketEvent::Snapshot(AuthoritativeSnapshot::default());
         let json = serde_json::to_string(&event).expect("serialize event");

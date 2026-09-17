@@ -1,5 +1,5 @@
+use crate::core::{ApiCommand, TestConfiguration};
 use crate::device;
-use crate::device::OutboundFrame;
 use crate::session::DeviceSession;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -153,66 +153,57 @@ impl ControlPanel {
                     .add_enabled(session.can_stop(), egui::Button::new("Stop"))
                     .clicked()
                 {
-                    session.send_cmd(OutboundFrame::Stop, ui.ctx());
-                    session.stop_mode();
+                    session.send_command(ApiCommand::Stop, ui.ctx());
                 }
             } else if ui
                 .add_enabled(session.can_start(), egui::Button::new("Start"))
                 .on_disabled_hover_text("Connect the device to a battery first")
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::StartConstantCurrentDischarge(
-                        (self.discharge_current * 1000.0) as u16,
-                        (self.discharge_cutoff_voltage * 1000.0) as u16,
-                        if self.discharge_time_enabled {
+                session.send_command(
+                    ApiCommand::Start(TestConfiguration::DischargeConstantCurrent {
+                        current_ma: (self.discharge_current * 1000.0) as u16,
+                        cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
+                        cutoff_time_min: if self.discharge_time_enabled {
                             self.discharge_time
                         } else {
                             device::MIN_CUTOFF_TIME_MIN
                         },
-                    ),
+                    }),
                     ui.ctx(),
                 );
-                session.start_mode();
             }
             if ui
                 .add_enabled(session.can_resume(), egui::Button::new("Continue"))
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::ContinueConstantCurrentDischarge(
-                        (self.discharge_current * 1000.0) as u16,
-                        (self.discharge_cutoff_voltage * 1000.0) as u16,
-                        if self.discharge_time_enabled {
+                session.resume(
+                    TestConfiguration::DischargeConstantCurrent {
+                        current_ma: (self.discharge_current * 1000.0) as u16,
+                        cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
+                        cutoff_time_min: if self.discharge_time_enabled {
                             self.discharge_time
                         } else {
                             device::MIN_CUTOFF_TIME_MIN
                         },
-                    ),
+                    },
                     ui.ctx(),
                 );
-                session.continue_mode();
             }
             if ui
-                .add_enabled(
-                    session.has_live_voltage()
-                        && session.mode_on
-                        && session.current_device_mode
-                            == Some(device::DeviceMode::DischargeConstantCurrent),
-                    egui::Button::new("Adjust"),
-                )
+                .add_enabled(session.can_adjust(), egui::Button::new("Adjust"))
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::AdjustConstantCurrentDischarge(
-                        (self.discharge_current * 1000.0) as u16,
-                        (self.discharge_cutoff_voltage * 1000.0) as u16,
-                        if self.discharge_time_enabled {
+                session.send_command(
+                    ApiCommand::Adjust(TestConfiguration::DischargeConstantCurrent {
+                        current_ma: (self.discharge_current * 1000.0) as u16,
+                        cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
+                        cutoff_time_min: if self.discharge_time_enabled {
                             self.discharge_time
                         } else {
                             device::MIN_CUTOFF_TIME_MIN
                         },
-                    ),
+                    }),
                     ui.ctx(),
                 );
             }
@@ -262,45 +253,42 @@ impl ControlPanel {
                     .add_enabled(session.can_stop(), egui::Button::new("Stop"))
                     .clicked()
                 {
-                    session.send_cmd(OutboundFrame::Stop, ui.ctx());
-                    session.stop_mode();
+                    session.send_command(ApiCommand::Stop, ui.ctx());
                 }
             } else if ui
                 .add_enabled(session.can_start(), egui::Button::new("Start"))
                 .on_disabled_hover_text("Connect device to battery first")
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::StartConstantPowerDischarge(
-                        self.discharge_watts,
-                        (self.discharge_cutoff_voltage * 1000.0) as u16,
-                        if self.discharge_time_enabled {
+                session.send_command(
+                    ApiCommand::Start(TestConfiguration::DischargeConstantPower {
+                        power_w: self.discharge_watts,
+                        cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
+                        cutoff_time_min: if self.discharge_time_enabled {
                             self.discharge_time
                         } else {
                             device::MIN_CUTOFF_TIME_MIN
                         },
-                    ),
+                    }),
                     ui.ctx(),
                 );
-                session.start_mode();
             }
             if ui
                 .add_enabled(session.can_resume(), egui::Button::new("Continue"))
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::ContinueConstantPowerDischarge(
-                        self.discharge_watts,
-                        (self.discharge_cutoff_voltage * 1000.0) as u16,
-                        if self.discharge_time_enabled {
+                session.resume(
+                    TestConfiguration::DischargeConstantPower {
+                        power_w: self.discharge_watts,
+                        cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
+                        cutoff_time_min: if self.discharge_time_enabled {
                             self.discharge_time
                         } else {
                             device::MIN_CUTOFF_TIME_MIN
                         },
-                    ),
+                    },
                     ui.ctx(),
                 );
-                session.continue_mode();
             }
         });
     }
@@ -353,37 +341,34 @@ impl ControlPanel {
                     .add_enabled(session.can_stop(), egui::Button::new("Stop"))
                     .clicked()
                 {
-                    session.send_cmd(OutboundFrame::Stop, ui.ctx());
-                    session.stop_mode();
+                    session.send_command(ApiCommand::Stop, ui.ctx());
                 }
             } else if ui
                 .add_enabled(session.can_start(), egui::Button::new("Start"))
                 .on_disabled_hover_text("Connect device to battery first")
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::StartConstantVoltageCharge(
-                        (self.charge_current * 1000.0) as u16,
-                        (self.charge_voltage * 1000.0) as u16,
-                        (self.charge_cutoff_current * 1000.0) as u16,
-                    ),
+                session.send_command(
+                    ApiCommand::Start(TestConfiguration::ChargeConstantVoltage {
+                        current_ma: (self.charge_current * 1000.0) as u16,
+                        voltage_mv: (self.charge_voltage * 1000.0) as u16,
+                        cutoff_current_ma: (self.charge_cutoff_current * 1000.0) as u16,
+                    }),
                     ui.ctx(),
                 );
-                session.start_mode();
             }
             if ui
                 .add_enabled(session.can_resume(), egui::Button::new("Continue"))
                 .clicked()
             {
-                session.send_cmd(
-                    OutboundFrame::ContinueConstantVoltageCharge(
-                        (self.charge_current * 1000.0) as u16,
-                        (self.charge_voltage * 1000.0) as u16,
-                        (self.charge_cutoff_current * 1000.0) as u16,
-                    ),
+                session.resume(
+                    TestConfiguration::ChargeConstantVoltage {
+                        current_ma: (self.charge_current * 1000.0) as u16,
+                        voltage_mv: (self.charge_voltage * 1000.0) as u16,
+                        cutoff_current_ma: (self.charge_cutoff_current * 1000.0) as u16,
+                    },
                     ui.ctx(),
                 );
-                session.continue_mode();
             }
         });
     }

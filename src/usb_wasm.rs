@@ -1,5 +1,6 @@
-use crate::device::{ConnectionStatus, DeviceEvent, OutboundFrame, UsbDeviceInfo};
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use crate::device::{ConnectionStatus, UsbDeviceInfo};
+use crate::transport::{DeviceEvent, EventSender, TransportCommand};
+use futures::channel::mpsc::UnboundedReceiver;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_futures::JsFuture;
 
@@ -29,7 +30,7 @@ pub fn is_remote_transport() -> bool {
     ) == crate::session::TransportMode::Remote
 }
 
-pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
+pub fn enumerate_devices(event_tx: EventSender) {
     if is_remote_transport() {
         return;
     }
@@ -40,11 +41,9 @@ pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
         let usb = window.navigator().usb();
         if usb.is_undefined() {
             log::error!("WebUSB API not supported in this browser");
-            event_tx
-                .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
-                    "WebUSB API not supported".to_owned(),
-                )))
-                .ok();
+            event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
+                "WebUSB API not supported".to_owned(),
+            )));
             return;
         }
         match JsFuture::from(usb.get_devices()).await {
@@ -59,23 +58,19 @@ pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
                         product_id: device.product_id(),
                     });
                 }
-                event_tx
-                    .unbounded_send(DeviceEvent::DevicesUpdated(devices))
-                    .ok();
+                event_tx.send(DeviceEvent::DevicesUpdated(devices));
             }
             Err(e) => {
                 log::error!("Failed to enumerate USB devices: {e:?}");
-                event_tx
-                    .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
-                        format!("Failed to enumerate USB devices: {e:?}"),
-                    )))
-                    .ok();
+                event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
+                    format!("Failed to enumerate USB devices: {e:?}"),
+                )));
             }
         }
     });
 }
 
-pub fn request_device(event_tx: UnboundedSender<DeviceEvent>) {
+pub fn request_device(event_tx: EventSender) {
     if is_remote_transport() {
         return;
     }
@@ -96,14 +91,10 @@ pub fn request_device(event_tx: UnboundedSender<DeviceEvent>) {
     });
 }
 
-pub fn spawn_device_worker(
-    ctx: egui::Context,
-    cmd_rx: UnboundedReceiver<OutboundFrame>,
-    event_tx: UnboundedSender<DeviceEvent>,
-) {
+pub fn spawn_device_worker(cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: EventSender) {
     if is_remote_transport() {
-        wasm_bindgen_futures::spawn_local(remote::remote_task(ctx, cmd_rx, event_tx));
+        wasm_bindgen_futures::spawn_local(remote::remote_task(cmd_rx, event_tx));
     } else {
-        wasm_bindgen_futures::spawn_local(worker::device_task(ctx, cmd_rx, event_tx));
+        wasm_bindgen_futures::spawn_local(worker::device_task(cmd_rx, event_tx));
     }
 }

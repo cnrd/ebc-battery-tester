@@ -493,49 +493,6 @@ impl TryFrom<&[u8]> for InboundFrame {
     }
 }
 
-pub enum DeviceEvent {
-    StatusChanged(ConnectionStatus),
-    // Vec of available devices.
-    DevicesUpdated(Vec<UsbDeviceInfo>),
-    Frame(InboundFrame, Vec<u8>),
-    RemoteConnectionChanged(RemoteConnectionStatus),
-    Remote(crate::core::WebSocketEvent),
-    RemoteCommandSucceeded,
-    RemoteCommandError(String),
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteConnectionStatus {
-    #[default]
-    NotUsed,
-    Connecting,
-    Connected,
-    Reconnecting,
-    Error(String),
-}
-
-impl std::fmt::Debug for DeviceEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StatusChanged(s) => f.debug_tuple("StatusChanged").field(s).finish(),
-            Self::DevicesUpdated(d) => f.debug_tuple("DevicesUpdated").field(d).finish(),
-            Self::Frame(frame, _) => {
-                write!(f, "Frame({frame:?})")
-            }
-            Self::RemoteConnectionChanged(status) => f
-                .debug_tuple("RemoteConnectionChanged")
-                .field(status)
-                .finish(),
-            Self::Remote(event) => f.debug_tuple("Remote").field(event).finish(),
-            Self::RemoteCommandSucceeded => write!(f, "RemoteCommandSucceeded"),
-            Self::RemoteCommandError(error) => {
-                f.debug_tuple("RemoteCommandError").field(error).finish()
-            }
-        }
-    }
-}
-
 pub fn process_buffer(buf: &mut Vec<u8>) -> Vec<(InboundFrame, Vec<u8>)> {
     let mut frames = Vec::new();
     loop {

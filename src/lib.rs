@@ -13,6 +13,7 @@ mod update_check;
 
 #[cfg(feature = "gui")]
 mod app;
+pub mod controller;
 pub mod core;
 pub mod device;
 #[cfg(feature = "gui")]
@@ -21,6 +22,8 @@ mod export;
 pub mod server;
 #[cfg(feature = "gui")]
 mod session;
+#[cfg(feature = "gui")]
+mod transport;
 #[cfg(feature = "gui")]
 mod ui;
 #[cfg(feature = "gui")]

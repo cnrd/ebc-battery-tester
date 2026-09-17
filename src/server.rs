@@ -23,6 +23,7 @@ use tokio::{fs as tokio_fs, io::AsyncReadExt as _};
 use tokio_util::io::ReaderStream;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::controller::{ControllerMode, DeviceReport, ReportState, TestController};
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, RunSummary, Sample,
     ServerConnectionState, SnapshotUpdate, TestConfiguration, TestState, WebSocketEvent,
@@ -33,10 +34,6 @@ const SNAPSHOT_CHANNEL_CAPACITY: usize = 16;
 const SNAPSHOT_SAMPLE_LIMIT: usize = 5_000;
 const SERIAL_TIMEOUT: Duration = Duration::from_millis(20);
 const ACTOR_TICK: Duration = Duration::from_millis(100);
-const CAPACITY_MODULUS_MAH: u64 = 57_600;
-const CAPACITY_WRAP_HIGH_WATER: u16 = 43_200;
-const CAPACITY_WRAP_LOW_WATER: u16 = 14_400;
-const MAX_TIMER_MINUTES: u64 = device::MAX_TIMER_SYNC_MINUTES as u64;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -108,203 +105,6 @@ struct ExportDescriptor {
 struct ActorMessage {
     request: ActorRequest,
     response: oneshot::Sender<Result<ActorResponse, String>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PhysicalState {
-    Unknown,
-    Active,
-    Inactive,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReportState {
-    Idle,
-    Active,
-    Finished,
-    InactiveUnknown,
-}
-
-impl From<device::ModeReportState> for ReportState {
-    fn from(state: device::ModeReportState) -> Self {
-        match state {
-            device::ModeReportState::Idle => Self::Idle,
-            device::ModeReportState::Active => Self::Active,
-            device::ModeReportState::Finished => Self::Finished,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lifecycle {
-    Idle,
-    RecoveredUncertain,
-    Starting,
-    RunningOwned,
-    Stopping,
-}
-
-#[derive(Default)]
-struct CalibrationStaging {
-    references: [bool; 4],
-}
-
-impl CalibrationStaging {
-    fn complete(&self) -> bool {
-        self.references.iter().all(|staged| *staged)
-    }
-}
-
-struct TestClock {
-    running_since: Option<Instant>,
-    accumulated: Duration,
-    last_sync_minute: u64,
-}
-
-impl TestClock {
-    fn new(elapsed_seconds: u64) -> Self {
-        Self {
-            running_since: None,
-            accumulated: Duration::from_secs(elapsed_seconds),
-            last_sync_minute: elapsed_seconds / 60,
-        }
-    }
-
-    fn start_fresh(&mut self) {
-        self.running_since = Some(Instant::now());
-        self.accumulated = Duration::ZERO;
-        self.last_sync_minute = 0;
-    }
-
-    fn resume(&mut self) {
-        if self.running_since.is_none() {
-            self.running_since = Some(Instant::now());
-        }
-    }
-
-    fn stop(&mut self) {
-        if let Some(started) = self.running_since.take() {
-            self.accumulated += started.elapsed();
-        }
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.running_since.map_or(self.accumulated, |started| {
-            self.accumulated + started.elapsed()
-        })
-    }
-
-    fn next_timer_sync(&mut self) -> Option<u16> {
-        let minute = self.elapsed().as_secs() / 60;
-        if self.running_since.is_some() && minute > self.last_sync_minute {
-            self.last_sync_minute = minute;
-            (minute <= MAX_TIMER_MINUTES).then_some(minute as u16)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct EnergyReading {
-    elapsed_seconds: f64,
-    power_w: f64,
-}
-
-struct EnergyAccumulator {
-    energy_wh: f64,
-    previous: Option<EnergyReading>,
-}
-
-impl EnergyAccumulator {
-    fn from_snapshot(snapshot: &AuthoritativeSnapshot) -> Self {
-        let previous = snapshot.history.last().map(|sample| EnergyReading {
-            elapsed_seconds: sample.elapsed_seconds as f64,
-            power_w: sample.voltage_mv as f64 * sample.current_ma as f64 / 1_000_000.0,
-        });
-        Self {
-            energy_wh: snapshot.test.energy_wh,
-            previous,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.energy_wh = 0.0;
-        self.previous = None;
-    }
-
-    fn break_gap(&mut self) {
-        self.previous = None;
-    }
-
-    /// Integrates power using the trapezoidal rule over backend elapsed time.
-    fn add(&mut self, elapsed_seconds: f64, voltage_mv: u16, current_ma: u16) -> f64 {
-        let power_w = voltage_mv as f64 * current_ma as f64 / 1_000_000.0;
-        if let Some(previous) = self.previous {
-            let delta_seconds = elapsed_seconds - previous.elapsed_seconds;
-            if delta_seconds > 0.0 {
-                self.energy_wh += (previous.power_w + power_w) * 0.5 * delta_seconds / 3600.0;
-            }
-        }
-        self.previous = Some(EnergyReading {
-            elapsed_seconds,
-            power_w,
-        });
-        self.energy_wh
-    }
-}
-
-struct CapacityAccumulator {
-    capacity_mah: u64,
-    previous_raw: Option<u16>,
-}
-
-impl CapacityAccumulator {
-    fn from_snapshot(snapshot: &AuthoritativeSnapshot) -> Self {
-        let persisted_capacity = snapshot.test.capacity_mah.unwrap_or(0);
-        let capacity_mah = snapshot
-            .history
-            .last()
-            .map_or(persisted_capacity, |sample| {
-                sample.capacity_mah.max(persisted_capacity)
-            });
-        let previous_raw = snapshot
-            .history
-            .last()
-            .map_or(snapshot.device.capacity_mah, |sample| {
-                u16::try_from(sample.capacity_mah % CAPACITY_MODULUS_MAH).ok()
-            });
-        Self {
-            capacity_mah,
-            previous_raw,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.capacity_mah = 0;
-        self.previous_raw = None;
-    }
-
-    fn observe(&mut self, raw: u16, allow_wrap: bool) -> u64 {
-        let Some(previous) = self.previous_raw else {
-            self.previous_raw = Some(raw);
-            self.capacity_mah = self.capacity_mah.max(u64::from(raw));
-            return self.capacity_mah;
-        };
-        if raw >= previous {
-            self.capacity_mah = self.capacity_mah.saturating_add(u64::from(raw - previous));
-            self.previous_raw = Some(raw);
-        } else if previous >= CAPACITY_WRAP_HIGH_WATER && raw <= CAPACITY_WRAP_LOW_WATER {
-            if allow_wrap {
-                self.capacity_mah = self
-                    .capacity_mah
-                    .saturating_add(CAPACITY_MODULUS_MAH - u64::from(previous) + u64::from(raw));
-            }
-            // During uncertain recovery, rebase without claiming an unseen wrap.
-            self.previous_raw = Some(raw);
-        }
-        self.capacity_mah
-    }
 }
 
 struct Persistence {
@@ -909,17 +709,10 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 struct DeviceActor {
     config: ServerConfig,
     snapshot: AuthoritativeSnapshot,
+    controller: TestController,
     persistence: Persistence,
     port: Option<Box<dyn serialport::SerialPort>>,
     serial_buffer: Vec<u8>,
-    clock: TestClock,
-    energy: EnergyAccumulator,
-    capacity: CapacityAccumulator,
-    lifecycle: Lifecycle,
-    physical: PhysicalState,
-    connection_generation: u64,
-    report_generation: Option<u64>,
-    calibration_staging: CalibrationStaging,
     mock_sample_number: u64,
     last_mock_sample: Instant,
     mock_idle_report_due: Option<Instant>,
@@ -934,31 +727,22 @@ impl DeviceActor {
     ) -> Result<Self, String> {
         let mut persistence = Persistence::new(&config.data_dir)?;
         let mut snapshot = persistence.load()?;
-        let clock = TestClock::new(snapshot.test.elapsed_seconds);
-        let energy = EnergyAccumulator::from_snapshot(&snapshot);
-        let capacity = CapacityAccumulator::from_snapshot(&snapshot);
+        let controller = TestController::from_state(
+            ControllerMode::Server,
+            snapshot.device.clone(),
+            snapshot.test.clone(),
+            snapshot.history.last(),
+        );
         if snapshot.history.len() > SNAPSHOT_SAMPLE_LIMIT {
             snapshot.history = presentation_history(&snapshot.history, SNAPSHOT_SAMPLE_LIMIT);
         }
-        let lifecycle = if snapshot.test.state == TestState::RecoveredUncertain {
-            Lifecycle::RecoveredUncertain
-        } else {
-            Lifecycle::Idle
-        };
         Ok(Self {
             config,
             snapshot,
+            controller,
             persistence,
             port: None,
             serial_buffer: Vec::new(),
-            clock,
-            energy,
-            capacity,
-            lifecycle,
-            physical: PhysicalState::Unknown,
-            connection_generation: 0,
-            report_generation: None,
-            calibration_staging: CalibrationStaging::default(),
             mock_sample_number: 0,
             last_mock_sample: Instant::now(),
             mock_idle_report_due: None,
@@ -999,7 +783,7 @@ impl DeviceActor {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
+        self.sync_controller_state();
         self.persistence.flush_samples()?;
         self.persistence.save_metadata(&self.snapshot)
     }
@@ -1008,7 +792,7 @@ impl DeviceActor {
         let result = match message.request {
             ActorRequest::Snapshot => Ok(ActorResponse::Snapshot(self.current_snapshot())),
             ActorRequest::CompleteSnapshot => {
-                self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
+                self.sync_controller_state();
                 Ok(ActorResponse::Snapshot(self.snapshot_for_clients()))
             }
             ActorRequest::History => Ok(ActorResponse::History(presentation_history(
@@ -1046,19 +830,24 @@ impl DeviceActor {
     }
 
     fn current_snapshot(&mut self) -> AuthoritativeSnapshot {
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
+        self.sync_controller_state();
         self.snapshot_for_clients()
     }
 
     fn connect(&mut self) -> Result<(), String> {
-        self.begin_connection_generation("device connection changed; physical state is unknown");
+        self.controller
+            .begin_connection("device connection changed; physical state is unknown");
         self.snapshot.connection = ServerConnectionState::Connecting;
         self.snapshot.connection_error = None;
         if self.config.mock {
             self.snapshot.connection = ServerConnectionState::Connected;
-            self.snapshot.device.model = Some("EBC-MOCK".to_owned());
-            self.snapshot.device.firmware_version = Some("0.0.1".to_owned());
-            self.snapshot.device.voltage_mv = Some(4200);
+            self.controller.connection_established();
+            self.controller.set_device_identity(
+                Some("EBC-MOCK".to_owned()),
+                Some("0.0.1".to_owned()),
+                Some(4200),
+            );
+            self.sync_controller_state();
             self.mock_idle_report_due = Some(Instant::now() + ACTOR_TICK);
             return Ok(());
         }
@@ -1073,6 +862,8 @@ impl DeviceActor {
         self.port = Some(port);
         self.serial_buffer.clear();
         self.snapshot.connection = ServerConnectionState::Connected;
+        self.controller.connection_established();
+        self.sync_controller_state();
         Ok(())
     }
 
@@ -1082,246 +873,92 @@ impl DeviceActor {
         }
         self.port = None;
         self.serial_buffer.clear();
+        self.mock_idle_report_due = None;
         self.snapshot.connection = ServerConnectionState::Disconnected;
-        self.invalidate_for_gap("device disconnected; physical test state is unknown");
+        self.controller
+            .disconnect("device disconnected; physical test state is unknown");
+        self.sync_controller_state();
         Ok(())
     }
 
-    fn begin_connection_generation(&mut self, reason: &str) {
-        self.invalidate_for_gap(reason);
-        self.connection_generation = self.connection_generation.wrapping_add(1);
-    }
-
-    fn invalidate_for_gap(&mut self, reason: &str) {
-        let contradiction = self.lifecycle == Lifecycle::Idle
-            && (self.physical == PhysicalState::Active || self.snapshot.device.active);
-        if matches!(
-            self.lifecycle,
-            Lifecycle::Starting
-                | Lifecycle::RunningOwned
-                | Lifecycle::Stopping
-                | Lifecycle::RecoveredUncertain
-        ) || contradiction
-        {
-            self.lifecycle = Lifecycle::RecoveredUncertain;
-            self.snapshot.test.state = TestState::RecoveredUncertain;
-            self.snapshot.test.result = Some(reason.to_owned());
-        }
-        self.physical = PhysicalState::Unknown;
-        self.report_generation = None;
-        self.snapshot.device.activity_known = false;
-        self.snapshot.device.active = false;
-        self.calibration_staging = CalibrationStaging::default();
-        self.mock_idle_report_due = None;
-        self.clock.stop();
-        self.energy.break_gap();
-    }
-
-    fn has_fresh_report(&self, physical: PhysicalState) -> bool {
-        self.snapshot.connection == ServerConnectionState::Connected
-            && self.report_generation == Some(self.connection_generation)
-            && self.physical == physical
-            && self.snapshot.device.activity_known
-    }
-
-    fn require_connected(&self) -> Result<(), String> {
-        if self.snapshot.connection == ServerConnectionState::Connected {
-            Ok(())
-        } else {
-            Err("device is not connected".to_owned())
-        }
-    }
-
     fn start_test(&mut self, config: TestConfiguration) -> Result<(), String> {
-        self.require_connected()?;
-        if self.lifecycle != Lifecycle::Idle
-            || !self.has_fresh_report(PhysicalState::Inactive)
-            || !matches!(
-                self.snapshot.test.state,
-                TestState::Idle | TestState::Stopped | TestState::Completed
-            )
-        {
-            return Err("start requires a fresh current-connection inactive report".to_owned());
-        }
-        config.validate().map_err(|error| error.to_string())?;
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
+        let prepared = self.controller.prepare_command(ApiCommand::Start(config))?;
+        self.sync_controller_state();
         self.persistence.archive_current(&self.snapshot)?;
         self.persistence.reset_samples()?;
         self.snapshot.history.clear();
         let run_id = self.persistence.new_run_id();
         self.persistence.begin_current_run(run_id);
-        self.clock.start_fresh();
-        self.clock.stop();
-        self.energy.reset();
-        self.capacity.reset();
-        self.lifecycle = Lifecycle::Starting;
-        self.physical = PhysicalState::Unknown;
-        self.report_generation = None;
-        self.snapshot.device.activity_known = false;
-        self.snapshot.device.active = false;
-        self.snapshot.test.state = TestState::Starting;
-        self.snapshot.test.config = Some(config);
-        self.snapshot.test.started_at_utc = Some(Utc::now().to_rfc3339());
-        self.snapshot.test.elapsed_seconds = 0;
-        self.snapshot.test.result = None;
-        self.snapshot.test.capacity_mah = None;
-        self.snapshot.test.energy_wh = 0.0;
-        self.snapshot.device.mode = Some(config.mode());
+        self.controller
+            .commit_command(prepared, Some(Utc::now().to_rfc3339()));
+        self.sync_controller_state();
         self.persistence.save_metadata(&self.snapshot)?;
-        if let Err(error) = self.send(test_frame(&config, false)) {
-            self.lifecycle = Lifecycle::RecoveredUncertain;
-            self.snapshot.test.state = TestState::RecoveredUncertain;
-            self.snapshot.test.result =
-                Some("start outcome is unknown after a write failure".to_owned());
+        if let Some(frame) = prepared.frame()
+            && let Err(error) = self.send(frame)
+        {
+            self.controller.start_write_failed();
+            self.sync_controller_state();
             let _persisted = self.persistence.save_metadata(&self.snapshot);
             return Err(error);
         }
         if self.config.mock {
-            self.snapshot.device.current_ma = Some(mock_current(&config));
+            self.controller.set_current_ma(mock_current(&config));
+            self.sync_controller_state();
         }
         Ok(())
     }
 
     fn stop_test(&mut self) -> Result<(), String> {
-        self.require_connected()?;
-        if self.lifecycle == Lifecycle::Stopping {
-            return Ok(());
+        let prepared = self.controller.prepare_command(ApiCommand::Stop)?;
+        if let Some(frame) = prepared.frame() {
+            self.send(frame)?;
         }
-        if self.lifecycle == Lifecycle::Idle
-            && self.physical != PhysicalState::Active
-            && !matches!(
-                self.snapshot.test.state,
-                TestState::Running | TestState::RecoveredUncertain
-            )
-        {
-            return Err("there is no active or uncertain test to stop".to_owned());
-        }
-        self.send(OutboundFrame::Stop)?;
-        self.clock.stop();
-        self.lifecycle = Lifecycle::Stopping;
-        self.snapshot.test.state = TestState::Stopping;
-        self.snapshot.test.result = None;
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
-        self.energy.break_gap();
+        self.controller.commit_command(prepared, None);
+        self.sync_controller_state();
         self.persistence.flush_samples()?;
         Ok(())
     }
 
     fn adjust_test(&mut self, config: TestConfiguration) -> Result<(), String> {
-        self.require_connected()?;
-        if self.lifecycle != Lifecycle::RunningOwned
-            || !self.has_fresh_report(PhysicalState::Active)
-            || self.snapshot.test.state != TestState::Running
-        {
-            return Err("adjustment requires a confirmed backend-owned running test".to_owned());
-        }
-        config.validate().map_err(|error| error.to_string())?;
-        let TestConfiguration::DischargeConstantCurrent {
-            current_ma,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        } = config
-        else {
-            return Err("only constant-current discharge can be adjusted".to_owned());
-        };
-        if !self.snapshot.device.active
-            || self.snapshot.device.mode != Some(device::DeviceMode::DischargeConstantCurrent)
-        {
-            return Err("constant-current discharge is not active".to_owned());
-        }
-        self.send(OutboundFrame::AdjustConstantCurrentDischarge(
-            current_ma,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        ))?;
-        self.snapshot.test.config = Some(config);
+        let prepared = self
+            .controller
+            .prepare_command(ApiCommand::Adjust(config))?;
+        let frame = prepared
+            .frame()
+            .ok_or_else(|| "adjustment did not produce a protocol frame".to_owned())?;
+        self.send(frame)?;
+        self.controller.commit_command(prepared, None);
         if self.config.mock {
-            self.snapshot.device.current_ma = Some(current_ma);
+            let TestConfiguration::DischargeConstantCurrent { current_ma, .. } = config else {
+                unreachable!();
+            };
+            self.controller.set_current_ma(current_ma);
         }
+        self.sync_controller_state();
         Ok(())
     }
 
     fn resume_test(&mut self) -> Result<(), String> {
-        self.require_connected()?;
-        if self.lifecycle != Lifecycle::Idle
-            || self.snapshot.test.state != TestState::Stopped
-            || !self.has_fresh_report(PhysicalState::Inactive)
-        {
-            return Err("resume requires a confirmed inactive stopped test".to_owned());
-        }
-        let config = self
-            .snapshot
-            .test
-            .config
-            .ok_or_else(|| "there is no test configuration to resume".to_owned())?;
-        config.validate().map_err(|error| error.to_string())?;
-        self.send(test_frame(&config, true))?;
-        self.lifecycle = Lifecycle::Starting;
-        self.physical = PhysicalState::Unknown;
-        self.report_generation = None;
-        self.snapshot.device.activity_known = false;
-        self.snapshot.device.active = false;
-        self.snapshot.test.state = TestState::Starting;
-        self.snapshot.test.result = None;
+        let prepared = self.controller.prepare_command(ApiCommand::Resume)?;
+        let frame = prepared
+            .frame()
+            .ok_or_else(|| "resume did not produce a protocol frame".to_owned())?;
+        self.send(frame)?;
+        self.controller.commit_command(prepared, None);
+        self.sync_controller_state();
         Ok(())
     }
 
     fn calibrate(&mut self, command: CalibrationCommand) -> Result<(), String> {
-        self.require_connected()?;
-        command.validate().map_err(|error| error.to_string())?;
-        if self.report_generation != Some(self.connection_generation)
-            || !self.snapshot.device.activity_known
-        {
-            return Err("calibration requires fresh current-connection telemetry".to_owned());
-        }
-        if matches!(
-            self.lifecycle,
-            Lifecycle::RecoveredUncertain | Lifecycle::Starting | Lifecycle::Stopping
-        ) {
-            return Err(
-                "calibration is not allowed while test state is pending or uncertain".to_owned(),
-            );
-        }
-        match command {
-            CalibrationCommand::VoltageLow(_) | CalibrationCommand::VoltageHigh(_)
-                if self.snapshot.device.voltage_mv.unwrap_or(0) == 0 =>
-            {
-                return Err(
-                    "device must provide a fresh live voltage before calibration".to_owned(),
-                );
-            }
-            CalibrationCommand::CurrentLow(_) | CalibrationCommand::CurrentHigh(_)
-                if self.lifecycle != Lifecycle::RunningOwned
-                    || !self.has_fresh_report(PhysicalState::Active)
-                    || self.snapshot.device.mode
-                        != Some(device::DeviceMode::DischargeConstantCurrent) =>
-            {
-                return Err(
-                    "constant-current discharge must be active for current calibration".to_owned(),
-                );
-            }
-            CalibrationCommand::Confirm if !self.calibration_staging.complete() => {
-                return Err(
-                    "all four calibration references must be staged on this connection".to_owned(),
-                );
-            }
-            _ => {}
-        }
-        let frame = match command {
-            CalibrationCommand::VoltageLow(value) => OutboundFrame::CalibrateVoltageLow(value),
-            CalibrationCommand::VoltageHigh(value) => OutboundFrame::CalibrateVoltageHigh(value),
-            CalibrationCommand::CurrentLow(value) => OutboundFrame::CalibrateCurrentLow(value),
-            CalibrationCommand::CurrentHigh(value) => OutboundFrame::CalibrateCurrentHigh(value),
-            CalibrationCommand::Confirm => OutboundFrame::CalibrateConfirm,
-        };
+        let prepared = self
+            .controller
+            .prepare_command(ApiCommand::Calibration(command))?;
+        let frame = prepared
+            .frame()
+            .ok_or_else(|| "calibration did not produce a protocol frame".to_owned())?;
         self.send(frame)?;
-        match command {
-            CalibrationCommand::VoltageLow(_) => self.calibration_staging.references[0] = true,
-            CalibrationCommand::VoltageHigh(_) => self.calibration_staging.references[1] = true,
-            CalibrationCommand::CurrentLow(_) => self.calibration_staging.references[2] = true,
-            CalibrationCommand::CurrentHigh(_) => self.calibration_staging.references[3] = true,
-            CalibrationCommand::Confirm => self.calibration_staging = CalibrationStaging::default(),
-        }
+        self.controller.commit_command(prepared, None);
+        self.sync_controller_state();
         Ok(())
     }
 
@@ -1342,19 +979,12 @@ impl DeviceActor {
         } else {
             self.read_serial();
         }
-        if self.timer_sync_allowed()
-            && let Some(minutes) = self.clock.next_timer_sync()
+        if let Some(minutes) = self.controller.next_timer_sync()
             && let Err(error) = self.send(OutboundFrame::TimerSync(minutes))
         {
             self.set_connection_error(&error);
         }
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
-    }
-
-    fn timer_sync_allowed(&self) -> bool {
-        self.lifecycle == Lifecycle::RunningOwned
-            && self.has_fresh_report(PhysicalState::Active)
-            && self.snapshot.test.state == TestState::Running
+        self.sync_controller_state();
     }
 
     fn tick_mock(&mut self) {
@@ -1371,7 +1001,7 @@ impl DeviceActor {
             self.record_report(mode, 4200, 0, 0, ReportState::Idle, "EBC-MOCK", None);
             return;
         }
-        if self.lifecycle == Lifecycle::Stopping {
+        if self.controller.is_stopping() {
             let mode = self
                 .snapshot
                 .device
@@ -1379,25 +1009,23 @@ impl DeviceActor {
                 .unwrap_or(device::DeviceMode::DischargeConstantCurrent);
             self.record_report(
                 mode,
-                self.snapshot.device.voltage_mv.unwrap_or(4200),
+                self.controller.device().voltage_mv.unwrap_or(4200),
                 0,
-                self.snapshot.device.capacity_mah.unwrap_or(0),
+                self.controller.device().capacity_mah.unwrap_or(0),
                 ReportState::Idle,
                 "EBC-MOCK",
                 None,
             );
             return;
         }
-        if !matches!(
-            self.lifecycle,
-            Lifecycle::Starting | Lifecycle::RunningOwned
-        ) || self.last_mock_sample.elapsed() < Duration::from_secs(1)
+        if !(self.controller.is_starting() || self.controller.is_running_owned())
+            || self.last_mock_sample.elapsed() < Duration::from_secs(1)
         {
             return;
         }
         self.last_mock_sample = Instant::now();
         self.mock_sample_number += 1;
-        let Some(config) = self.snapshot.test.config else {
+        let Some(config) = self.controller.test().config else {
             return;
         };
         let voltage =
@@ -1475,7 +1103,7 @@ impl DeviceActor {
         }
     }
 
-    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
     fn record_report(
         &mut self,
         mode: device::DeviceMode,
@@ -1486,72 +1114,28 @@ impl DeviceActor {
         model: &str,
         firmware: Option<String>,
     ) {
-        let previous_lifecycle = self.lifecycle;
         let active = report_state == ReportState::Active;
-        self.report_generation = Some(self.connection_generation);
-        self.physical = if active {
-            PhysicalState::Active
-        } else {
-            PhysicalState::Inactive
-        };
-        self.snapshot.device.mode = Some(mode);
-        self.snapshot.device.activity_known = true;
-        self.snapshot.device.active = active;
-        self.snapshot.device.voltage_mv = Some(voltage_mv);
-        self.snapshot.device.current_ma = Some(current_ma);
-        self.snapshot.device.capacity_mah = Some(capacity_mah);
-        self.snapshot.device.model = Some(model.to_owned());
-        if firmware.is_some() {
-            self.snapshot.device.firmware_version = firmware;
-        }
-        if active {
-            let owns_metrics = match previous_lifecycle {
-                Lifecycle::Starting => {
-                    self.lifecycle = Lifecycle::RunningOwned;
-                    self.snapshot.test.state = TestState::Running;
-                    self.snapshot.test.result = None;
-                    self.clock.resume();
-                    true
-                }
-                Lifecycle::RunningOwned => {
-                    self.clock.resume();
-                    true
-                }
-                Lifecycle::Stopping => {
-                    self.clock.stop();
-                    self.energy.break_gap();
-                    false
-                }
-                Lifecycle::Idle | Lifecycle::RecoveredUncertain => {
-                    self.lifecycle = Lifecycle::RecoveredUncertain;
-                    self.snapshot.test.state = TestState::RecoveredUncertain;
-                    self.snapshot.test.result =
-                        Some("hardware reports an active test not owned by this server".to_owned());
-                    self.clock.stop();
-                    self.energy.break_gap();
-                    false
-                }
-            };
-            let elapsed = self.clock.elapsed();
-            let energy_wh = if owns_metrics {
-                self.energy
-                    .add(elapsed.as_secs_f64(), voltage_mv, current_ma)
-            } else {
-                self.snapshot.test.energy_wh
-            };
-            let normalized_capacity = self.capacity.observe(capacity_mah, owns_metrics);
-            self.snapshot.test.energy_wh = energy_wh;
-            self.snapshot.test.capacity_mah = Some(normalized_capacity);
+        let (outcome, measurement) = self.controller.report(DeviceReport {
+            mode,
+            state: report_state,
+            voltage_mv,
+            current_ma,
+            capacity_mah,
+            model: model.to_owned(),
+            firmware_version: firmware,
+        });
+        self.sync_controller_state();
+        if let Some(measurement) = measurement {
             let sample = Sample {
                 run_id: self.persistence.current_run_id.clone(),
                 sequence: self.persistence.next_sequence,
                 timestamp_utc: Utc::now().to_rfc3339(),
-                elapsed_seconds: elapsed.as_secs(),
-                voltage_mv,
-                current_ma,
-                capacity_mah: normalized_capacity,
-                energy_wh,
-                mode,
+                elapsed_seconds: measurement.elapsed_seconds,
+                voltage_mv: measurement.voltage_mv,
+                current_ma: measurement.current_ma,
+                capacity_mah: measurement.capacity_mah,
+                energy_wh: measurement.energy_wh,
+                mode: measurement.mode,
             };
             if let Err(error) = self.persistence.append_sample(&sample) {
                 log::error!("failed to append sample: {error}");
@@ -1563,50 +1147,11 @@ impl DeviceActor {
                 }
                 let _receivers = self.snapshot_tx.send(WebSocketEvent::Sample(sample));
             }
-        } else {
-            self.clock.stop();
-            self.energy.break_gap();
-            self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
-            if previous_lifecycle != Lifecycle::Starting {
-                let normalized_capacity = self
-                    .capacity
-                    .observe(capacity_mah, previous_lifecycle == Lifecycle::RunningOwned);
-                self.snapshot.test.capacity_mah = Some(normalized_capacity);
-            }
-            match previous_lifecycle {
-                Lifecycle::RecoveredUncertain => {
-                    self.lifecycle = Lifecycle::Idle;
-                    self.snapshot.test.state = TestState::Stopped;
-                    self.snapshot.test.result =
-                        Some("recovered previous test; hardware reports inactive".to_owned());
-                }
-                Lifecycle::Starting | Lifecycle::Idle => {}
-                Lifecycle::RunningOwned => match report_state {
-                    ReportState::Finished => {
-                        self.lifecycle = Lifecycle::Idle;
-                        self.snapshot.test.state = TestState::Completed;
-                        self.snapshot.test.result =
-                            Some("device reported test complete".to_owned());
-                    }
-                    ReportState::Idle => {
-                        self.lifecycle = Lifecycle::Idle;
-                        self.snapshot.test.state = TestState::Stopped;
-                        self.snapshot.test.result = Some("device reported test idle".to_owned());
-                    }
-                    ReportState::InactiveUnknown => {}
-                    ReportState::Active => unreachable!(),
-                },
-                Lifecycle::Stopping => {
-                    self.lifecycle = Lifecycle::Idle;
-                    self.snapshot.test.state = TestState::Stopped;
-                    self.snapshot.test.result = Some("stop confirmed by hardware".to_owned());
-                }
-            }
-            if previous_lifecycle != self.lifecycle
-                && let Err(error) = self.persistence.flush_samples()
-            {
-                log::error!("failed to flush inactive samples: {error}");
-            }
+        }
+        if outcome.transitioned_to_inactive
+            && let Err(error) = self.persistence.flush_samples()
+        {
+            log::error!("failed to flush inactive samples: {error}");
         }
         let persistence_result = if !active {
             self.persist_and_publish()
@@ -1620,23 +1165,25 @@ impl DeviceActor {
 
     fn set_connection_error(&mut self, error: &str) {
         self.port = None;
+        self.mock_idle_report_due = None;
         self.snapshot.connection = ServerConnectionState::Error;
         self.snapshot.connection_error = Some(error.to_owned());
-        self.invalidate_for_gap(&format!(
+        self.controller.disconnect(&format!(
             "device connection failed; physical test state is unknown: {error}"
         ));
+        self.sync_controller_state();
         let _persisted = self.persist_and_publish();
     }
 
     fn persist_and_publish(&mut self) -> Result<(), String> {
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
+        self.sync_controller_state();
         self.persistence.save_metadata(&self.snapshot)?;
         self.publish();
         Ok(())
     }
 
     fn persist_report_and_publish(&mut self) -> Result<(), String> {
-        self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
+        self.sync_controller_state();
         if self.last_metadata_sync.elapsed() >= Duration::from_secs(1) {
             self.persistence.save_metadata(&self.snapshot)?;
             self.last_metadata_sync = Instant::now();
@@ -1650,61 +1197,16 @@ impl DeviceActor {
         let _receivers = self.snapshot_tx.send(WebSocketEvent::Update(update));
     }
 
+    fn sync_controller_state(&mut self) {
+        self.controller.update_elapsed();
+        self.snapshot.device = self.controller.device().clone();
+        self.snapshot.test = self.controller.test().clone();
+    }
+
     fn snapshot_for_clients(&self) -> AuthoritativeSnapshot {
         let mut snapshot = self.snapshot.clone();
         snapshot.history = presentation_history(&snapshot.history, SNAPSHOT_SAMPLE_LIMIT);
         snapshot
-    }
-}
-
-fn test_frame(config: &TestConfiguration, resume: bool) -> OutboundFrame {
-    match *config {
-        TestConfiguration::DischargeConstantCurrent {
-            current_ma,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        } if resume => OutboundFrame::ContinueConstantCurrentDischarge(
-            current_ma,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        ),
-        TestConfiguration::DischargeConstantCurrent {
-            current_ma,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        } => OutboundFrame::StartConstantCurrentDischarge(
-            current_ma,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        ),
-        TestConfiguration::DischargeConstantPower {
-            power_w,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        } if resume => OutboundFrame::ContinueConstantPowerDischarge(
-            power_w,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        ),
-        TestConfiguration::DischargeConstantPower {
-            power_w,
-            cutoff_voltage_mv,
-            cutoff_time_min,
-        } => {
-            OutboundFrame::StartConstantPowerDischarge(power_w, cutoff_voltage_mv, cutoff_time_min)
-        }
-        TestConfiguration::ChargeConstantVoltage {
-            current_ma,
-            voltage_mv,
-            cutoff_current_ma,
-        } if resume => {
-            OutboundFrame::ContinueConstantVoltageCharge(current_ma, voltage_mv, cutoff_current_ma)
-        }
-        TestConfiguration::ChargeConstantVoltage {
-            current_ma,
-            voltage_mv,
-            cutoff_current_ma,
-        } => OutboundFrame::StartConstantVoltageCharge(current_ma, voltage_mv, cutoff_current_ma),
     }
 }
 
@@ -2170,63 +1672,6 @@ mod tests {
     }
 
     #[test]
-    fn timer_sync_occurs_only_on_minute_transitions() {
-        let mut clock = TestClock::new(59);
-        assert_eq!(clock.next_timer_sync(), None);
-        clock.resume();
-        clock.accumulated = Duration::from_secs(60);
-        assert_eq!(clock.next_timer_sync(), Some(1));
-        assert_eq!(clock.next_timer_sync(), None);
-
-        clock.accumulated = Duration::from_secs(MAX_TIMER_MINUTES * 60);
-        assert_eq!(clock.next_timer_sync(), Some(MAX_TIMER_MINUTES as u16));
-        let encoded: [u8; OUTBOUND_FRAME_SIZE] =
-            OutboundFrame::TimerSync(MAX_TIMER_MINUTES as u16).into();
-        assert_eq!(&encoded[2..4], &[0xef, 0xef]);
-
-        clock.accumulated = Duration::from_secs((MAX_TIMER_MINUTES + 1) * 60);
-        assert_eq!(clock.next_timer_sync(), None);
-        assert_eq!(clock.next_timer_sync(), None);
-    }
-
-    #[test]
-    fn fresh_report_is_required_for_start_and_calibration() {
-        let (mut actor, directory) = mock_actor("fresh-state-guards");
-        actor.connect().expect("connect mock");
-        actor.snapshot.device.voltage_mv = Some(4200);
-        actor.snapshot.device.active = true;
-
-        assert!(actor.start_test(test_config()).is_err());
-        assert!(
-            actor
-                .calibrate(CalibrationCommand::VoltageLow(1000))
-                .is_err()
-        );
-        assert!(
-            actor
-                .calibrate(CalibrationCommand::CurrentLow(1000))
-                .is_err()
-        );
-        assert!(actor.calibrate(CalibrationCommand::Confirm).is_err());
-
-        confirm_inactive(&mut actor);
-        actor
-            .calibrate(CalibrationCommand::VoltageLow(1000))
-            .expect("fresh voltage permits staging");
-        actor.connect().expect("reconnect invalidates telemetry");
-        actor.snapshot.device.voltage_mv = Some(4200);
-        actor.snapshot.device.active = true;
-        assert!(
-            actor
-                .calibrate(CalibrationCommand::VoltageHigh(4000))
-                .is_err()
-        );
-        assert!(actor.calibrate(CalibrationCommand::Confirm).is_err());
-        assert!(actor.start_test(test_config()).is_err());
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
     fn persistence_round_trip_keeps_samples_and_recovers_running_state() {
         let directory = temporary_directory("persistence");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
@@ -2250,87 +1695,6 @@ mod tests {
         let loaded = persistence.load().expect("load persistence");
         assert_eq!(loaded.test.state, TestState::RecoveredUncertain);
         assert_eq!(loaded.history, vec![sample]);
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn energy_integration_is_deterministic_and_uses_trapezoids() {
-        let mut energy = EnergyAccumulator {
-            energy_wh: 0.0,
-            previous: None,
-        };
-        assert!((energy.add(0.0, 10_000, 1_000) - 0.0).abs() < f64::EPSILON);
-        assert!((energy.add(3600.0, 10_000, 2_000) - 15.0).abs() < f64::EPSILON);
-        assert!((energy.add(3600.0, 10_000, 3_000) - 15.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn capacity_accumulator_increases_wraps_and_ignores_stale_regressions() {
-        let mut capacity = CapacityAccumulator {
-            capacity_mah: 0,
-            previous_raw: None,
-        };
-        assert_eq!(capacity.observe(100, true), 100);
-        assert_eq!(capacity.observe(150, true), 150);
-        assert_eq!(capacity.observe(145, true), 150);
-        assert_eq!(capacity.observe(160, true), 160);
-
-        let mut wrapped = CapacityAccumulator {
-            capacity_mah: 57_599,
-            previous_raw: Some(57_599),
-        };
-        assert_eq!(wrapped.observe(2, true), 57_602);
-    }
-
-    #[test]
-    fn capacity_accumulator_supports_more_than_280_amp_hours() {
-        let mut capacity = CapacityAccumulator {
-            capacity_mah: 0,
-            previous_raw: None,
-        };
-        assert_eq!(capacity.observe(0, true), 0);
-        for _ in 0..5 {
-            capacity.observe(57_599, true);
-            capacity.observe(0, true);
-        }
-        assert_eq!(capacity.capacity_mah, 288_000);
-    }
-
-    #[test]
-    fn uncertain_capacity_recovery_does_not_invent_a_wrap() {
-        let mut capacity = CapacityAccumulator {
-            capacity_mah: 57_599,
-            previous_raw: Some(57_599),
-        };
-        assert_eq!(capacity.observe(2, false), 57_599);
-        assert_eq!(capacity.observe(12, false), 57_609);
-    }
-
-    #[test]
-    fn fresh_start_is_blocked_until_recovery_is_resolved() {
-        let directory = temporary_directory("uncertain-start");
-        let (snapshot_tx, _) = broadcast::channel(1);
-        let config = ServerConfig {
-            http_addr: "127.0.0.1:0".parse().expect("test address"),
-            serial_port: "/dev/null".to_owned(),
-            data_dir: directory.clone(),
-            mock: true,
-            static_dir: directory.clone(),
-        };
-        let mut actor = DeviceActor::new(config, snapshot_tx).expect("create actor");
-        actor.snapshot.connection = ServerConnectionState::Connected;
-        actor.snapshot.test.state = TestState::RecoveredUncertain;
-
-        let error = actor
-            .start_test(TestConfiguration::DischargeConstantCurrent {
-                current_ma: 1000,
-                cutoff_voltage_mv: 3000,
-                cutoff_time_min: 0,
-            })
-            .expect_err("uncertain recovery must block a fresh start");
-
-        assert!(error.contains("fresh current-connection inactive report"));
-        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -2445,6 +1809,7 @@ mod tests {
 
     fn confirm_inactive(actor: &mut DeviceActor) {
         actor.snapshot.connection = ServerConnectionState::Connected;
+        actor.controller.connection_established();
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
             4200,
@@ -2468,338 +1833,6 @@ mod tests {
             energy_wh: sequence as f64 / 1000.0,
             mode: device::DeviceMode::DischargeConstantCurrent,
         }
-    }
-
-    #[test]
-    fn recovery_active_stays_uncertain_without_clock_or_ownership() {
-        let (mut actor, directory) = mock_actor("recovery-active");
-        actor.snapshot.connection = ServerConnectionState::Connected;
-        actor.snapshot.test.state = TestState::RecoveredUncertain;
-        actor.snapshot.test.elapsed_seconds = 75;
-        actor.lifecycle = Lifecycle::RecoveredUncertain;
-        actor.clock = TestClock::new(75);
-
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            3900,
-            1000,
-            10,
-            ReportState::Active,
-            "EBC-X",
-            None,
-        );
-
-        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
-        assert_eq!(actor.lifecycle, Lifecycle::RecoveredUncertain);
-        assert_eq!(actor.physical, PhysicalState::Active);
-        assert!(actor.snapshot.device.activity_known);
-        assert_eq!(actor.clock.running_since, None);
-        assert_eq!(actor.clock.next_timer_sync(), None);
-        assert_eq!(actor.snapshot.history.len(), 1);
-        assert_eq!(actor.snapshot.history[0].elapsed_seconds, 75);
-        assert!(actor.start_test(test_config()).is_err());
-        assert!(actor.resume_test().is_err());
-        assert!(actor.adjust_test(test_config()).is_err());
-        assert!(
-            actor
-                .calibrate(CalibrationCommand::VoltageLow(1000))
-                .is_err()
-        );
-        assert!(
-            actor
-                .calibrate(CalibrationCommand::CurrentLow(1000))
-                .is_err()
-        );
-        assert!(actor.calibrate(CalibrationCommand::Confirm).is_err());
-        actor.stop_test().expect("stop is allowed while uncertain");
-        actor
-            .disconnect()
-            .expect("disconnect is allowed while uncertain");
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn recovery_idle_resolves_and_reconnect_reconciles_again() {
-        let (mut actor, directory) = mock_actor("recovery-idle");
-        actor.snapshot.connection = ServerConnectionState::Connected;
-        actor.snapshot.test.state = TestState::RecoveredUncertain;
-        actor.lifecycle = Lifecycle::RecoveredUncertain;
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            3900,
-            0,
-            10,
-            ReportState::InactiveUnknown,
-            "EBC-X",
-            None,
-        );
-        assert_eq!(actor.snapshot.test.state, TestState::Stopped);
-        assert_eq!(actor.lifecycle, Lifecycle::Idle);
-
-        actor.snapshot.test.state = TestState::RecoveredUncertain;
-        actor.lifecycle = Lifecycle::RecoveredUncertain;
-        actor.set_connection_error("lost");
-        assert_eq!(actor.physical, PhysicalState::Unknown);
-        assert!(!actor.snapshot.device.activity_known);
-        actor.connect().expect("mock reconnect");
-        assert_eq!(actor.lifecycle, Lifecycle::RecoveredUncertain);
-        assert_eq!(actor.physical, PhysicalState::Unknown);
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn pending_commands_are_serialized_and_repeats_do_not_advance_state() {
-        let (mut actor, directory) = mock_actor("pending-races");
-        confirm_inactive(&mut actor);
-        actor.start_test(test_config()).expect("start command");
-        assert_eq!(actor.lifecycle, Lifecycle::Starting);
-        assert_eq!(actor.snapshot.test.state, TestState::Starting);
-        let metadata: Metadata = serde_json::from_slice(
-            &fs::read(directory.join("session.json")).expect("read pending metadata"),
-        )
-        .expect("parse pending metadata");
-        assert!(!metadata.current_run_id.is_empty());
-        assert_eq!(
-            fs::read_to_string(directory.join("samples.csv")).expect("read fresh CSV"),
-            csv_header()
-        );
-        assert!(actor.start_test(test_config()).is_err());
-        assert!(actor.resume_test().is_err());
-
-        actor.stop_test().expect("stop while starting");
-        assert_eq!(actor.lifecycle, Lifecycle::Stopping);
-        assert_eq!(actor.snapshot.test.state, TestState::Stopping);
-        actor.stop_test().expect("repeated stop is idempotent");
-        assert!(actor.start_test(test_config()).is_err());
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            4000,
-            0,
-            0,
-            ReportState::Idle,
-            "EBC-MOCK",
-            None,
-        );
-        assert_eq!(actor.snapshot.test.state, TestState::Stopped);
-        assert_eq!(actor.lifecycle, Lifecycle::Idle);
-        actor.resume_test().expect("first resume command");
-        assert_eq!(actor.lifecycle, Lifecycle::Starting);
-        assert!(actor.resume_test().is_err());
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn reconnect_transition_matrix_never_reclaims_ownership() {
-        for (name, lifecycle, state) in [
-            ("starting", Lifecycle::Starting, TestState::Starting),
-            ("running", Lifecycle::RunningOwned, TestState::Running),
-            ("stopping", Lifecycle::Stopping, TestState::Stopping),
-        ] {
-            for active in [true, false] {
-                let (mut actor, directory) = mock_actor(&format!("gap-{name}-{active}"));
-                actor.snapshot.connection = ServerConnectionState::Connected;
-                actor.lifecycle = lifecycle;
-                actor.snapshot.test.state = state.clone();
-                actor.physical = PhysicalState::Active;
-                actor.report_generation = Some(actor.connection_generation);
-                actor.snapshot.device.activity_known = true;
-                actor.snapshot.device.active = true;
-                actor.clock = TestClock::new(1800);
-                actor.clock.resume();
-
-                actor.set_connection_error("serial gap");
-                assert_eq!(actor.lifecycle, Lifecycle::RecoveredUncertain);
-                assert_eq!(actor.physical, PhysicalState::Unknown);
-                actor.connect().expect("reconnect mock");
-                actor.record_report(
-                    device::DeviceMode::DischargeConstantCurrent,
-                    3900,
-                    if active { 1000 } else { 0 },
-                    10,
-                    if active {
-                        ReportState::Active
-                    } else {
-                        ReportState::Idle
-                    },
-                    "EBC-MOCK",
-                    None,
-                );
-
-                if active {
-                    assert_eq!(actor.lifecycle, Lifecycle::RecoveredUncertain);
-                    assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
-                    assert!(!actor.timer_sync_allowed());
-                    assert_eq!(actor.clock.elapsed().as_secs(), 1800);
-                } else {
-                    assert_eq!(actor.lifecycle, Lifecycle::Idle);
-                    assert_eq!(actor.snapshot.test.state, TestState::Stopped);
-                    assert!(actor.has_fresh_report(PhysicalState::Inactive));
-                }
-                fs::remove_dir_all(directory).expect("remove test directory");
-            }
-        }
-    }
-
-    #[test]
-    fn buffered_inactive_reports_do_not_reject_start_before_active_confirmation() {
-        let (mut actor, directory) = mock_actor("uninterrupted-inactive");
-        confirm_inactive(&mut actor);
-        actor.start_test(test_config()).expect("start");
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            4000,
-            0,
-            0,
-            ReportState::Idle,
-            "EBC-MOCK",
-            None,
-        );
-        assert_eq!(actor.lifecycle, Lifecycle::Starting);
-        assert_eq!(actor.snapshot.test.state, TestState::Starting);
-        assert_eq!(actor.snapshot.test.capacity_mah, None);
-
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            4000,
-            0,
-            0,
-            ReportState::InactiveUnknown,
-            "EBC-MOCK",
-            None,
-        );
-        assert_eq!(actor.lifecycle, Lifecycle::Starting);
-
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            3990,
-            1000,
-            1,
-            ReportState::Active,
-            "EBC-MOCK",
-            None,
-        );
-        assert_eq!(actor.lifecycle, Lifecycle::RunningOwned);
-        assert_eq!(actor.snapshot.test.state, TestState::Running);
-        assert_eq!(actor.snapshot.test.capacity_mah, Some(1));
-
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            3900,
-            0,
-            20,
-            ReportState::Finished,
-            "EBC-MOCK",
-            None,
-        );
-        assert_eq!(actor.lifecycle, Lifecycle::Idle);
-        assert_eq!(actor.snapshot.test.state, TestState::Completed);
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn buffered_inactive_reports_do_not_reject_resume_before_active_confirmation() {
-        let (mut actor, directory) = mock_actor("buffered-resume-reports");
-        confirm_inactive(&mut actor);
-        actor.snapshot.test.config = Some(test_config());
-        actor.snapshot.test.state = TestState::Stopped;
-        actor.resume_test().expect("resume");
-
-        for report_state in [ReportState::Idle, ReportState::InactiveUnknown] {
-            actor.record_report(
-                device::DeviceMode::DischargeConstantCurrent,
-                4000,
-                0,
-                10,
-                report_state,
-                "EBC-MOCK",
-                None,
-            );
-            assert_eq!(actor.lifecycle, Lifecycle::Starting);
-            assert_eq!(actor.snapshot.test.state, TestState::Starting);
-        }
-
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            3990,
-            1000,
-            11,
-            ReportState::Active,
-            "EBC-MOCK",
-            None,
-        );
-        assert_eq!(actor.lifecycle, Lifecycle::RunningOwned);
-        assert_eq!(actor.snapshot.test.state, TestState::Running);
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn normal_idle_and_finished_reports_have_distinct_results() {
-        for (report_state, expected_state) in [
-            (ReportState::Idle, TestState::Stopped),
-            (ReportState::Finished, TestState::Completed),
-        ] {
-            let (mut actor, directory) = mock_actor(&format!("normal-{report_state:?}"));
-            confirm_inactive(&mut actor);
-            actor.start_test(test_config()).expect("start");
-            actor.record_report(
-                device::DeviceMode::DischargeConstantCurrent,
-                4000,
-                1000,
-                1,
-                ReportState::Active,
-                "EBC-MOCK",
-                None,
-            );
-            actor.record_report(
-                device::DeviceMode::DischargeConstantCurrent,
-                3900,
-                0,
-                10,
-                report_state,
-                "EBC-MOCK",
-                None,
-            );
-
-            assert_eq!(actor.lifecycle, Lifecycle::Idle);
-            assert_eq!(actor.snapshot.test.state, expected_state);
-            fs::remove_dir_all(directory).expect("remove test directory");
-        }
-    }
-
-    #[test]
-    fn long_gap_in_finite_owned_test_freezes_time_and_disables_timer_sync() {
-        let (mut actor, directory) = mock_actor("finite-gap-timer");
-        actor.snapshot.connection = ServerConnectionState::Connected;
-        actor.snapshot.test.config = Some(TestConfiguration::DischargeConstantCurrent {
-            current_ma: 1000,
-            cutoff_voltage_mv: 3000,
-            cutoff_time_min: 60,
-        });
-        actor.snapshot.test.state = TestState::Running;
-        actor.lifecycle = Lifecycle::RunningOwned;
-        actor.physical = PhysicalState::Active;
-        actor.report_generation = Some(actor.connection_generation);
-        actor.snapshot.device.activity_known = true;
-        actor.clock = TestClock::new(30 * 60);
-        actor.clock.resume();
-
-        actor.set_connection_error("ten minute serial gap");
-        actor.connect().expect("reconnect");
-        actor.record_report(
-            device::DeviceMode::DischargeConstantCurrent,
-            3800,
-            1000,
-            30_000,
-            ReportState::Active,
-            "EBC-MOCK",
-            None,
-        );
-
-        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
-        assert_eq!(actor.clock.elapsed().as_secs(), 30 * 60);
-        assert!(!actor.timer_sync_allowed());
-        assert_eq!(actor.clock.next_timer_sync(), None);
-        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]
@@ -2925,6 +1958,19 @@ mod tests {
     }
 
     #[test]
+    fn mock_disconnect_cancels_deferred_idle_report() {
+        let (mut actor, directory) = mock_actor("mock-disconnect");
+        actor.connect().expect("connect mock");
+        assert!(actor.mock_idle_report_due.is_some());
+
+        actor.disconnect().expect("disconnect mock");
+
+        assert_eq!(actor.mock_idle_report_due, None);
+        assert!(!actor.snapshot.device.activity_known);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn startup_compacts_ten_thousand_legacy_rows_but_archive_count_is_exact() {
         let directory = temporary_directory("startup-compaction");
         let persistence = Persistence::new(&directory).expect("create persistence");
@@ -2980,30 +2026,6 @@ mod tests {
             .count(),
             10_001
         );
-        fs::remove_dir_all(directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn timer_sync_requires_owned_running_connected_and_active() {
-        let (mut actor, directory) = mock_actor("timer-gate");
-        actor.snapshot.connection = ServerConnectionState::Connected;
-        actor.snapshot.test.state = TestState::Running;
-        actor.lifecycle = Lifecycle::Starting;
-        actor.physical = PhysicalState::Active;
-        assert!(!actor.timer_sync_allowed());
-        actor.lifecycle = Lifecycle::RecoveredUncertain;
-        assert!(!actor.timer_sync_allowed());
-        actor.lifecycle = Lifecycle::RunningOwned;
-        actor.physical = PhysicalState::Inactive;
-        assert!(!actor.timer_sync_allowed());
-        actor.physical = PhysicalState::Unknown;
-        assert!(!actor.timer_sync_allowed());
-        actor.physical = PhysicalState::Active;
-        actor.report_generation = Some(actor.connection_generation);
-        actor.snapshot.device.activity_known = true;
-        assert!(actor.timer_sync_allowed());
-        actor.snapshot.connection = ServerConnectionState::Error;
-        assert!(!actor.timer_sync_allowed());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

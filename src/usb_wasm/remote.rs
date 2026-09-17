@@ -1,6 +1,6 @@
 use crate::core::{ApiCommand, AuthoritativeSnapshot};
-use crate::device::{DeviceEvent, OutboundFrame, RemoteConnectionStatus};
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use crate::transport::{DeviceEvent, EventSender, RemoteConnectionStatus, TransportCommand};
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gloo_net::http::Request;
 use gloo_net::websocket::{Message, futures::WebSocket};
@@ -10,15 +10,13 @@ const MAX_RECONNECT_DELAY_MS: u32 = 15_000;
 const COMMAND_HEADER: &str = "X-EBC-Command";
 
 pub(super) async fn remote_task(
-    ctx: egui::Context,
-    mut cmd_rx: UnboundedReceiver<OutboundFrame>,
-    event_tx: UnboundedSender<DeviceEvent>,
+    mut cmd_rx: UnboundedReceiver<TransportCommand>,
+    event_tx: EventSender,
 ) {
     let mut reconnect_delay_ms = 1_000;
     loop {
         send_connection(
             &event_tx,
-            &ctx,
             if reconnect_delay_ms == 1_000 {
                 RemoteConnectionStatus::Connecting
             } else {
@@ -28,7 +26,7 @@ pub(super) async fn remote_task(
         let url = match websocket_url() {
             Ok(url) => url,
             Err(error) => {
-                send_connection(&event_tx, &ctx, RemoteConnectionStatus::Error(error));
+                send_connection(&event_tx, RemoteConnectionStatus::Error(error));
                 return;
             }
         };
@@ -50,12 +48,10 @@ pub(super) async fn remote_task(
                                             reconnect_delay_ms = 1_000;
                                             send_connection(
                                                 &event_tx,
-                                                &ctx,
                                                 RemoteConnectionStatus::Connected,
                                             );
                                         }
-                                        event_tx.unbounded_send(DeviceEvent::Remote(event)).ok();
-                                        ctx.request_repaint();
+                                        event_tx.send(DeviceEvent::Remote(event));
                                     }
                                     Err(error) => log::error!("invalid server websocket event: {error}"),
                                 }
@@ -67,29 +63,21 @@ pub(super) async fn remote_task(
                             }
                             None => break,
                         },
-                        outgoing = command => if let Some(frame) = outgoing {
-                            if let Some(command) = ApiCommand::from_outbound(&frame) {
+                        outgoing = command => if let Some(TransportCommand::Remote(command)) = outgoing {
                                 match send_command(command).await {
                                     Ok(snapshot) => {
-                                        event_tx.unbounded_send(
-                                            DeviceEvent::RemoteCommandSucceeded,
-                                        ).ok();
-                                        event_tx.unbounded_send(DeviceEvent::Remote(
+                                        event_tx.send(DeviceEvent::RemoteCommandSucceeded);
+                                        event_tx.send(DeviceEvent::Remote(
                                             crate::core::WebSocketEvent::Update(
                                                 crate::core::SnapshotUpdate::from(&snapshot),
                                             ),
-                                        )).ok();
-                                        ctx.request_repaint();
+                                        ));
                                     }
                                     Err(error) => {
                                         log::error!("remote command failed: {error}");
-                                        event_tx.unbounded_send(
-                                            DeviceEvent::RemoteCommandError(error),
-                                        ).ok();
-                                        ctx.request_repaint();
+                                        event_tx.send(DeviceEvent::RemoteCommandError(error));
                                     }
                                 }
-                            }
                         } else {
                             let _closed = writer.close().await;
                             return;
@@ -99,21 +87,14 @@ pub(super) async fn remote_task(
             }
             Err(error) => log::warn!("failed to open server websocket: {error}"),
         }
-        send_connection(&event_tx, &ctx, RemoteConnectionStatus::Reconnecting);
+        send_connection(&event_tx, RemoteConnectionStatus::Reconnecting);
         TimeoutFuture::new(reconnect_delay_ms).await;
         reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
     }
 }
 
-fn send_connection(
-    event_tx: &UnboundedSender<DeviceEvent>,
-    ctx: &egui::Context,
-    status: RemoteConnectionStatus,
-) {
-    event_tx
-        .unbounded_send(DeviceEvent::RemoteConnectionChanged(status))
-        .ok();
-    ctx.request_repaint();
+fn send_connection(event_tx: &EventSender, status: RemoteConnectionStatus) {
+    event_tx.send(DeviceEvent::RemoteConnectionChanged(status));
 }
 
 fn websocket_url() -> Result<String, String> {

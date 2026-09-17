@@ -1,13 +1,15 @@
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
 
+use crate::controller::{ControllerMode, DeviceReport, ReportState, TestController};
 use crate::core::{
-    AuthoritativeSnapshot, Sample, ServerConnectionState, SnapshotUpdate, TestState,
+    ApiCommand, AuthoritativeSnapshot, Sample, ServerConnectionState, SnapshotUpdate,
+    TestConfiguration, TestState,
 };
 use crate::device;
 use crate::export::{LogDirection, LogEntry};
+use crate::transport::{DeviceEvent, EventSender, RemoteConnectionStatus, TransportCommand};
 use crate::usb;
-use device::{ConnectionStatus, DeviceEvent, OutboundFrame, RemoteConnectionStatus};
+use device::{ConnectionStatus, OutboundFrame};
 use futures::channel::mpsc;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -99,27 +101,13 @@ fn compact_samples(samples: &mut Vec<Sample>, limit: usize) {
         .collect();
 }
 
-fn timer_sync_eligible(
-    transport_mode: TransportMode,
-    test_state: &TestState,
-    activity_known: bool,
-    active: bool,
-) -> bool {
-    transport_mode == TransportMode::Direct
-        && elapsed_projection_eligible(test_state, activity_known, active)
-}
-
-fn elapsed_projection_eligible(test_state: &TestState, activity_known: bool, active: bool) -> bool {
-    *test_state == TestState::Running && activity_known && active
-}
-
 /// Live device connection, transport status, telemetry, and outgoing command dispatch.
 pub(crate) struct DeviceSession {
     pub(crate) available_devices: Vec<device::UsbDeviceInfo>,
     pub(crate) selected_device_index: Option<usize>,
-    pub(crate) cmd_tx: UnboundedSender<OutboundFrame>,
+    pub(crate) cmd_tx: UnboundedSender<TransportCommand>,
     event_rx: UnboundedReceiver<DeviceEvent>,
-    pub(crate) event_tx: UnboundedSender<DeviceEvent>,
+    pub(crate) event_tx: EventSender,
     pub(crate) status: ConnectionStatus,
     pub(crate) remote_status: RemoteConnectionStatus,
     pub(crate) firmware_version: Option<String>,
@@ -136,21 +124,20 @@ pub(crate) struct DeviceSession {
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) command_error: Option<String>,
     transport_mode: TransportMode,
+    controller: TestController,
     remote_run_id: Option<String>,
     last_remote_sequence: Option<u64>,
-    last_timer_sync_min: u64,
-    mode_started_at: Option<Instant>,
-    mode_accumulated: Duration,
 }
 
 impl Default for DeviceSession {
     fn default() -> Self {
+        let (event_tx, event_rx) = mpsc::unbounded::<DeviceEvent>();
         Self {
             available_devices: Vec::new(),
             selected_device_index: None,
-            cmd_tx: mpsc::unbounded::<OutboundFrame>().0,
-            event_rx: mpsc::unbounded::<DeviceEvent>().1,
-            event_tx: mpsc::unbounded::<DeviceEvent>().0,
+            cmd_tx: mpsc::unbounded::<TransportCommand>().0,
+            event_rx,
+            event_tx: EventSender::new(event_tx, || {}),
             status: ConnectionStatus::Disconnected,
             remote_status: RemoteConnectionStatus::NotUsed,
             firmware_version: None,
@@ -167,25 +154,27 @@ impl Default for DeviceSession {
             log_entries: Vec::new(),
             command_error: None,
             transport_mode: TransportMode::Direct,
+            controller: TestController::new(ControllerMode::Direct),
             remote_run_id: None,
             last_remote_sequence: None,
-            last_timer_sync_min: 0,
-            mode_started_at: None,
-            mode_accumulated: Duration::ZERO,
         }
     }
 }
 
 impl DeviceSession {
     pub(crate) fn new(ctx: &egui::Context) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded::<OutboundFrame>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded::<TransportCommand>();
         let (event_tx, event_rx) = mpsc::unbounded::<DeviceEvent>();
+        let event_tx = EventSender::new(event_tx, {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
         let transport_mode = if usb::is_remote_transport() {
             TransportMode::Remote
         } else {
             TransportMode::Direct
         };
-        usb::spawn_device_worker(ctx.clone(), cmd_rx, event_tx.clone());
+        usb::spawn_device_worker(cmd_rx, event_tx.clone());
         if transport_mode == TransportMode::Direct {
             usb::enumerate_devices(event_tx.clone());
         }
@@ -194,6 +183,7 @@ impl DeviceSession {
             event_rx,
             event_tx,
             transport_mode,
+            controller: TestController::new(ControllerMode::Direct),
             remote_status: if transport_mode == TransportMode::Remote {
                 RemoteConnectionStatus::Connecting
             } else {
@@ -212,35 +202,27 @@ impl DeviceSession {
     }
 
     pub(crate) fn can_start(&self) -> bool {
-        self.has_live_voltage()
-            && !self.mode_on
-            && matches!(
-                self.test_state,
-                TestState::Idle | TestState::Stopped | TestState::Completed
-            )
+        self.controller.capabilities().start
     }
 
     pub(crate) fn can_resume(&self) -> bool {
-        self.has_live_voltage() && !self.mode_on && self.test_state == TestState::Stopped
+        self.controller.capabilities().resume
     }
 
     pub(crate) fn can_calibrate(&self) -> bool {
         self.can_start()
     }
 
+    pub(crate) fn can_adjust(&self) -> bool {
+        self.controller.capabilities().adjust
+    }
+
     pub(crate) fn show_stop_control(&self) -> bool {
-        self.mode_on
-            || matches!(
-                self.test_state,
-                TestState::Starting
-                    | TestState::Running
-                    | TestState::Stopping
-                    | TestState::RecoveredUncertain
-            )
+        self.controller.capabilities().show_stop
     }
 
     pub(crate) fn can_stop(&self) -> bool {
-        self.show_stop_control() && self.test_state != TestState::Stopping
+        self.controller.capabilities().stop
     }
 
     pub(crate) fn can_control_device(&self) -> bool {
@@ -249,115 +231,132 @@ impl DeviceSession {
     }
 
     pub(crate) fn displayed_elapsed_secs(&self) -> f64 {
-        self.elapsed().as_secs_f64()
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.mode_started_at
-            .map_or(self.mode_accumulated, |started| {
-                self.mode_accumulated + started.elapsed()
-            })
-    }
-
-    /// The command is optimistic until an active device report confirms it.
-    pub(crate) fn start_mode(&mut self) {
-        if self.is_remote() {
-            return;
-        }
-        self.mode_on = false;
-        self.activity_known = false;
-        self.test_state = TestState::Starting;
-        self.mode_started_at = None;
-        self.mode_accumulated = Duration::ZERO;
-        self.last_timer_sync_min = 0;
-        self.samples.clear();
-    }
-
-    pub(crate) fn continue_mode(&mut self) {
-        if self.is_remote() {
-            return;
-        }
-        self.mode_on = false;
-        self.activity_known = false;
-        self.test_state = TestState::Starting;
-        self.mode_started_at = None;
-    }
-
-    pub(crate) fn stop_mode(&mut self) {
-        if self.is_remote() {
-            return;
-        }
-        self.freeze_timer();
-        self.test_state = TestState::Stopping;
-    }
-
-    fn freeze_timer(&mut self) {
-        if let Some(started) = self.mode_started_at.take() {
-            self.mode_accumulated += started.elapsed();
-        }
-    }
-
-    fn invalidate_direct_for_gap(&mut self) {
-        self.freeze_timer();
-        if self.mode_on
-            || matches!(
-                self.test_state,
-                TestState::Starting
-                    | TestState::Running
-                    | TestState::Stopping
-                    | TestState::RecoveredUncertain
-            )
-        {
-            self.test_state = TestState::RecoveredUncertain;
-        }
-        self.mode_on = false;
-        self.activity_known = false;
-        self.current_device_mode = None;
+        self.controller.elapsed().as_secs_f64()
     }
 
     /// Direct transports synchronize the device timer. The remote server owns
     /// this responsibility independently of browser clients.
     pub(crate) fn send_timer_sync_if_needed(&mut self, ctx: &egui::Context) {
-        if let Some(elapsed_mins) = self.pending_timer_sync_minute() {
-            self.last_timer_sync_min = elapsed_mins;
-            self.send_cmd(OutboundFrame::TimerSync(elapsed_mins as u16), ctx);
+        if self.transport_mode == TransportMode::Direct
+            && let Some(elapsed_mins) = self.controller.next_timer_sync()
+        {
+            self.send_protocol(OutboundFrame::TimerSync(elapsed_mins), ctx);
         }
     }
 
-    fn pending_timer_sync_minute(&self) -> Option<u64> {
-        if !timer_sync_eligible(
-            self.transport_mode,
-            &self.test_state,
-            self.activity_known,
-            self.mode_on,
-        ) {
-            return None;
-        }
-        let elapsed_mins = self.elapsed().as_secs() / 60;
-        (elapsed_mins > self.last_timer_sync_min
-            && elapsed_mins <= u64::from(device::MAX_TIMER_SYNC_MINUTES))
-        .then_some(elapsed_mins)
-    }
-
-    pub(crate) fn send_cmd(&mut self, frame: OutboundFrame, ctx: &egui::Context) {
+    pub(crate) fn send_command(&mut self, command: ApiCommand, ctx: &egui::Context) {
         if self.is_remote() && self.remote_status != RemoteConnectionStatus::Connected {
-            let error = format!("browser is disconnected; command was not sent: {frame:?}");
+            let error = format!("browser is disconnected; command was not sent: {command:?}");
             log::warn!("{error}");
             self.command_error = Some(error);
             return;
         }
-        let raw_bytes = if self.is_remote() {
-            Vec::new()
-        } else {
-            <[u8; device::OUTBOUND_FRAME_SIZE]>::from(frame).to_vec()
+        if self.is_remote() {
+            self.log_command(format!("{command:?}"), Vec::new(), ctx);
+            self.cmd_tx
+                .unbounded_send(TransportCommand::Remote(command))
+                .ok();
+            return;
+        }
+        let prepared = match self.controller.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.command_error = Some(error);
+                return;
+            }
         };
+        self.send_prepared(command, prepared, ctx);
+    }
+
+    pub(crate) fn resume(&mut self, config: TestConfiguration, ctx: &egui::Context) {
+        if self.is_remote() {
+            self.send_command(ApiCommand::Resume, ctx);
+            return;
+        }
+        let prepared = match self.controller.prepare_resume(config) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.command_error = Some(error);
+                return;
+            }
+        };
+        self.send_prepared(ApiCommand::Resume, prepared, ctx);
+    }
+
+    fn send_prepared(
+        &mut self,
+        command: ApiCommand,
+        prepared: crate::controller::PreparedCommand,
+        ctx: &egui::Context,
+    ) {
+        if let Some(frame) = prepared.frame() {
+            self.send_protocol(frame, ctx);
+        }
+        let starts_fresh = matches!(command, ApiCommand::Start(_));
+        self.controller.commit_command(prepared, None);
+        if starts_fresh {
+            self.samples.clear();
+        }
+        self.sync_controller_view();
+    }
+
+    fn send_protocol(&mut self, frame: OutboundFrame, ctx: &egui::Context) {
+        let raw_bytes = <[u8; device::OUTBOUND_FRAME_SIZE]>::from(frame).to_vec();
+        self.log_command(format!("{frame:?}"), raw_bytes, ctx);
+        self.cmd_tx
+            .unbounded_send(TransportCommand::Protocol(frame))
+            .ok();
+    }
+
+    fn log_command(&mut self, label: String, raw_bytes: Vec<u8>, ctx: &egui::Context) {
         self.log_entries.push(LogEntry {
             direction: LogDirection::Out,
-            label: format!("{frame:?}"),
+            label,
             timestamp: ctx.input(|input| input.time),
             raw_bytes,
         });
-        self.cmd_tx.unbounded_send(frame).ok();
+    }
+
+    pub(crate) fn connect(&mut self, index: usize, ctx: &egui::Context) {
+        let command = if self.is_remote() {
+            self.log_command(format!("{:?}", ApiCommand::Connect), Vec::new(), ctx);
+            TransportCommand::Remote(ApiCommand::Connect)
+        } else {
+            self.log_command(
+                format!("{:?}", OutboundFrame::Connect(index)),
+                <[u8; device::OUTBOUND_FRAME_SIZE]>::from(OutboundFrame::Connect(index)).to_vec(),
+                ctx,
+            );
+            TransportCommand::Connect(index)
+        };
+        self.cmd_tx.unbounded_send(command).ok();
+    }
+
+    pub(crate) fn disconnect_device(&mut self, ctx: &egui::Context) {
+        if self.is_remote() {
+            self.log_command(format!("{:?}", ApiCommand::Stop), Vec::new(), ctx);
+            self.log_command(format!("{:?}", ApiCommand::Disconnect), Vec::new(), ctx);
+            self.cmd_tx
+                .unbounded_send(TransportCommand::Remote(ApiCommand::Stop))
+                .ok();
+            self.cmd_tx
+                .unbounded_send(TransportCommand::Remote(ApiCommand::Disconnect))
+                .ok();
+        } else {
+            for frame in [OutboundFrame::Stop, OutboundFrame::Disconnect] {
+                self.log_command(
+                    format!("{frame:?}"),
+                    <[u8; device::OUTBOUND_FRAME_SIZE]>::from(frame).to_vec(),
+                    ctx,
+                );
+            }
+            self.cmd_tx
+                .unbounded_send(TransportCommand::Protocol(OutboundFrame::Stop))
+                .ok();
+            self.cmd_tx
+                .unbounded_send(TransportCommand::Disconnect)
+                .ok();
+        }
     }
 
     /// A remote browser never owns hardware lifetime, so closing or reloading
@@ -366,14 +365,12 @@ impl DeviceSession {
         if self.is_remote() {
             return;
         }
-        self.cmd_tx.unbounded_send(OutboundFrame::Stop).ok();
-        self.cmd_tx.unbounded_send(OutboundFrame::Disconnect).ok();
-    }
-
-    fn update_timer(&mut self, elapsed_seconds: u64, running: bool) {
-        self.mode_accumulated = Duration::from_secs(elapsed_seconds);
-        self.mode_started_at = running.then(Instant::now);
-        self.last_timer_sync_min = elapsed_seconds / 60;
+        self.cmd_tx
+            .unbounded_send(TransportCommand::Protocol(OutboundFrame::Stop))
+            .ok();
+        self.cmd_tx
+            .unbounded_send(TransportCommand::Disconnect)
+            .ok();
     }
 
     fn apply_snapshot(&mut self, snapshot: AuthoritativeSnapshot) {
@@ -390,6 +387,7 @@ impl DeviceSession {
     }
 
     fn apply_update(&mut self, update: SnapshotUpdate) {
+        let connected = update.connection == ServerConnectionState::Connected;
         self.status = match update.connection {
             ServerConnectionState::Disconnected => ConnectionStatus::Disconnected,
             ServerConnectionState::Connecting => ConnectionStatus::Connecting,
@@ -400,23 +398,9 @@ impl DeviceSession {
                     .unwrap_or_else(|| "backend device error".to_owned()),
             ),
         };
-        self.firmware_version = update.device.firmware_version;
-        self.model_name = update.device.model;
-        self.live_voltage_mv = update.device.voltage_mv.unwrap_or(0);
-        self.live_current_ma = update.device.current_ma.unwrap_or(0);
-        self.live_milli_ampere_hours = update
-            .test
-            .capacity_mah
-            .or_else(|| update.device.capacity_mah.map(u64::from))
-            .unwrap_or(0);
-        self.live_energy_wh = update.test.energy_wh;
-        self.current_device_mode = update.device.mode;
-        self.activity_known = update.device.activity_known;
-        self.mode_on = update.device.active;
-        self.test_state = update.test.state;
-        let timer_running =
-            elapsed_projection_eligible(&self.test_state, self.activity_known, self.mode_on);
-        self.update_timer(update.test.elapsed_seconds, timer_running);
+        self.controller
+            .replace_authoritative(connected, update.device, update.test);
+        self.sync_controller_view();
     }
 
     fn apply_sample(&mut self, sample: Sample) {
@@ -444,19 +428,20 @@ impl DeviceSession {
     }
 
     fn handle_firmware_report(&mut self, report: device::FirmwareReport) {
-        self.current_device_mode = Some(report.device_mode);
-        self.apply_direct_report_state(if report.in_progress {
-            Some(device::ModeReportState::Active)
-        } else {
-            None
+        self.controller.report(DeviceReport {
+            mode: report.device_mode,
+            state: if report.in_progress {
+                ReportState::Active
+            } else {
+                ReportState::InactiveUnknown
+            },
+            voltage_mv: report.voltage_mv,
+            current_ma: report.current_ma,
+            capacity_mah: report.milli_ampere_hours,
+            model: report.device_type,
+            firmware_version: Some(report.firmware_version),
         });
-        self.live_voltage_mv = report.voltage_mv;
-        self.live_current_ma = report.current_ma;
-        self.live_milli_ampere_hours = u64::from(report.milli_ampere_hours);
-        self.live_energy_wh =
-            report.voltage_mv as f64 * report.milli_ampere_hours as f64 / 1_000_000.0;
-        self.firmware_version = Some(report.firmware_version);
-        self.model_name = Some(report.device_type);
+        self.sync_controller_view();
     }
 
     fn handle_measurement(
@@ -468,14 +453,21 @@ impl DeviceSession {
         capacity_mah: u16,
         model: String,
     ) {
-        self.current_device_mode = Some(mode);
-        self.apply_direct_report_state(Some(report_state));
-        self.live_voltage_mv = voltage_mv;
-        self.live_current_ma = current_ma;
-        self.live_milli_ampere_hours = u64::from(capacity_mah);
-        self.live_energy_wh = voltage_mv as f64 * capacity_mah as f64 / 1_000_000.0;
-        self.model_name = Some(model);
-        if self.mode_on {
+        self.handle_direct_report(DeviceReport {
+            mode,
+            state: report_state.into(),
+            voltage_mv,
+            current_ma,
+            capacity_mah,
+            model,
+            firmware_version: None,
+        });
+    }
+
+    fn handle_direct_report(&mut self, report: DeviceReport) {
+        let (_, measurement) = self.controller.report(report);
+        self.sync_controller_view();
+        if let Some(measurement) = measurement {
             let sequence = self
                 .samples
                 .last()
@@ -484,12 +476,12 @@ impl DeviceSession {
                 run_id: String::new(),
                 sequence,
                 timestamp_utc: String::new(),
-                elapsed_seconds: self.elapsed().as_secs(),
-                voltage_mv,
-                current_ma,
-                capacity_mah: u64::from(capacity_mah),
-                energy_wh: self.live_energy_wh,
-                mode,
+                elapsed_seconds: measurement.elapsed_seconds,
+                voltage_mv: measurement.voltage_mv,
+                current_ma: measurement.current_ma,
+                capacity_mah: measurement.capacity_mah,
+                energy_wh: measurement.energy_wh,
+                mode: measurement.mode,
             });
             if self.samples.len() > MAX_PRESENTATION_SAMPLES {
                 compact_samples(&mut self.samples, COMPACTED_PRESENTATION_SAMPLES);
@@ -497,44 +489,39 @@ impl DeviceSession {
         }
     }
 
-    fn apply_direct_report_state(&mut self, report_state: Option<device::ModeReportState>) {
-        let active = report_state == Some(device::ModeReportState::Active);
-        self.activity_known = true;
-        self.mode_on = active;
-        if active {
-            if self.test_state == TestState::Starting {
-                self.test_state = TestState::Running;
-            }
-            if self.test_state == TestState::Running && self.mode_started_at.is_none() {
-                self.mode_started_at = Some(Instant::now());
-            }
-        } else {
-            self.freeze_timer();
-            self.test_state = match (self.test_state.clone(), report_state) {
-                (TestState::Starting, _) => TestState::Starting,
-                (TestState::Stopping | TestState::RecoveredUncertain, _)
-                | (TestState::Running, Some(device::ModeReportState::Idle)) => TestState::Stopped,
-                (TestState::Running, Some(device::ModeReportState::Finished)) => {
-                    TestState::Completed
-                }
-                (state, _) => state,
-            };
-            if matches!(self.test_state, TestState::Stopped | TestState::Completed) {
-                self.mode_on = false;
-            }
-        }
+    fn sync_controller_view(&mut self) {
+        let device = self.controller.device();
+        let test = self.controller.test();
+        self.firmware_version.clone_from(&device.firmware_version);
+        self.model_name.clone_from(&device.model);
+        self.live_voltage_mv = device.voltage_mv.unwrap_or(0);
+        self.live_current_ma = device.current_ma.unwrap_or(0);
+        self.live_milli_ampere_hours = test
+            .capacity_mah
+            .or_else(|| device.capacity_mah.map(u64::from))
+            .unwrap_or(0);
+        self.live_energy_wh = test.energy_wh;
+        self.current_device_mode = device.mode;
+        self.activity_known = device.activity_known;
+        self.mode_on = device.active;
+        self.test_state.clone_from(&test.state);
     }
 
     pub(crate) fn consume_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 DeviceEvent::StatusChanged(status) => {
-                    if matches!(
-                        status,
-                        ConnectionStatus::Disconnected | ConnectionStatus::Error(_)
-                    ) && !self.is_remote()
-                    {
-                        self.invalidate_direct_for_gap();
+                    if !self.is_remote() {
+                        match &status {
+                            ConnectionStatus::Connecting => {
+                                self.controller.begin_connection("connection changed");
+                            }
+                            ConnectionStatus::Connected => self.controller.connection_established(),
+                            ConnectionStatus::Disconnected | ConnectionStatus::Error(_) => {
+                                self.controller.disconnect("device connection lost");
+                            }
+                        }
+                        self.sync_controller_view();
                     }
                     log::info!("Device status changed: {status:?}");
                     self.status = status;
@@ -716,158 +703,24 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_projection_requires_known_active_running_state() {
-        assert!(elapsed_projection_eligible(&TestState::Running, true, true));
-        assert!(!elapsed_projection_eligible(
-            &TestState::RecoveredUncertain,
-            true,
-            true
-        ));
-        assert!(!elapsed_projection_eligible(
-            &TestState::Running,
-            false,
-            true
-        ));
-        assert!(!elapsed_projection_eligible(
-            &TestState::Running,
-            true,
-            false
-        ));
-    }
-
-    #[test]
-    fn direct_timer_sync_waits_for_confirmed_active_report() {
+    fn firmware_identity_reports_do_not_add_presentation_samples() {
         let mut session = DeviceSession::default();
-        session.start_mode();
-        session.mode_accumulated = Duration::from_secs(60);
+        session.handle_firmware_report(device::FirmwareReport {
+            device_mode: device::DeviceMode::DischargeConstantCurrent,
+            in_progress: true,
+            current_ma: 1000,
+            voltage_mv: 3900,
+            milli_ampere_hours: 5,
+            unknown: 0,
+            firmware_version: "1.0".to_owned(),
+            unknown1: 2988,
+            unknown2: 2087,
+            device_type: "EBC-A20".to_owned(),
+        });
 
-        assert!(!session.activity_known);
-        assert_eq!(session.pending_timer_sync_minute(), None);
-
-        session.handle_measurement(
-            device::DeviceMode::DischargeConstantCurrent,
-            device::ModeReportState::Active,
-            3900,
-            1000,
-            5,
-            "EBC-A20".to_owned(),
-        );
-
-        assert!(session.activity_known);
-        assert_eq!(session.pending_timer_sync_minute(), Some(1));
-
-        session.handle_measurement(
-            device::DeviceMode::DischargeConstantCurrent,
-            device::ModeReportState::Finished,
-            3900,
-            0,
-            5,
-            "EBC-A20".to_owned(),
-        );
-        assert_eq!(session.pending_timer_sync_minute(), None);
-        assert!(session.mode_started_at.is_none());
-    }
-
-    #[test]
-    fn direct_timer_sync_stops_at_canonical_base240_maximum() {
-        let mut session = DeviceSession {
-            activity_known: true,
-            mode_on: true,
-            test_state: TestState::Running,
-            mode_started_at: None,
-            mode_accumulated: Duration::from_secs(u64::from(device::MAX_TIMER_SYNC_MINUTES) * 60),
-            ..DeviceSession::default()
-        };
-        assert_eq!(
-            session.pending_timer_sync_minute(),
-            Some(u64::from(device::MAX_TIMER_SYNC_MINUTES))
-        );
-
-        session.mode_accumulated += Duration::from_secs(60);
-        assert_eq!(session.pending_timer_sync_minute(), None);
-    }
-
-    #[test]
-    fn direct_start_ignores_buffered_idle_until_active_report() {
-        let mut session = DeviceSession::default();
-        session.start_mode();
-
-        session.apply_direct_report_state(Some(device::ModeReportState::Idle));
-        session.apply_direct_report_state(None);
-        assert_eq!(session.test_state, TestState::Starting);
-        assert!(session.mode_started_at.is_none());
-
-        session.apply_direct_report_state(Some(device::ModeReportState::Active));
-        assert_eq!(session.test_state, TestState::Running);
-        assert!(session.mode_started_at.is_some());
-    }
-
-    #[test]
-    fn direct_mode_reports_distinguish_idle_finished_and_ambiguous_inactive() {
-        for (report_state, expected) in [
-            (device::ModeReportState::Idle, TestState::Stopped),
-            (device::ModeReportState::Finished, TestState::Completed),
-        ] {
-            let mut session = DeviceSession {
-                activity_known: true,
-                mode_on: true,
-                test_state: TestState::Running,
-                mode_started_at: Some(Instant::now()),
-                ..DeviceSession::default()
-            };
-            session.apply_direct_report_state(None);
-            assert_eq!(session.test_state, TestState::Running);
-            session.apply_direct_report_state(Some(report_state));
-            assert_eq!(session.test_state, expected);
-        }
-    }
-
-    #[test]
-    fn controls_require_fresh_authoritative_activity() {
-        let mut session = DeviceSession {
-            live_voltage_mv: 3900,
-            ..DeviceSession::default()
-        };
-        assert!(!session.can_start());
-        assert!(!session.can_calibrate());
-
-        session.activity_known = true;
-        assert!(session.can_start());
-        assert!(session.can_calibrate());
-
-        session.start_mode();
-        assert_eq!(session.test_state, TestState::Starting);
-        assert!(session.show_stop_control());
-        assert!(session.can_stop());
-        assert!(!session.can_start());
-        assert!(!session.can_calibrate());
-
-        session.test_state = TestState::Stopping;
-        assert!(!session.can_stop());
-    }
-
-    #[test]
-    fn direct_connection_gap_never_reclaims_running_state() {
-        let mut session = DeviceSession {
-            activity_known: true,
-            mode_on: true,
-            test_state: TestState::Running,
-            mode_started_at: Some(Instant::now()),
-            ..DeviceSession::default()
-        };
-
-        session.invalidate_direct_for_gap();
-        assert_eq!(session.test_state, TestState::RecoveredUncertain);
-        assert!(!session.activity_known);
-        assert!(!session.mode_on);
-        assert!(session.mode_started_at.is_none());
-
-        session.apply_direct_report_state(Some(device::ModeReportState::Active));
-        assert_eq!(session.test_state, TestState::RecoveredUncertain);
-        assert!(session.mode_started_at.is_none());
-
-        session.apply_direct_report_state(Some(device::ModeReportState::Idle));
-        assert_eq!(session.test_state, TestState::Stopped);
+        assert!(session.samples.is_empty());
+        assert_eq!(session.firmware_version.as_deref(), Some("1.0"));
+        assert!(session.mode_on);
     }
 
     #[test]

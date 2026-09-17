@@ -1,8 +1,9 @@
 use super::connection;
-use crate::device::{ConnectionStatus, DeviceEvent, OUTBOUND_FRAME_SIZE, OutboundFrame};
+use crate::device::{ConnectionStatus, OUTBOUND_FRAME_SIZE, OutboundFrame};
+use crate::transport::{DeviceEvent, EventSender, TransportCommand};
 use futures::FutureExt as _;
 use futures::StreamExt as _;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::channel::oneshot;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
@@ -11,49 +12,38 @@ use wasm_bindgen_futures::JsFuture;
 const INBOUND_BUFFER_SIZE: u32 = 64;
 
 pub(super) async fn device_task(
-    ctx: egui::Context,
-    mut cmd_rx: UnboundedReceiver<OutboundFrame>,
-    event_tx: UnboundedSender<DeviceEvent>,
+    mut cmd_rx: UnboundedReceiver<TransportCommand>,
+    event_tx: EventSender,
 ) {
     let mut stop_reading_tx: Option<oneshot::Sender<()>> = None;
     let mut device: Option<web_sys::UsbDevice> = None;
     let mut out_endpoint_num: Option<u8> = None;
     loop {
         match cmd_rx.next().await {
-            Some(OutboundFrame::Connect(idx)) => {
-                event_tx
-                    .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Connecting))
-                    .ok();
-                ctx.request_repaint();
+            Some(TransportCommand::Connect(idx)) => {
+                event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Connecting));
                 match connection::connect(idx).await {
                     Ok(state) => {
                         let dev = state.device;
                         out_endpoint_num = Some(state.out_endpoint_num);
                         let (stop_tx, stop_rx) = oneshot::channel();
                         stop_reading_tx = Some(stop_tx);
-                        event_tx
-                            .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Connected))
-                            .ok();
+                        event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Connected));
                         wasm_bindgen_futures::spawn_local(reading_task(
                             dev.clone(),
                             state.in_endpoint_num,
                             event_tx.clone(),
                             stop_rx,
-                            ctx.clone(),
                         ));
                         device = Some(dev);
-                        ctx.request_repaint();
                     }
                     Err(e) => {
                         log::error!("Failed to connect: {e}");
-                        event_tx
-                            .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Error(e)))
-                            .ok();
-                        ctx.request_repaint();
+                        event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(e)));
                     }
                 }
             }
-            Some(OutboundFrame::Disconnect) => {
+            Some(TransportCommand::Disconnect) => {
                 if let (Some(device), Some(ep)) = (&device, out_endpoint_num) {
                     if let Some(stop_tx) = stop_reading_tx.take() {
                         let result = stop_tx.send(());
@@ -68,30 +58,27 @@ pub(super) async fn device_task(
                 }
                 device = None;
                 out_endpoint_num = None;
-                event_tx
-                    .unbounded_send(DeviceEvent::StatusChanged(ConnectionStatus::Disconnected))
-                    .ok();
-                ctx.request_repaint();
+                event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Disconnected));
             }
-            Some(OutboundFrame::Stop) => {
-                if let (Some(device), Some(ep)) = (&device, out_endpoint_num) {
-                    let result = connection::stop(device, ep).await;
-                    if let Err(e) = result {
-                        log::error!("Failed to send stop command: {e:?}");
-                    }
+            Some(TransportCommand::Protocol(OutboundFrame::Stop)) => {
+                if let (Some(device), Some(ep)) = (&device, out_endpoint_num)
+                    && let Err(e) = connection::stop(device, ep).await
+                {
+                    log::error!("Failed to send stop command: {e:?}");
                 }
             }
             // Every other frame (discharge/charge start/adjust/continue, timer
             // sync, calibration) is a plain "encode and transfer" command with
             // no extra connection-state bookkeeping, so they all funnel through
             // send_frame.
-            Some(frame) => {
+            Some(TransportCommand::Protocol(frame)) => {
                 if let (Some(device), Some(ep)) = (&device, out_endpoint_num)
                     && let Err(e) = send_frame(device, ep, frame).await
                 {
                     log::error!("Failed to send {frame:?}: {e:?}");
                 }
             }
+            Some(TransportCommand::Remote(_)) => {}
             None => break,
         }
     }
@@ -115,9 +102,8 @@ async fn send_frame(
 async fn reading_task(
     device: web_sys::UsbDevice,
     in_endpoint: u8,
-    event_tx: UnboundedSender<DeviceEvent>,
+    event_tx: EventSender,
     mut stop_reading_rx: oneshot::Receiver<()>,
-    ctx: egui::Context,
 ) {
     let mut buf: Vec<u8> = Vec::new();
     loop {
@@ -130,17 +116,15 @@ async fn reading_task(
                     if let Some(data) = result.data() {
                         buf.extend_from_slice(&js_sys::Uint8Array::new(&data.buffer()).to_vec());
                         for (frame, raw) in crate::device::process_buffer(&mut buf) {
-                            event_tx.unbounded_send(DeviceEvent::Frame(frame, raw)).ok();
-                            ctx.request_repaint();
+                            event_tx.send(DeviceEvent::Frame(frame, raw));
                         }
                     }
                 }
                 Err(e) => {
                     log::error!("Bulk IN transfer failed: {e:?}");
-                    event_tx.unbounded_send(DeviceEvent::StatusChanged(
+                    event_tx.send(DeviceEvent::StatusChanged(
                         ConnectionStatus::Error("Read error: connection lost".to_owned()),
-                    )).ok();
-                    ctx.request_repaint();
+                    ));
                     return;
                 }
             },
