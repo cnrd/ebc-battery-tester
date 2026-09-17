@@ -13,17 +13,21 @@ mod update_check;
 
 #[cfg(feature = "gui")]
 mod app;
+#[cfg(feature = "gui")]
+mod backend;
+#[cfg(feature = "gui")]
+mod backend_client;
 pub mod controller;
 pub mod core;
 pub mod device;
 #[cfg(feature = "gui")]
 mod export;
+#[cfg(feature = "gui")]
+mod local_backend;
 #[cfg(all(not(target_arch = "wasm32"), feature = "server"))]
 pub mod server;
 #[cfg(feature = "gui")]
 mod session;
-#[cfg(feature = "gui")]
-mod transport;
 #[cfg(feature = "gui")]
 mod ui;
 #[cfg(feature = "gui")]

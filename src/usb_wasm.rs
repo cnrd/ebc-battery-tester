@@ -1,5 +1,5 @@
-use crate::device::{ConnectionStatus, UsbDeviceInfo};
-use crate::transport::{DeviceEvent, EventSender, TransportCommand};
+use crate::backend::{BackendCommand, BackendEvent, BackendEventSender};
+use crate::device::UsbDeviceInfo;
 use futures::channel::mpsc::UnboundedReceiver;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_futures::JsFuture;
@@ -11,7 +11,7 @@ mod remote;
 #[path = "usb_wasm/worker.rs"]
 mod worker;
 
-pub fn is_remote_transport() -> bool {
+pub fn is_remote_backend() -> bool {
     let Some(window) = web_sys::window() else {
         return crate::session::select_wasm_transport(
             option_env!("EBC_WASM_DEFAULT_TRANSPORT").unwrap_or("webusb"),
@@ -30,71 +30,76 @@ pub fn is_remote_transport() -> bool {
     ) == crate::session::TransportMode::Remote
 }
 
-pub fn enumerate_devices(event_tx: EventSender) {
-    if is_remote_transport() {
+pub(super) async fn enumerate_devices(event_tx: &BackendEventSender) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let usb = window.navigator().usb();
+    if usb.is_undefined() {
+        event_tx.send(BackendEvent::CommandError(
+            "WebUSB API not supported".to_owned(),
+        ));
         return;
     }
-    wasm_bindgen_futures::spawn_local(async move {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let usb = window.navigator().usb();
-        if usb.is_undefined() {
-            log::error!("WebUSB API not supported in this browser");
-            event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
-                "WebUSB API not supported".to_owned(),
+    match JsFuture::from(usb.get_devices()).await {
+        Ok(value) => {
+            let mut devices = Vec::new();
+            for item in js_sys::Array::from(&value) {
+                let device: web_sys::UsbDevice = item.unchecked_into();
+                devices.push(UsbDeviceInfo {
+                    product_name: device.product_name().unwrap_or_default(),
+                    manufacturer_name: device.manufacturer_name().unwrap_or_default(),
+                    vendor_id: device.vendor_id(),
+                    product_id: device.product_id(),
+                });
+            }
+            event_tx.send(BackendEvent::DevicesUpdated(devices));
+        }
+        Err(error) => {
+            log::error!("Failed to enumerate USB devices: {error:?}");
+            event_tx.send(BackendEvent::CommandError(format!(
+                "Failed to enumerate USB devices: {error:?}"
             )));
-            return;
         }
-        match JsFuture::from(usb.get_devices()).await {
-            Ok(value) => {
-                let mut devices = Vec::new();
-                for item in js_sys::Array::from(&value) {
-                    let device: web_sys::UsbDevice = item.unchecked_into();
-                    devices.push(UsbDeviceInfo {
-                        product_name: device.product_name().unwrap_or_default(),
-                        manufacturer_name: device.manufacturer_name().unwrap_or_default(),
-                        vendor_id: device.vendor_id(),
-                        product_id: device.product_id(),
-                    });
-                }
-                event_tx.send(DeviceEvent::DevicesUpdated(devices));
-            }
-            Err(e) => {
-                log::error!("Failed to enumerate USB devices: {e:?}");
-                event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
-                    format!("Failed to enumerate USB devices: {e:?}"),
-                )));
-            }
-        }
-    });
+    }
 }
 
-pub fn request_device(event_tx: EventSender) {
-    if is_remote_transport() {
+pub fn request_device_access(event_tx: BackendEventSender) {
+    if is_remote_backend() {
         return;
     }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let usb = window.navigator().usb();
+    if usb.is_undefined() {
+        event_tx.send(BackendEvent::CommandError(
+            "WebUSB API not supported".to_owned(),
+        ));
+        return;
+    }
+    let filter = web_sys::UsbDeviceFilter::new();
+    filter.set_vendor_id(crate::device::VENDOR_ID);
+    let options = web_sys::UsbDeviceRequestOptions::new(&[filter]);
+    // Invoke requestDevice synchronously while the click's user activation is live.
+    let promise = usb.request_device(&options);
     wasm_bindgen_futures::spawn_local(async move {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let usb = window.navigator().usb();
-        let filter = web_sys::UsbDeviceFilter::new();
-        filter.set_vendor_id(crate::device::VENDOR_ID);
-        let options = web_sys::UsbDeviceRequestOptions::new(&[filter]);
-        match JsFuture::from(usb.request_device(&options)).await {
-            Ok(_) => enumerate_devices(event_tx),
-            Err(e) => {
-                log::warn!("USB device request cancelled or denied: {e:?}");
+        match JsFuture::from(promise).await {
+            Ok(_) => enumerate_devices(&event_tx).await,
+            Err(error) => {
+                log::warn!("USB device request cancelled or denied: {error:?}");
+                event_tx.send(BackendEvent::CommandError(
+                    "USB device request was cancelled or denied".to_owned(),
+                ));
             }
         }
     });
 }
 
-pub fn spawn_device_worker(cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: EventSender) {
-    if is_remote_transport() {
-        wasm_bindgen_futures::spawn_local(remote::remote_task(cmd_rx, event_tx));
+pub fn spawn_backend(command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
+    if is_remote_backend() {
+        wasm_bindgen_futures::spawn_local(remote::remote_task(command_rx, event_tx));
     } else {
-        wasm_bindgen_futures::spawn_local(worker::device_task(cmd_rx, event_tx));
+        wasm_bindgen_futures::spawn_local(worker::local_backend_task(command_rx, event_tx));
     }
 }

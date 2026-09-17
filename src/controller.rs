@@ -841,6 +841,11 @@ impl TestController {
         self.test.elapsed_seconds = self.clock.elapsed().as_secs();
     }
 
+    #[cfg(all(test, feature = "gui"))]
+    pub(crate) fn set_elapsed_for_test(&mut self, seconds: u64) {
+        self.clock.accumulated = Duration::from_secs(seconds);
+    }
+
     fn has_fresh_report(&self, physical: PhysicalState) -> bool {
         self.connected
             && self.report_generation == Some(self.connection_generation)

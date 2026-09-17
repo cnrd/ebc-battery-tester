@@ -1,7 +1,6 @@
+use crate::backend::BackendConnectionStatus;
 use crate::device::ConnectionStatus;
 use crate::session::DeviceSession;
-use crate::transport::RemoteConnectionStatus;
-use crate::usb;
 
 pub(crate) fn ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
     if session.is_remote() {
@@ -29,10 +28,10 @@ pub(crate) fn ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             #[cfg(target_arch = "wasm32")]
             if ui.button("Add USB device").clicked() {
-                usb::request_device(session.event_tx.clone());
+                session.request_device_access();
             }
             if ui.button("Refresh").clicked() {
-                usb::enumerate_devices(session.event_tx.clone());
+                session.refresh_devices();
             }
         });
         ui.add_sized(
@@ -55,7 +54,7 @@ pub(crate) fn ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
                 if let Some(idx) = session.selected_device_index
                     && ui.button("Connect").clicked()
                 {
-                    session.connect(idx, ui.ctx());
+                    session.connect(idx);
                 }
             }
             ConnectionStatus::Connecting => {
@@ -64,14 +63,14 @@ pub(crate) fn ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
             }
             ConnectionStatus::Connected => {
                 if ui.button("Disconnect").clicked() {
-                    session.disconnect_device(ui.ctx());
+                    session.disconnect_device();
                 }
             }
             ConnectionStatus::Error(_) => {
                 if let Some(idx) = session.selected_device_index
                     && ui.button("Retry").clicked()
                 {
-                    session.connect(idx, ui.ctx());
+                    session.connect(idx);
                 }
             }
         });
@@ -79,29 +78,35 @@ pub(crate) fn ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
     if let ConnectionStatus::Error(msg) = &session.status {
         ui.colored_label(egui::Color32::RED, format!("Error: {msg}"));
     }
+    if let Some(error) = &session.command_error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Command failed: {error}"),
+        );
+    }
 }
 
-fn remote_ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
+fn remote_ui(session: &DeviceSession, ui: &mut egui::Ui) {
     ui.heading("Remote Server");
-    let browser_connected = session.remote_status == RemoteConnectionStatus::Connected;
+    let browser_connected = session.remote_status == BackendConnectionStatus::Connected;
     egui::Grid::new("remote_connection_status").show(ui, |ui| {
         ui.label("Browser:");
         match &session.remote_status {
-            RemoteConnectionStatus::NotUsed => {
+            BackendConnectionStatus::NotUsed => {
                 ui.label("--");
             }
-            RemoteConnectionStatus::Connecting => {
+            BackendConnectionStatus::Connecting => {
                 ui.spinner();
                 ui.label("Connecting");
             }
-            RemoteConnectionStatus::Connected => {
+            BackendConnectionStatus::Connected => {
                 ui.colored_label(egui::Color32::GREEN, "Connected");
             }
-            RemoteConnectionStatus::Reconnecting => {
+            BackendConnectionStatus::Reconnecting => {
                 ui.spinner();
                 ui.label("Reconnecting");
             }
-            RemoteConnectionStatus::Error(error) => {
+            BackendConnectionStatus::Error(error) => {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
         }
@@ -115,7 +120,7 @@ fn remote_ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
                     .add_enabled(browser_connected, egui::Button::new("Connect device"))
                     .clicked()
                 {
-                    session.connect(0, ui.ctx());
+                    session.connect(0);
                 }
             }
             ConnectionStatus::Connecting => {
@@ -128,7 +133,7 @@ fn remote_ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
                     .add_enabled(browser_connected, egui::Button::new("Disconnect device"))
                     .clicked()
                 {
-                    session.disconnect_device(ui.ctx());
+                    session.disconnect_device();
                 }
             }
             ConnectionStatus::Error(error) => {
@@ -137,7 +142,7 @@ fn remote_ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
                     .add_enabled(browser_connected, egui::Button::new("Retry device"))
                     .clicked()
                 {
-                    session.connect(0, ui.ctx());
+                    session.connect(0);
                 }
             }
         }

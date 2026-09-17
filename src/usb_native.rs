@@ -1,22 +1,24 @@
 use std::io::{Read as _, Write as _};
 
-use crate::device::{ConnectionStatus, OUTBOUND_FRAME_SIZE, OutboundFrame, UsbDeviceInfo};
-use crate::transport::{DeviceEvent, EventSender, TransportCommand};
+use crate::backend::{
+    BackendCommand, BackendEvent, BackendEventSender, DiagnosticDirection, DiagnosticEvent,
+};
+use crate::device::{OUTBOUND_FRAME_SIZE, OutboundFrame, UsbDeviceInfo};
+use crate::local_backend::{LocalBackend, LocalOutput};
 use futures::channel::mpsc::UnboundedReceiver;
 use serialport::SerialPortType;
 
 const BAUD_RATE: u32 = 9600;
 const SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(10);
 
-pub const fn is_remote_transport() -> bool {
+pub const fn is_remote_backend() -> bool {
     false
 }
 
-#[expect(clippy::needless_pass_by_value)]
-pub fn enumerate_devices(event_tx: EventSender) {
+fn available_devices() -> Vec<UsbDeviceInfo> {
     let all_ports = serialport::available_ports().unwrap_or_default();
     log::debug!("All serial ports: {all_ports:?}");
-    let devices = all_ports
+    all_ports
         .into_iter()
         .filter_map(|p| {
             if let SerialPortType::UsbPort(usb) = p.port_type
@@ -31,12 +33,16 @@ pub fn enumerate_devices(event_tx: EventSender) {
             }
             None
         })
-        .collect();
-    event_tx.send(DeviceEvent::DevicesUpdated(devices));
+        .collect()
 }
 
-pub fn spawn_device_worker(cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: EventSender) {
-    std::thread::spawn(move || device_thread(cmd_rx, event_tx));
+pub fn spawn_backend(command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("ebc-local-backend".to_owned())
+        .spawn(move || backend_thread(command_rx, event_tx))
+    {
+        log::error!("failed to spawn local backend thread: {error}");
+    }
 }
 
 fn find_ch340_port(idx: usize) -> Option<String> {
@@ -64,47 +70,49 @@ fn connect(idx: usize) -> Result<Box<dyn serialport::SerialPort>, String> {
 }
 
 #[expect(clippy::needless_pass_by_value)]
-fn device_thread(mut cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: EventSender) -> ! {
+fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
+    let mut backend = LocalBackend::default();
     let mut port: Option<Box<dyn serialport::SerialPort>> = None;
     let mut buffer: Vec<u8> = Vec::new();
 
-    loop {
+    'runtime: loop {
         loop {
-            match cmd_rx.try_recv() {
-                Ok(TransportCommand::Connect(idx)) => {
-                    event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Connecting));
+            match command_rx.try_recv() {
+                Ok(BackendCommand::RefreshDevices) => {
+                    event_tx.send(BackendEvent::DevicesUpdated(available_devices()));
+                }
+                Ok(BackendCommand::Connect(idx)) => {
+                    publish(backend.begin_connection(), &mut port, &event_tx);
+                    event_tx.send(outgoing(OutboundFrame::Connect(idx)));
                     match connect(idx) {
                         Ok(p) => {
                             port = Some(p);
-                            event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Connected));
+                            publish(backend.connection_established(), &mut port, &event_tx);
                         }
                         Err(e) => {
                             log::error!("Failed to connect: {e}");
-                            event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(e)));
+                            publish(backend.connection_failed(e), &mut port, &event_tx);
                         }
                     }
                 }
-                Ok(TransportCommand::Disconnect) => {
-                    if let Some(ref mut p) = port {
-                        let bytes: [u8; OUTBOUND_FRAME_SIZE] = OutboundFrame::Disconnect.into();
-                        if let Err(e) = p.write_all(&bytes) {
-                            log::error!("Failed to send disconnect frame: {e}");
-                        }
-                    }
+                Ok(BackendCommand::Disconnect) => {
+                    publish(LocalBackend::safe_disconnect(), &mut port, &event_tx);
                     port = None;
                     buffer.clear();
-                    event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Disconnected));
+                    publish(backend.disconnected(), &mut port, &event_tx);
                 }
-                Ok(TransportCommand::Protocol(frame)) => {
-                    if let Some(ref mut p) = port {
-                        let bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
-                        if let Err(e) = p.write_all(&bytes) {
-                            log::error!("Failed to send frame: {e}");
-                        }
-                    }
+                Ok(BackendCommand::Api(command)) => {
+                    publish(backend.command(command), &mut port, &event_tx);
                 }
-                Ok(TransportCommand::Remote(_)) => {}
-                Err(_) => break,
+                Ok(BackendCommand::Resume(config)) => {
+                    publish(backend.resume(config), &mut port, &event_tx);
+                }
+                Ok(BackendCommand::Shutdown) => {
+                    publish(backend.shutdown(), &mut port, &event_tx);
+                    break 'runtime;
+                }
+                Err(futures::channel::mpsc::TryRecvError::Empty) => break,
+                Err(futures::channel::mpsc::TryRecvError::Closed) => break 'runtime,
             }
         }
 
@@ -114,7 +122,7 @@ fn device_thread(mut cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: Even
                 Ok(n) if n > 0 => {
                     buffer.extend_from_slice(&temp_buffer[..n]);
                     for (frame, raw) in crate::device::process_buffer(&mut buffer) {
-                        event_tx.send(DeviceEvent::Frame(frame, raw));
+                        publish(backend.frame(frame, raw), &mut port, &event_tx);
                     }
                 }
                 Ok(_) => {}
@@ -123,13 +131,43 @@ fn device_thread(mut cmd_rx: UnboundedReceiver<TransportCommand>, event_tx: Even
                     log::error!("Serial read error: {e}");
                     port = None;
                     buffer.clear();
-                    event_tx.send(DeviceEvent::StatusChanged(ConnectionStatus::Error(
-                        "Read error: connection lost".to_owned(),
-                    )));
+                    publish(
+                        backend.connection_failed("Read error: connection lost".to_owned()),
+                        &mut port,
+                        &event_tx,
+                    );
                 }
             }
         } else {
             std::thread::sleep(SLEEP_DURATION);
         }
+        publish(backend.tick(), &mut port, &event_tx);
     }
+}
+
+fn publish(
+    output: LocalOutput,
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    event_tx: &BackendEventSender,
+) {
+    for frame in output.frames {
+        event_tx.send(outgoing(frame));
+        if let Some(port) = port {
+            let bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
+            if let Err(error) = port.write_all(&bytes) {
+                log::error!("Failed to send {frame:?}: {error}");
+            }
+        }
+    }
+    for event in output.events {
+        event_tx.send(event);
+    }
+}
+
+fn outgoing(frame: OutboundFrame) -> BackendEvent {
+    BackendEvent::Diagnostic(DiagnosticEvent {
+        direction: DiagnosticDirection::Out,
+        label: format!("{frame:?}"),
+        raw_bytes: <[u8; OUTBOUND_FRAME_SIZE]>::from(frame).to_vec(),
+    })
 }
