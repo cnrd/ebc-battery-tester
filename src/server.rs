@@ -36,7 +36,7 @@ const ACTOR_TICK: Duration = Duration::from_millis(100);
 const CAPACITY_MODULUS_MAH: u64 = 57_600;
 const CAPACITY_WRAP_HIGH_WATER: u16 = 43_200;
 const CAPACITY_WRAP_LOW_WATER: u16 = 14_400;
-const MAX_TIMER_MINUTES: u64 = 57_839;
+const MAX_TIMER_MINUTES: u64 = device::MAX_TIMER_SYNC_MINUTES as u64;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -115,6 +115,24 @@ enum PhysicalState {
     Unknown,
     Active,
     Inactive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportState {
+    Idle,
+    Active,
+    Finished,
+    InactiveUnknown,
+}
+
+impl From<device::ModeReportState> for ReportState {
+    fn from(state: device::ModeReportState) -> Self {
+        match state {
+            device::ModeReportState::Idle => Self::Idle,
+            device::ModeReportState::Active => Self::Active,
+            device::ModeReportState::Finished => Self::Finished,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1350,7 +1368,7 @@ impl DeviceActor {
                 .device
                 .mode
                 .unwrap_or(device::DeviceMode::DischargeConstantCurrent);
-            self.record_report(mode, 4200, 0, 0, false, "EBC-MOCK", None);
+            self.record_report(mode, 4200, 0, 0, ReportState::Idle, "EBC-MOCK", None);
             return;
         }
         if self.lifecycle == Lifecycle::Stopping {
@@ -1364,7 +1382,7 @@ impl DeviceActor {
                 self.snapshot.device.voltage_mv.unwrap_or(4200),
                 0,
                 self.snapshot.device.capacity_mah.unwrap_or(0),
-                false,
+                ReportState::Idle,
                 "EBC-MOCK",
                 None,
             );
@@ -1390,7 +1408,7 @@ impl DeviceActor {
             voltage,
             mock_current(&config),
             capacity,
-            true,
+            ReportState::Active,
             "EBC-MOCK",
             None,
         );
@@ -1419,7 +1437,11 @@ impl DeviceActor {
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
-                report.in_progress,
+                if report.in_progress {
+                    ReportState::Active
+                } else {
+                    ReportState::InactiveUnknown
+                },
                 &report.device_type,
                 Some(report.firmware_version),
             ),
@@ -1428,7 +1450,7 @@ impl DeviceActor {
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
-                report.in_progress,
+                report.state.into(),
                 &report.device_type,
                 None,
             ),
@@ -1437,7 +1459,7 @@ impl DeviceActor {
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
-                report.in_progress,
+                report.state.into(),
                 &report.device_type,
                 None,
             ),
@@ -1446,7 +1468,7 @@ impl DeviceActor {
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
-                report.in_progress,
+                report.state.into(),
                 &report.device_type,
                 None,
             ),
@@ -1460,11 +1482,12 @@ impl DeviceActor {
         voltage_mv: u16,
         current_ma: u16,
         capacity_mah: u16,
-        active: bool,
+        report_state: ReportState,
         model: &str,
         firmware: Option<String>,
     ) {
         let previous_lifecycle = self.lifecycle;
+        let active = report_state == ReportState::Active;
         self.report_generation = Some(self.connection_generation);
         self.physical = if active {
             PhysicalState::Active
@@ -1544,10 +1567,12 @@ impl DeviceActor {
             self.clock.stop();
             self.energy.break_gap();
             self.snapshot.test.elapsed_seconds = self.clock.elapsed().as_secs();
-            let normalized_capacity = self
-                .capacity
-                .observe(capacity_mah, previous_lifecycle == Lifecycle::RunningOwned);
-            self.snapshot.test.capacity_mah = Some(normalized_capacity);
+            if previous_lifecycle != Lifecycle::Starting {
+                let normalized_capacity = self
+                    .capacity
+                    .observe(capacity_mah, previous_lifecycle == Lifecycle::RunningOwned);
+                self.snapshot.test.capacity_mah = Some(normalized_capacity);
+            }
             match previous_lifecycle {
                 Lifecycle::RecoveredUncertain => {
                     self.lifecycle = Lifecycle::Idle;
@@ -1555,25 +1580,29 @@ impl DeviceActor {
                     self.snapshot.test.result =
                         Some("recovered previous test; hardware reports inactive".to_owned());
                 }
-                Lifecycle::Starting => {
-                    self.lifecycle = Lifecycle::Idle;
-                    self.snapshot.test.state = TestState::Stopped;
-                    self.snapshot.test.result =
-                        Some("start was not confirmed active by hardware".to_owned());
-                }
-                Lifecycle::RunningOwned => {
-                    self.lifecycle = Lifecycle::Idle;
-                    self.snapshot.test.state = TestState::Completed;
-                    self.snapshot.test.result = Some("device reported test complete".to_owned());
-                }
+                Lifecycle::Starting | Lifecycle::Idle => {}
+                Lifecycle::RunningOwned => match report_state {
+                    ReportState::Finished => {
+                        self.lifecycle = Lifecycle::Idle;
+                        self.snapshot.test.state = TestState::Completed;
+                        self.snapshot.test.result =
+                            Some("device reported test complete".to_owned());
+                    }
+                    ReportState::Idle => {
+                        self.lifecycle = Lifecycle::Idle;
+                        self.snapshot.test.state = TestState::Stopped;
+                        self.snapshot.test.result = Some("device reported test idle".to_owned());
+                    }
+                    ReportState::InactiveUnknown => {}
+                    ReportState::Active => unreachable!(),
+                },
                 Lifecycle::Stopping => {
                     self.lifecycle = Lifecycle::Idle;
                     self.snapshot.test.state = TestState::Stopped;
                     self.snapshot.test.result = Some("stop confirmed by hardware".to_owned());
                 }
-                Lifecycle::Idle => {}
             }
-            if previous_lifecycle != Lifecycle::Idle
+            if previous_lifecycle != self.lifecycle
                 && let Err(error) = self.persistence.flush_samples()
             {
                 log::error!("failed to flush inactive samples: {error}");
@@ -2149,6 +2178,12 @@ mod tests {
         assert_eq!(clock.next_timer_sync(), Some(1));
         assert_eq!(clock.next_timer_sync(), None);
 
+        clock.accumulated = Duration::from_secs(MAX_TIMER_MINUTES * 60);
+        assert_eq!(clock.next_timer_sync(), Some(MAX_TIMER_MINUTES as u16));
+        let encoded: [u8; OUTBOUND_FRAME_SIZE] =
+            OutboundFrame::TimerSync(MAX_TIMER_MINUTES as u16).into();
+        assert_eq!(&encoded[2..4], &[0xef, 0xef]);
+
         clock.accumulated = Duration::from_secs((MAX_TIMER_MINUTES + 1) * 60);
         assert_eq!(clock.next_timer_sync(), None);
         assert_eq!(clock.next_timer_sync(), None);
@@ -2415,7 +2450,7 @@ mod tests {
             4200,
             0,
             actor.snapshot.device.capacity_mah.unwrap_or(0),
-            false,
+            ReportState::Idle,
             "EBC-MOCK",
             None,
         );
@@ -2449,7 +2484,7 @@ mod tests {
             3900,
             1000,
             10,
-            true,
+            ReportState::Active,
             "EBC-X",
             None,
         );
@@ -2494,7 +2529,7 @@ mod tests {
             3900,
             0,
             10,
-            false,
+            ReportState::InactiveUnknown,
             "EBC-X",
             None,
         );
@@ -2541,7 +2576,7 @@ mod tests {
             4000,
             0,
             0,
-            false,
+            ReportState::Idle,
             "EBC-MOCK",
             None,
         );
@@ -2581,7 +2616,11 @@ mod tests {
                     3900,
                     if active { 1000 } else { 0 },
                     10,
-                    active,
+                    if active {
+                        ReportState::Active
+                    } else {
+                        ReportState::Idle
+                    },
                     "EBC-MOCK",
                     None,
                 );
@@ -2602,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn uninterrupted_inactive_reports_resolve_pending_and_running_states() {
+    fn buffered_inactive_reports_do_not_reject_start_before_active_confirmation() {
         let (mut actor, directory) = mock_actor("uninterrupted-inactive");
         confirm_inactive(&mut actor);
         actor.start_test(test_config()).expect("start");
@@ -2611,30 +2650,120 @@ mod tests {
             4000,
             0,
             0,
-            false,
+            ReportState::Idle,
             "EBC-MOCK",
             None,
         );
-        assert_eq!(actor.lifecycle, Lifecycle::Idle);
-        assert_eq!(actor.snapshot.test.state, TestState::Stopped);
+        assert_eq!(actor.lifecycle, Lifecycle::Starting);
+        assert_eq!(actor.snapshot.test.state, TestState::Starting);
+        assert_eq!(actor.snapshot.test.capacity_mah, None);
 
-        actor.snapshot.test.state = TestState::Running;
-        actor.lifecycle = Lifecycle::RunningOwned;
-        actor.physical = PhysicalState::Active;
-        actor.report_generation = Some(actor.connection_generation);
-        actor.snapshot.device.activity_known = true;
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            0,
+            0,
+            ReportState::InactiveUnknown,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.lifecycle, Lifecycle::Starting);
+
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            3990,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.lifecycle, Lifecycle::RunningOwned);
+        assert_eq!(actor.snapshot.test.state, TestState::Running);
+        assert_eq!(actor.snapshot.test.capacity_mah, Some(1));
+
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
             3900,
             0,
             20,
-            false,
+            ReportState::Finished,
             "EBC-MOCK",
             None,
         );
         assert_eq!(actor.lifecycle, Lifecycle::Idle);
         assert_eq!(actor.snapshot.test.state, TestState::Completed);
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn buffered_inactive_reports_do_not_reject_resume_before_active_confirmation() {
+        let (mut actor, directory) = mock_actor("buffered-resume-reports");
+        confirm_inactive(&mut actor);
+        actor.snapshot.test.config = Some(test_config());
+        actor.snapshot.test.state = TestState::Stopped;
+        actor.resume_test().expect("resume");
+
+        for report_state in [ReportState::Idle, ReportState::InactiveUnknown] {
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                4000,
+                0,
+                10,
+                report_state,
+                "EBC-MOCK",
+                None,
+            );
+            assert_eq!(actor.lifecycle, Lifecycle::Starting);
+            assert_eq!(actor.snapshot.test.state, TestState::Starting);
+        }
+
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            3990,
+            1000,
+            11,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.lifecycle, Lifecycle::RunningOwned);
+        assert_eq!(actor.snapshot.test.state, TestState::Running);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn normal_idle_and_finished_reports_have_distinct_results() {
+        for (report_state, expected_state) in [
+            (ReportState::Idle, TestState::Stopped),
+            (ReportState::Finished, TestState::Completed),
+        ] {
+            let (mut actor, directory) = mock_actor(&format!("normal-{report_state:?}"));
+            confirm_inactive(&mut actor);
+            actor.start_test(test_config()).expect("start");
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                4000,
+                1000,
+                1,
+                ReportState::Active,
+                "EBC-MOCK",
+                None,
+            );
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                3900,
+                0,
+                10,
+                report_state,
+                "EBC-MOCK",
+                None,
+            );
+
+            assert_eq!(actor.lifecycle, Lifecycle::Idle);
+            assert_eq!(actor.snapshot.test.state, expected_state);
+            fs::remove_dir_all(directory).expect("remove test directory");
+        }
     }
 
     #[test]
@@ -2661,7 +2790,7 @@ mod tests {
             3800,
             1000,
             30_000,
-            true,
+            ReportState::Active,
             "EBC-MOCK",
             None,
         );
@@ -2771,7 +2900,7 @@ mod tests {
                 4000,
                 1000,
                 raw_capacity,
-                true,
+                ReportState::Active,
                 "EBC-MOCK",
                 None,
             );

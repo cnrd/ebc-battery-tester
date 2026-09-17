@@ -166,8 +166,15 @@ cannot be proven. An inactive report resolves the run to `stopped`; the user can
 then start a fresh run or explicitly resume a stopped run. While recovery
 remains uncertain, Start, Resume, Adjust, and Calibration are rejected; explicit
 Stop and Disconnect remain available. Start and Stop are exposed as `starting`
-and `stopping` until a fresh hardware report confirms their result. If no usable
-report arrives, the pending or uncertain state remains visible. Disconnects,
+and `stopping` until hardware reports confirm their result. Because the protocol
+has no command acknowledgement, inactive reports received while Starting are
+treated as potentially buffered pre-command telemetry; only an active report
+confirms Start or Resume. The state remains pending until that confirmation, an
+explicit Stop, or a connection gap. Normal mode reports preserve the device's
+Idle and Finished states: Idle resolves an owned run to `stopped`, while Finished
+resolves it to `completed`. Firmware-inactive reports do not contain that
+distinction, so the server waits for the interleaved normal mode report when an
+owned run ends. Disconnects,
 serial errors, and uncertain recovery break the trapezoidal energy accumulator,
 so neither elapsed time nor energy is invented across an observation gap. A
 confirmed backend-owned start/resume starts a fresh clock at zero or resumes

@@ -21,6 +21,7 @@ pub const MIN_VOLTAGE_MV: u16 = 10;
 pub const MAX_VOLTAGE_MV: u16 = 30000;
 pub const MIN_CUTOFF_TIME_MIN: u16 = 0;
 pub const MAX_CUTOFF_TIME_MIN: u16 = 999;
+pub const MAX_TIMER_SYNC_MINUTES: u16 = 57_599;
 // Max minutes to wait between charge and discharge cycle.
 pub const AUTO_MODE_TIME_MIN_MINS: u16 = 0;
 pub const AUTO_MODE_TIME_MAX_MINS: u16 = 10;
@@ -252,9 +253,17 @@ pub struct FirmwareReport {
     pub device_type: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeReportState {
+    Idle,
+    Active,
+    Finished,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChargeReport {
-    pub in_progress: bool,
+    pub state: ModeReportState,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
@@ -267,7 +276,7 @@ pub struct ChargeReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DischargeConstantCurrentReport {
-    pub in_progress: bool,
+    pub state: ModeReportState,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
@@ -280,7 +289,7 @@ pub struct DischargeConstantCurrentReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DischargeConstantPowerReport {
-    pub in_progress: bool,
+    pub state: ModeReportState,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
@@ -340,7 +349,11 @@ impl InboundFrame {
     fn construct_charge_report(payload: &[u8]) -> Self {
         let command_byte = payload[0];
         Self::Charge(ChargeReport {
-            in_progress: command_byte == StatusReportType::ChargeConstantCurrentOnReport as u8,
+            state: mode_report_state(
+                command_byte,
+                StatusReportType::ChargeConstantCurrentOnReport,
+                StatusReportType::ChargeConstantCurrentEnd,
+            ),
             current_ma: decode_base240(payload[1], payload[2]) * 10,
             voltage_mv: decode_base240(payload[3], payload[4]),
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
@@ -355,7 +368,11 @@ impl InboundFrame {
     fn construct_discharge_constant_current_report(payload: &[u8]) -> Self {
         let command_byte = payload[0];
         Self::DischargeConstantCurrent(DischargeConstantCurrentReport {
-            in_progress: command_byte == StatusReportType::DischargeConstantCurrentOnReport as u8,
+            state: mode_report_state(
+                command_byte,
+                StatusReportType::DischargeConstantCurrentOnReport,
+                StatusReportType::DischargeConstantCurrentEnd,
+            ),
             current_ma: decode_base240(payload[1], payload[2]) * 10,
             voltage_mv: decode_base240(payload[3], payload[4]),
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
@@ -370,7 +387,11 @@ impl InboundFrame {
     fn construct_discharge_constant_power_report(payload: &[u8]) -> Self {
         let command_byte = payload[0];
         Self::DischargeConstantPower(DischargeConstantPowerReport {
-            in_progress: command_byte == StatusReportType::DischargeConstantPowerOnReport as u8,
+            state: mode_report_state(
+                command_byte,
+                StatusReportType::DischargeConstantPowerOnReport,
+                StatusReportType::DischargeConstantPowerEnd,
+            ),
             current_ma: decode_base240(payload[1], payload[2]) * 10,
             voltage_mv: decode_base240(payload[3], payload[4]),
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
@@ -380,6 +401,20 @@ impl InboundFrame {
             cutoff_time_min: decode_base240(payload[13], payload[14]),
             device_type: get_device_model_name(payload[15]),
         })
+    }
+}
+
+fn mode_report_state(
+    command_byte: u8,
+    active: StatusReportType,
+    finished: StatusReportType,
+) -> ModeReportState {
+    if command_byte == active as u8 {
+        ModeReportState::Active
+    } else if command_byte == finished as u8 {
+        ModeReportState::Finished
+    } else {
+        ModeReportState::Idle
     }
 }
 
@@ -678,6 +713,10 @@ fn continue_constant_current_discharge_command(
 }
 
 fn timer_sync_command(minutes: u16) -> [u8; OUTBOUND_FRAME_SIZE] {
+    assert!(
+        minutes <= MAX_TIMER_SYNC_MINUTES,
+        "Timer sync must not exceed {MAX_TIMER_SYNC_MINUTES} minutes"
+    );
     let (min_h, min_l) = encode_base240(minutes);
     build_frame([
         CommmandType::TimerSync as u8,
@@ -827,4 +866,40 @@ fn continue_constant_voltage_charge_command(
         cutoff_current_h,
         cutoff_current_l,
     ])
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test parsing should fail fast")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_reports_preserve_idle_active_and_finished_states() {
+        for (command, expected) in [
+            (0x00, ModeReportState::Idle),
+            (0x0a, ModeReportState::Active),
+            (0x14, ModeReportState::Finished),
+            (0x01, ModeReportState::Idle),
+            (0x0b, ModeReportState::Active),
+            (0x15, ModeReportState::Finished),
+            (0x02, ModeReportState::Idle),
+            (0x0c, ModeReportState::Active),
+            (0x16, ModeReportState::Finished),
+        ] {
+            let mut payload = [0_u8; 16];
+            payload[0] = command;
+            let mut frame = vec![START_BYTE];
+            frame.extend_from_slice(&payload);
+            frame.push(xor_checksum(&payload));
+            frame.push(END_BYTE);
+
+            let state = match InboundFrame::try_from(frame.as_slice()).expect("parse report") {
+                InboundFrame::Charge(report) => report.state,
+                InboundFrame::DischargeConstantCurrent(report) => report.state,
+                InboundFrame::DischargeConstantPower(report) => report.state,
+                InboundFrame::Firmware(_) => panic!("expected normal mode report"),
+            };
+            assert_eq!(state, expected, "command {command:#04x}");
+        }
+    }
 }

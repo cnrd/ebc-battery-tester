@@ -232,7 +232,10 @@ impl DeviceSession {
         self.mode_on
             || matches!(
                 self.test_state,
-                TestState::Starting | TestState::Stopping | TestState::RecoveredUncertain
+                TestState::Starting
+                    | TestState::Running
+                    | TestState::Stopping
+                    | TestState::RecoveredUncertain
             )
     }
 
@@ -331,7 +334,9 @@ impl DeviceSession {
             return None;
         }
         let elapsed_mins = self.elapsed().as_secs() / 60;
-        (elapsed_mins > self.last_timer_sync_min).then_some(elapsed_mins)
+        (elapsed_mins > self.last_timer_sync_min
+            && elapsed_mins <= u64::from(device::MAX_TIMER_SYNC_MINUTES))
+        .then_some(elapsed_mins)
     }
 
     pub(crate) fn send_cmd(&mut self, frame: OutboundFrame, ctx: &egui::Context) {
@@ -440,7 +445,11 @@ impl DeviceSession {
 
     fn handle_firmware_report(&mut self, report: device::FirmwareReport) {
         self.current_device_mode = Some(report.device_mode);
-        self.apply_direct_activity(report.in_progress);
+        self.apply_direct_report_state(if report.in_progress {
+            Some(device::ModeReportState::Active)
+        } else {
+            None
+        });
         self.live_voltage_mv = report.voltage_mv;
         self.live_current_ma = report.current_ma;
         self.live_milli_ampere_hours = u64::from(report.milli_ampere_hours);
@@ -453,14 +462,14 @@ impl DeviceSession {
     fn handle_measurement(
         &mut self,
         mode: device::DeviceMode,
-        in_progress: bool,
+        report_state: device::ModeReportState,
         voltage_mv: u16,
         current_ma: u16,
         capacity_mah: u16,
         model: String,
     ) {
         self.current_device_mode = Some(mode);
-        self.apply_direct_activity(in_progress);
+        self.apply_direct_report_state(Some(report_state));
         self.live_voltage_mv = voltage_mv;
         self.live_current_ma = current_ma;
         self.live_milli_ampere_hours = u64::from(capacity_mah);
@@ -488,8 +497,8 @@ impl DeviceSession {
         }
     }
 
-    fn apply_direct_activity(&mut self, active: bool) {
-        let was_on = self.mode_on;
+    fn apply_direct_report_state(&mut self, report_state: Option<device::ModeReportState>) {
+        let active = report_state == Some(device::ModeReportState::Active);
         self.activity_known = true;
         self.mode_on = active;
         if active {
@@ -501,12 +510,14 @@ impl DeviceSession {
             }
         } else {
             self.freeze_timer();
-            self.test_state = match self.test_state.clone() {
-                TestState::Starting | TestState::Stopping | TestState::RecoveredUncertain => {
-                    TestState::Stopped
+            self.test_state = match (self.test_state.clone(), report_state) {
+                (TestState::Starting, _) => TestState::Starting,
+                (TestState::Stopping | TestState::RecoveredUncertain, _)
+                | (TestState::Running, Some(device::ModeReportState::Idle)) => TestState::Stopped,
+                (TestState::Running, Some(device::ModeReportState::Finished)) => {
+                    TestState::Completed
                 }
-                TestState::Running if was_on => TestState::Completed,
-                state => state,
+                (state, _) => state,
             };
             if matches!(self.test_state, TestState::Stopped | TestState::Completed) {
                 self.mode_on = false;
@@ -551,7 +562,7 @@ impl DeviceSession {
                         }
                         device::InboundFrame::Charge(report) => self.handle_measurement(
                             device::DeviceMode::ChargeConstantVoltage,
-                            report.in_progress,
+                            report.state,
                             report.voltage_mv,
                             report.current_ma,
                             report.milli_ampere_hours,
@@ -560,7 +571,7 @@ impl DeviceSession {
                         device::InboundFrame::DischargeConstantCurrent(report) => self
                             .handle_measurement(
                                 device::DeviceMode::DischargeConstantCurrent,
-                                report.in_progress,
+                                report.state,
                                 report.voltage_mv,
                                 report.current_ma,
                                 report.milli_ampere_hours,
@@ -569,7 +580,7 @@ impl DeviceSession {
                         device::InboundFrame::DischargeConstantPower(report) => self
                             .handle_measurement(
                                 device::DeviceMode::DischargeConstantPower,
-                                report.in_progress,
+                                report.state,
                                 report.voltage_mv,
                                 report.current_ma,
                                 report.milli_ampere_hours,
@@ -735,7 +746,7 @@ mod tests {
 
         session.handle_measurement(
             device::DeviceMode::DischargeConstantCurrent,
-            true,
+            device::ModeReportState::Active,
             3900,
             1000,
             5,
@@ -747,7 +758,7 @@ mod tests {
 
         session.handle_measurement(
             device::DeviceMode::DischargeConstantCurrent,
-            false,
+            device::ModeReportState::Finished,
             3900,
             0,
             5,
@@ -755,6 +766,60 @@ mod tests {
         );
         assert_eq!(session.pending_timer_sync_minute(), None);
         assert!(session.mode_started_at.is_none());
+    }
+
+    #[test]
+    fn direct_timer_sync_stops_at_canonical_base240_maximum() {
+        let mut session = DeviceSession {
+            activity_known: true,
+            mode_on: true,
+            test_state: TestState::Running,
+            mode_started_at: None,
+            mode_accumulated: Duration::from_secs(u64::from(device::MAX_TIMER_SYNC_MINUTES) * 60),
+            ..DeviceSession::default()
+        };
+        assert_eq!(
+            session.pending_timer_sync_minute(),
+            Some(u64::from(device::MAX_TIMER_SYNC_MINUTES))
+        );
+
+        session.mode_accumulated += Duration::from_secs(60);
+        assert_eq!(session.pending_timer_sync_minute(), None);
+    }
+
+    #[test]
+    fn direct_start_ignores_buffered_idle_until_active_report() {
+        let mut session = DeviceSession::default();
+        session.start_mode();
+
+        session.apply_direct_report_state(Some(device::ModeReportState::Idle));
+        session.apply_direct_report_state(None);
+        assert_eq!(session.test_state, TestState::Starting);
+        assert!(session.mode_started_at.is_none());
+
+        session.apply_direct_report_state(Some(device::ModeReportState::Active));
+        assert_eq!(session.test_state, TestState::Running);
+        assert!(session.mode_started_at.is_some());
+    }
+
+    #[test]
+    fn direct_mode_reports_distinguish_idle_finished_and_ambiguous_inactive() {
+        for (report_state, expected) in [
+            (device::ModeReportState::Idle, TestState::Stopped),
+            (device::ModeReportState::Finished, TestState::Completed),
+        ] {
+            let mut session = DeviceSession {
+                activity_known: true,
+                mode_on: true,
+                test_state: TestState::Running,
+                mode_started_at: Some(Instant::now()),
+                ..DeviceSession::default()
+            };
+            session.apply_direct_report_state(None);
+            assert_eq!(session.test_state, TestState::Running);
+            session.apply_direct_report_state(Some(report_state));
+            assert_eq!(session.test_state, expected);
+        }
     }
 
     #[test]
@@ -797,11 +862,11 @@ mod tests {
         assert!(!session.mode_on);
         assert!(session.mode_started_at.is_none());
 
-        session.apply_direct_activity(true);
+        session.apply_direct_report_state(Some(device::ModeReportState::Active));
         assert_eq!(session.test_state, TestState::RecoveredUncertain);
         assert!(session.mode_started_at.is_none());
 
-        session.apply_direct_activity(false);
+        session.apply_direct_report_state(Some(device::ModeReportState::Idle));
         assert_eq!(session.test_state, TestState::Stopped);
     }
 

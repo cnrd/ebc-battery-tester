@@ -279,10 +279,8 @@ tested on real hardware; it must not be inferred from the frame cadence alone.
 The server sends timer sync only while connection, hardware activity, and
 backend ownership have remained continuously confirmed. A serial observation
 gap stops elapsed projection and timer sync rather than guessing the missing
-minutes. The shared protocol encoder permits values through 57,839 by allowing
-`0xf0` in the high byte; no further sync frame is sent after that bound. Whether
-the hardware accepts that final non-canonical range also requires real-device
-validation.
+minutes. Timer sync stops at the canonical two-byte base-240 maximum of 57,599
+(`ef ef`) and never emits the unvalidated high byte `0xf0`.
 
 ```text
 1 min → fa 0a 00 01 00 00 00 00 0b f8

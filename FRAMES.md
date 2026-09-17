@@ -321,9 +321,8 @@ timer, drive the elapsed-time display, or serve as a keep-alive. The device
 does not send a dedicated reply beyond its normal periodic status reports. No
 capture in this repository establishes whether omitting, delaying, or resetting
 this command changes cutoff behavior. The host therefore sends it only during
-an uninterrupted, confirmed host-owned run. The current encoder stops after
-57,839 minutes; its use of high byte `0xf0` for the final 240 values has not
-been validated on hardware.
+an uninterrupted, confirmed host-owned run and stops after the canonical
+two-byte base-240 maximum of 57,599 minutes (`ef ef`).
 
 ```text
 [fa] [0a] [minutes_h] [minutes_l] [00] [00] [00] [00] [checksum] [f8]
