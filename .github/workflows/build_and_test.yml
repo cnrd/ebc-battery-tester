@@ -1,5 +1,8 @@
 name: Build and Test
 
+env:
+  TRUNK_VERSION: 0.21.14
+
 on:
   push:
     branches:
@@ -38,8 +41,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check native
         run: cargo check --quiet --workspace --all-targets
+      - name: Check headless server without GUI dependencies
+        run: cargo check --quiet --no-default-features --features server --bin ebc-server
       - name: Check wasm
-        run: cargo check --quiet --workspace --all-features --lib --target wasm32-unknown-unknown
+        run: cargo check --quiet --lib --target wasm32-unknown-unknown
 
   clippy:
     runs-on: ubuntu-latest
@@ -57,9 +62,11 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Clippy native
-        run: cargo clippy --quiet --workspace --all-targets --all-features -- -D warnings -W clippy::all
+        run: cargo clippy --quiet --workspace --all-targets -- -D warnings -W clippy::all
+      - name: Clippy headless server
+        run: cargo clippy --quiet --no-default-features --features server --all-targets -- -D warnings -W clippy::all
       - name: Clippy wasm
-        run: cargo clippy --quiet --workspace --all-features --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::all
+        run: cargo clippy --quiet --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::all
 
   test:
     runs-on: ubuntu-latest
@@ -75,7 +82,9 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --quiet --workspace --all-targets --all-features
+        run: cargo test --quiet --workspace --all-targets
+      - name: Run headless server tests
+        run: cargo test --quiet --no-default-features --features server --all-targets
       - name: Run doc tests
         run: cargo test --quiet --workspace --doc
 
@@ -92,6 +101,75 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Download and install Trunk binary
-        run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+        run: wget -qO- "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xzf-
       - name: Build
-        run: ./trunk build
+        run: EBC_WASM_DEFAULT_TRANSPORT=webusb ./trunk build --locked
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build --build-arg "TRUNK_VERSION=${TRUNK_VERSION}" --tag ebc-battery-tester:ci .
+      - name: Smoke test production runtime and persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir .ci-data
+          chmod 0777 .ci-data
+          cleanup() {
+            docker rm -f ebc-battery-tester-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          run_server() {
+            docker run -d --name ebc-battery-tester-ci \
+              --user 10001:10001 \
+              -e EBC_MOCK=true \
+              -p 18080:8080 \
+              -v "$PWD/.ci-data:/data" \
+              ebc-battery-tester:ci
+            for _ in $(seq 1 60); do
+              if [ "$(docker inspect --format '{{.State.Health.Status}}' ebc-battery-tester-ci)" = healthy ]; then
+                return
+              fi
+              sleep 1
+            done
+            docker logs ebc-battery-tester-ci
+            return 1
+          }
+          run_server
+
+          HTML=$(curl --fail --silent --show-error http://127.0.0.1:18080/)
+          curl --fail --silent --show-error http://127.0.0.1:18080/manifest.json >/dev/null
+          JS=$(printf '%s' "$HTML" | grep -oE "[A-Za-z0-9_./-]+[-.][a-f0-9]{8,}\.js" | sed -n '1p')
+          WASM=$(printf '%s' "$HTML" | grep -oE "[A-Za-z0-9_./-]+[-.][a-f0-9]{8,}(_bg)?\.wasm" | sed -n '1p')
+          test -n "$JS" && test -n "$WASM"
+          JS=${JS#./}; JS=${JS#/}
+          WASM=${WASM#./}; WASM=${WASM#/}
+          curl --fail --silent --show-error "http://127.0.0.1:18080/$JS" >/dev/null
+          curl --fail --silent --show-error "http://127.0.0.1:18080/$WASM" >/dev/null
+          curl --fail --silent --show-error http://127.0.0.1:18080/api/status >/dev/null
+
+          COMMAND=(-H 'X-EBC-Command: 1')
+          curl --fail --silent --show-error -X POST "${COMMAND[@]}" http://127.0.0.1:18080/api/connect >/dev/null
+          curl --fail --silent --show-error -X POST "${COMMAND[@]}" \
+            -H 'Content-Type: application/json' \
+            --data '{"mode":"discharge_constant_current","current_ma":100,"cutoff_voltage_mv":3000,"cutoff_time_min":0}' \
+            http://127.0.0.1:18080/api/test/start >/dev/null
+          sleep 3
+          curl --fail --silent --show-error -X POST "${COMMAND[@]}" http://127.0.0.1:18080/api/test/stop >/dev/null
+          for _ in $(seq 1 20); do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/api/status | grep -q 'stopped'; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:18080/api/status | grep -q 'stopped'
+          curl --fail --silent --show-error http://127.0.0.1:18080/api/history.csv | grep -q ',100,'
+
+          docker rm -f ebc-battery-tester-ci >/dev/null
+          run_server
+          curl --fail --silent --show-error http://127.0.0.1:18080/ >/dev/null
+          curl --fail --silent --show-error http://127.0.0.1:18080/manifest.json >/dev/null
+          curl --fail --silent --show-error http://127.0.0.1:18080/api/status | grep -q 'stopped'
+          curl --fail --silent --show-error http://127.0.0.1:18080/api/history.csv | grep -q ',100,'

@@ -1,0 +1,13 @@
+.git
+.github
+.vscode
+dist
+target
+target_*
+Dockerfile*
+docker-compose*.yml
+firmware-update.pcap
+images
+*.bin
+*.exe
+__pycache__

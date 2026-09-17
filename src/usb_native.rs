@@ -9,6 +9,10 @@ use serialport::SerialPortType;
 const BAUD_RATE: u32 = 9600;
 const SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(10);
 
+pub const fn is_remote_transport() -> bool {
+    false
+}
+
 #[expect(clippy::needless_pass_by_value)]
 pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
     let all_ports = serialport::available_ports().unwrap_or_default();

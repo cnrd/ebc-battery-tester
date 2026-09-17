@@ -87,7 +87,7 @@ pub(super) async fn device_task(
             // send_frame.
             Some(frame) => {
                 if let (Some(device), Some(ep)) = (&device, out_endpoint_num)
-                    && let Err(e) = send_frame(device, ep, frame.clone()).await
+                    && let Err(e) = send_frame(device, ep, frame).await
                 {
                     log::error!("Failed to send {frame:?}: {e:?}");
                 }

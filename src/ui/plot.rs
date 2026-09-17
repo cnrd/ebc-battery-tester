@@ -1,8 +1,28 @@
 use crate::session::DeviceSession;
 use crate::ui::format_duration;
-use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoint, PlotPoints, VPlacement};
+use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoint, VPlacement};
 
 pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
+    let voltage_points: Vec<[f64; 2]> = session
+        .samples
+        .iter()
+        .map(|sample| {
+            [
+                sample.elapsed_seconds as f64,
+                sample.voltage_mv as f64 / 1000.0,
+            ]
+        })
+        .collect();
+    let current_points: Vec<[f64; 2]> = session
+        .samples
+        .iter()
+        .map(|sample| {
+            [
+                sample.elapsed_seconds as f64,
+                sample.current_ma as f64 / 1000.0,
+            ]
+        })
+        .collect();
     let label_formatter = |_s: &str, val: &PlotPoint| {
         format!(
             "{}: {:.3} V, {:.2} A",
@@ -38,11 +58,7 @@ pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
                 .placement(HPlacement::Right),
         ])
         .show(ui, |plot_ui| {
-            plot_ui.line(
-                Line::new("Voltage", PlotPoints::Borrowed(&session.voltage_points)).name("Voltage"),
-            );
-            plot_ui.line(
-                Line::new("Current", PlotPoints::Borrowed(&session.amperes_points)).name("Current"),
-            );
+            plot_ui.line(Line::new("Voltage", voltage_points).name("Voltage"));
+            plot_ui.line(Line::new("Current", current_points).name("Current"));
         });
 }

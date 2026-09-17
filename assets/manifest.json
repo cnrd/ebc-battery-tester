@@ -1,6 +1,6 @@
 {
-  "name": "egui Template PWA",
-  "short_name": "egui-template-pwa",
+  "name": "EBC Battery Tester",
+  "short_name": "EBC Tester",
   "icons": [
     {
       "src": "./assets/favicon-192x192.png",
@@ -15,9 +15,10 @@
     }
   ],
   "lang": "en-US",
-  "id": "/index.html",
-  "start_url": "./index.html",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
   "display": "standalone",
-  "background_color": "white",
-  "theme_color": "white"
+  "background_color": "#404040",
+  "theme_color": "#404040"
 }

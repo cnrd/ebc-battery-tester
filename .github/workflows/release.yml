@@ -80,7 +80,7 @@ jobs:
       - name: Download and install Trunk binary
         run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
       - name: Build
-        run: ./trunk build --release
+        run: EBC_WASM_DEFAULT_TRANSPORT=webusb ./trunk build --release
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

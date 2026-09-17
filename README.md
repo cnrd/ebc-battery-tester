@@ -1,306 +1,341 @@
-# EBC-A20 Battery Tester
+# EBC Battery Tester
 
-Open-source, cross-platform alternative for controlling the ZKETECH EBC-A20
-battery tester. Supports both native and browser environments.
+Open-source control software for the ZKETECH EBC-A20 battery tester. It can run
+as a persistent server with a browser UI, as a native desktop application, or
+directly in a WebUSB-capable browser.
 
-![App](images/app.png)
+![Application](images/app.png)
 
-The deployed web app is available at
-[mauri.codes/ebc-battery-tester](https://mauri.codes/ebc-battery-tester). Before
-using the web app, follow the [WebUSB setup](#access-usb-device-on-browser) for
-your OS to allow the browser to access the device.
+The project is written in Rust with [egui](https://github.com/emilk/egui) and
+[eframe](https://github.com/emilk/egui/tree/master/crates/eframe). Native builds
+are available on the [releases page](https://github.com/Kazhuu/ebc-battery-tester/releases).
 
-Native desktop binaries for Linux and Windows can be downloaded from the [GitHub
-releases page](https://github.com/Kazhuu/ebc-battery-tester/releases). This
-should work out of the box with default drivers. If you did the WebUSB setup
-above, you need to undo that in order for the native app to discover the serial port.
+## Modes
 
-Also check [Important Notes](#important-notes) before running the app.
+### Remote server (recommended)
 
-If you are interested in the protocol documentation, check [Frame
-Reference](#frame-reference).
+The server owns the serial connection, persists measurements, serves the WASM
+UI, and exposes its API on the same origin. This is the best mode for an
+unattended test: closing or reloading a browser does not stop the test. Reopen
+the page to reconnect to the running server.
 
-The app is built with Rust using [egui](https://github.com/emilk/egui) and
-[eframe](https://github.com/emilk/egui/tree/master/crates/eframe).
+Because the browser does not access USB in this mode, the UI works in current
+Safari on iPhone, iPad, and desktop, Firefox, Chrome, Edge, and other modern
+browsers. The Docker build compiles this mode as its default. HTTP, WebSocket,
+and static files normally use the same origin; reverse-proxy deployments may
+set `EBC_ALLOWED_ORIGIN` to one exact external origin.
 
-This project got featured in
-[Hackaday](https://hackaday.com/2026/06/18/battery-tester-gets-an-app-upgrade/).
+### Native desktop
 
-## Table of Contents
+The default Cargo feature builds the desktop GUI. It talks to the operating
+system serial port directly and is suitable when the computer remains attached.
+Closing the application stops and disconnects the test during orderly shutdown.
 
-- [EBC-A20 Battery Tester](#ebc-a20-battery-tester)
-  - [Table of Contents](#table-of-contents)
-  - [Features](#features)
-  - [Missing Features](#missing-features)
-  - [Known Bugs in the Original Software](#known-bugs-in-the-original-software)
-  - [Important Notes](#important-notes)
-  - [Access USB Device on Browser](#access-usb-device-on-browser)
-    - [Windows](#windows)
-    - [Linux](#linux)
-  - [Reverse Engineering](#reverse-engineering)
-    - [General Notes](#general-notes)
-    - [Frame Reference](#frame-reference)
-    - [Firmware Extraction Scripts](#firmware-extraction-scripts)
-  - [Development](#development)
-    - [Native Target Locally](#native-target-locally)
-    - [Web Locally](#web-locally)
-    - [VSCode WASM Target](#vscode-wasm-target)
-    - [CI Checks](#ci-checks)
-    - [Rustfmt](#rustfmt)
-    - [Clippy](#clippy)
-    - [Creating a Release](#creating-a-release)
-  - [Important Resources](#important-resources)
+### Direct WebUSB
 
-## Features
+Standalone Trunk builds, GitHub Pages, CI artifacts, and release archives
+default to WebUSB. Add `?transport=remote` to use a same-origin server instead.
+The Docker image defaults to remote mode. `?transport=webusb` and
+`?transport=remote` always override the build default explicitly; a hash
+override is also accepted, which is useful for an installed PWA launch.
 
-- Almost all original software features, see [Missing
-  Features](#missing-features).
-- All input fields support both , and . as a decimal separator.
-- Checks for updates automatically and notifies the user when a newer version is
-  available.
-- Log and save all low-level communication between software and device.
-- Better built-in guidance for the user, e.g. how to do calibration.
+Direct mode requires a secure context and WebUSB, currently provided by
+Chromium-based desktop browsers such as Chrome and Edge. Firefox and Safari,
+including iOS/iPadOS Safari, do not support direct WebUSB. The browser owns the
+device in this mode, so do not close the page during a test.
 
-## Missing Features
+## Architecture
 
-These are missing features compared to the original Windows software.
+```mermaid
+flowchart LR
+    Browser[Browser / installed PWA] -->|same-origin HTTP + WebSocket| Server[ebc-server]
+    Server -->|serial, 9600 baud| CH340[CH340 USB cable]
+    CH340 --> EBC[EBC-A20]
+    Server --> Data[/data/session.json + samples.csv + runs/]
+    Desktop[Native desktop GUI] -->|serial directly| CH340
+    WebUSB[Chromium direct WebUSB mode] -->|USB directly| CH340
+```
 
-- Control multiple devices from one software session.
-- Cycles configuration.
-- Plot saving as an image.
-- Data export to CSV and .dat files.
-- Opening exported CSV and .dat files.
-- Internal resistance test.
-- Support for other devices than EBC-A20.
-- Firmware update.
+Only one process or browser may own the device at a time. The supplied cable
+contains a CH340 adapter; a plain mini-USB cable does not provide the serial
+interface.
 
-These are things that require attention from a development perspective.
+HTTP handlers and serial polling do not share an async-runtime worker: all
+device lifecycle, protocol I/O, timing, and persistence are serialized by one
+dedicated `ebc-device-actor` operating-system thread. HTTP requests communicate
+with that single owner through messages.
 
-- Add tests.
+## Docker
 
-## Known Bugs in the Original Software
+Build and run the production image:
 
-- All input fields only take , and not . as decimal separator. This software is
-  able to take both. In Europe and China , is used and in USA . is used.
-- Reading graph back to the app from CSV file does not work. The values are read
-  wrong because the , is used for both value separator and decimal separator.
-  `.dat` file imports work as a tab character is used as a value separator.
-- Device screen is reporting firmware version v3.0.3, but v3.0.2 is reported
-  over the USB serial. Hence both this and the original software report the version as
-  v3.0.2 and not v3.0.3.
-- The device firmware checksum calculation is sometimes incorrect, hence this
-  software is ignoring it. For me this was the case with older firmware when I
-  constant current discharged with 1A to 3.3V. The checksum bug happened
-  around 2 mins of discharging. I did not observe this anymore with the newest
-  firmware.
+```bash
+docker build -t ebc-battery-tester .
+docker run -d --name ebc-battery-tester \
+  --restart unless-stopped \
+  --device /dev/ttyUSB0:/dev/ttyUSB0 \
+  --group-add "$(stat -c '%g' /dev/ttyUSB0)" \
+  -p 8080:8080 \
+  -v /srv/ebc-battery-tester:/data \
+  ebc-battery-tester
+```
 
-## Important Notes
+Open `http://SERVER:8080/`. The image compiles the server without GUI/X11
+dependencies and includes the Trunk-built WASM assets, CA certificates, and the
+runtime `libudev` library. It does not contain a compiler, browser, VNC, or
+desktop stack. Its health check calls the existing `/api/status` endpoint using
+the server binary itself.
 
-The browser version uses WebUSB to communicate with the device. WebUSB is only
-supported on Chrome, Edge and Opera; for example, the web app will not work with
-Firefox.
+### Docker Compose and Unraid
 
-Only the USB cable that ships with the device is
-supported. The cable has a built-in CH340 serial chip, even though the device
-end is a mini USB plug, so any regular mini USB cable will not work.
+`docker-compose.yml` defaults to Unraid's conventional UID/GID and appdata path:
 
-## Access USB Device on Browser
+```bash
+SERIAL_GID="$(stat -c '%g' /dev/ttyUSB0)" docker compose up -d --build
+```
 
-This configuration is only needed if you run the app via web browser. Native
-apps work out of the box.
+The defaults are `PUID=99`, `PGID=100`, port `8080`, device `/dev/ttyUSB0`, and
+host data path `/mnt/cache/appdata/ebc-battery-tester`. Override them as needed:
 
-By default, WebUSB cannot access the device from the browser as the OS driver has
-already claimed the device, locking the browser out. In order to use WebUSB, you
-need to do additional steps. Read the steps for your OS below.
+```bash
+PUID=1000 PGID=1000 SERIAL_GID=20 EBC_DEVICE=/dev/ttyUSB1 \
+EBC_PORT=8081 EBC_DATA_PATH=/mnt/user/appdata/ebc-battery-tester \
+docker compose up -d --build
+```
+
+`SERIAL_GID` must be the numeric group owner of the host serial device. Obtain
+it with `stat -c '%g' /dev/ttyUSB0` (or `ls -ln /dev/ttyUSB0`). Compose runs with
+that supplementary group and never uses `privileged: true`.
+
+In server/native serial mode, leave the Linux `ch341` driver attached. Do not
+install an unbind udev rule: the server needs the resulting `/dev/ttyUSB*`
+device. On Windows, use the normal CH340 serial driver for the native app.
+
+## Configuration
+
+The server accepts these environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EBC_HTTP_ADDR` | `0.0.0.0:8080` | HTTP listen address |
+| `EBC_SERIAL_PORT` | `/dev/ttyUSB0` | Serial device path |
+| `EBC_DATA_DIR` | `/data` | Persistent state directory |
+| `EBC_STATIC_DIR` | `dist` | Trunk static asset directory |
+| `EBC_MOCK` | `false` | Use the simulated device |
+| `EBC_ALLOWED_ORIGIN` | unset | Exact browser `Origin` accepted behind a reverse proxy |
+| `RUST_LOG` | `info` in Docker | Rust log filter |
+
+Persist `/data`. `session.json` stores the current device/test metadata and
+`samples.csv` stores current-run measurements. Before a fresh test replaces a
+meaningful current run, the server archives its metadata and CSV under
+`/data/runs/<run-id>.json` and `/data/runs/<run-id>.csv`. Run IDs are sanitized
+UTC start timestamps with collision suffixes. `GET /api/runs` lists archived
+runs and `GET /api/runs/<run-id>.csv` downloads one archive. Current history
+remains available from `GET /api/history.csv`.
+
+The durable CSV retains the complete current run. Initial browser snapshots
+are limited to 5000 presentation samples, and the browser remains bounded to
+5000 points for the lifetime of the page. Incremental deterministic compaction
+keeps the first and latest samples plus voltage/current extrema from time
+buckets. This affects only browser memory and plotting; raw current and archived
+CSV downloads remain complete.
+
+Samples and test status include cumulative `energy_wh`. The server integrates
+measured voltage and current with the trapezoidal rule over backend elapsed
+time, but never integrates across disconnect, restart, or uncertain-ownership
+gaps. The device's two-byte base-240 capacity counter is a raw `u16` value with
+a 57,600 mAh modulus. During a confirmed backend-owned run, the server
+normalizes plausible high-to-low wraps into a cumulative `u64 capacity_mah` and
+ignores stale regressions; it does not infer a wrap across a recovery gap.
+`DeviceState.capacity_mah` remains the latest raw hardware counter for
+diagnostics, while samples, test status, run summaries, browser live capacity,
+and CSV use the normalized cumulative value (divide by 1000 for Ah). Existing
+CSV and JSON data without energy fields loads with zero energy.
+
+After a server restart, saved history and configuration are recovered, but a
+previously running test is marked `recovered_uncertain`, device activity is
+unknown, and its clock is stopped. The server never automatically starts or
+blindly resumes it. An active hardware report keeps the run uncertain and does
+not advance backend elapsed time or energy because ownership of that interval
+cannot be proven. An inactive report resolves the run to `stopped`; the user can
+then start a fresh run. While recovery remains uncertain, Start, Resume, Adjust,
+and Calibration are rejected; explicit Stop and Disconnect remain available.
+If no usable report arrives, the state remains uncertain. Disconnects, serial
+errors, and uncertain recovery break
+the trapezoidal energy accumulator, so neither elapsed time nor energy is
+invented across an observation gap. A confirmed backend-owned start/resume
+starts a fresh clock at zero or resumes from the preserved elapsed value,
+respectively.
+
+Metadata replacement and run archival use write, sync, rename, and directory
+sync. Samples are append-only and flushed with `sync_data` at least once per
+second while reports arrive, and are flushed on orderly stop/shutdown. On load,
+one torn final CSV row is truncated; corruption in a complete row is rejected.
+SIGTERM/SIGINT performs graceful actor shutdown and flushing. SIGKILL or power
+loss cannot run cleanup and may lose the not-yet-synced tail (normally up to the
+one-second sync interval), but previously synced rows and atomically replaced
+metadata remain recoverable.
+
+## Install on iPhone or iPad
+
+Use the remote server URL in Safari, tap **Share**, then **Add to Home Screen**.
+The installed PWA reconnects to the same server. iOS does not support direct
+WebUSB, so the server and remote-default Docker UI are required. On narrow
+screens the toolbar and controls reflow, Start or the active primary Stop action
+appears before the graph, test settings follow it, and direct-USB selection and
+connection actions use separate touch-friendly rows.
+
+## Direct WebUSB setup
+
+These driver changes apply only to direct WebUSB mode. Do not apply them to the
+Docker server or native desktop mode.
 
 ### Windows
 
-On Windows you most likely installed the driver that came with the original app.
-This driver will claim the device when you plug in the USB cable. Hence the
-browser will not be able to access the device. You need to change the driver
-with a more generic WinUSB driver. When you do this, the COM port will not appear
-in the original Windows software anymore. To return the old behavior, you can
-always install the original manufacturer driver using the software bundled
-with the Windows app.
-
-To change the driver on Windows:
-
-1. Download [Zadig](https://zadig.akeo.ie/) and run it.
-2. In the menu, click `Options` and ensure `List All Devices` is checked.
-3. From the dropdown select `USB Serial`.
-4. On the right `Target Driver`, ensure WinUSB is selected, see the screenshot below.
-5. Click `Replace Driver`.
+Use [Zadig](https://zadig.akeo.ie/) to replace the `USB Serial` device driver
+with WinUSB: enable **Options > List All Devices**, select `USB Serial`, choose
+WinUSB, and click **Replace Driver**. This removes the COM port until the CH340
+driver is restored.
 
 ![Zadig Windows](images/zadig-windows.png)
 
-Unplug and plug the USB cable back to the machine. You should now be able to
-connect to the device using WebUSB.
-
 ### Linux
 
-When you plug in the USB cable, the Linux `ch341` driver will claim the USB device
-and you cannot connect to it using WebUSB anymore. You need to unbind it first.
-You can do a one-time unbind with the following command. This will work until you plug
-in the USB cable again.
+The kernel `ch341` driver normally claims the interface. For a one-time direct
+WebUSB session, identify the USB interface and unbind it, for example:
 
 ```bash
 sudo sh -c 'echo "1-2.3:1.0" > /sys/bus/usb/drivers/ch341/unbind'
 ```
 
-If you want to automatically unbind this when the cable is plugged in, you can
-add the following udev rule.
+Grant the logged-in user access to USB vendor `1a86`, product `7523`, with an
+appropriate udev rule. Avoid a permanent automatic unbind rule unless this host
+is dedicated to WebUSB, because unbinding removes `/dev/ttyUSB0` from native and
+server use.
+
+## Mock mode
+
+Run the complete container stack without hardware:
 
 ```bash
-sudo tee /etc/udev/rules.d/99-ebc-tester.rules << 'EOF'
-# Allow browser access to EBC battery tester (CH340, vid:1a86 pid:7523)
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0664", TAG+="uaccess"
-
-# Release ch341 kernel driver immediately after it binds, so WebUSB can claim the interface
-ACTION=="bind", SUBSYSTEM=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", DRIVER=="ch341", RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/ch341/unbind'"
-EOF
+EBC_MOCK=true docker compose up --build
 ```
 
-Then reload the udev rules with
+Or run it from source after building the web UI:
 
 ```bash
-sudo udevadm control --reload-rules
+EBC_WASM_DEFAULT_TRANSPORT=remote trunk build
+EBC_MOCK=true EBC_DATA_DIR=./data EBC_STATIC_DIR=./dist \
+  cargo run --no-default-features --features server --bin ebc-server
 ```
 
-Now you should be able to connect to the serial port with WebUSB.
+Connect the simulated device in the browser, configure a test, and start it to
+produce one sample per second.
 
-This will prevent using the native app as it will not be able to connect to the
-USB port anymore. To restore the original behavior, just remove the udev rule
-added above and reload udev rules with `sudo udevadm control --reload-rules` and
-reconnect the USB cable.
+## Build from source
 
-## Reverse Engineering
-
-### General Notes
-
-See [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) for my reverse engineering
-notes.
-
-### Frame Reference
-
-See [FRAMES.md](FRAMES.md) for the complete frame format reference for EBC-A20
-model.
-
-### Firmware Extraction Scripts
-
-Two Python scripts in the project root help you to extract the original firmware
-in two ways.
-
-**`extract_firmware_from_exe.py`** — extracts all device firmware images from
-the Windows software exe file. The firmware files are not included in this repo
-for legal reasons, but you can easily dump them on your own with this script.
-This will output the extracted firmware in `fw_out` folder in project root.
+Rust 1.92 or newer is required. Linux builds also need the development package
+for `libudev`; desktop builds need the normal eframe/X11 or Wayland development
+libraries.
 
 ```bash
-python3 extract_firmware_from_exe.py ebc-tester.exe
-```
+# Native desktop GUI
+cargo run
 
-**`extract_firmware.py`** — extracts firmware from a Wireshark USB capture
-recorded during a live firmware update performed with the original Windows
-software. Feed it the `.pcap` file and it reconstructs the firmware binary.
+# WASM UI (install wasm32-unknown-unknown and Trunk first)
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk --version 0.21.14
+trunk serve
 
-```bash
-python3 extract_firmware.py firmware-update.pcap firmware_extracted.bin
-```
+# Production headless server binary, with no GUI feature
+cargo build --release --no-default-features --features server --bin ebc-server
 
-Both scripts produce identical output for the EBC-A20:
-`fw_out/firmware_id9_EBC-A20.bin`.
-
-## Development
-
-### Native Target Locally
-
-To develop the app locally with auto compile, run
-
-```bash
-cargo-watch -x run
-```
-
-### Web Locally
-
-You can compile your app to [WASM](https://en.wikipedia.org/wiki/WebAssembly)
-and publish it as a web page.
-
-We use [Trunk](https://trunkrs.dev/) to build for web target.
-
-1. Install the required target with `rustup target add wasm32-unknown-unknown`.
-2. Install Trunk with `cargo install --locked trunk`.
-3. Run `trunk serve` to build and serve on `http://127.0.0.1:8080`. Trunk will rebuild automatically if you edit the project.
-4. Open `http://127.0.0.1:8080/index.html#dev` in a browser. See the warning below.
-
-> `assets/sw.js` script will try to cache our app, and loads the cached version when it cannot connect to server allowing your app to work offline (like PWA).
-> appending `#dev` to `index.html` will skip this caching, allowing us to load the latest builds during development.
-
-### VSCode WASM Target
-
-By default, VSCode and rust-analyzer compile and show errors for the native
-target. To get errors and code completion for the WASM target instead, uncomment
-the following line in [.vscode/settings.json](.vscode/settings.json):
-
-```json
-"rust-analyzer.cargo.target": "wasm32-unknown-unknown",
-```
-
-Remember to revert this when switching back to native development.
-
-### CI Checks
-
-To run all CI checks locally at once, use the provided script
-
-```bash
+# All formatting, native/server/WASM checks, tests, Clippy, and Trunk build
 ./check.sh
 ```
 
-This runs cargo check, formatting, Clippy, tests and a Trunk WASM build.
+Use `http://127.0.0.1:8080/#dev` during Trunk development. Development mode
+unregisters only this app's service worker and clears only caches prefixed
+`ebc-battery-tester-`. The production service worker is network-first, never
+caches `/api`, derives a unique cache generation from each Trunk-generated page,
+atomically populates a fresh generation, and removes only this app's older
+caches after successful installation. A failed installation leaves the active
+old cache in place, and no generated JS/WASM hash is hardcoded.
 
-### Rustfmt
+The project contains unit tests for validation, recovery and command races,
+run/sequence client deduplication and bounds, transport selection, mobile layout
+ordering, exports, and server persistence. Docker CI also runs the final image
+as a non-root UID/GID with mock hardware and a persistent volume, checks health
+and static hashed JS/WASM assets, exercises status/start/stop/CSV, restarts the
+container, and verifies persisted API and static content. Automated tests do
+not replace a real-device check.
 
-This project uses rustfmt for code formatting. There is also a CI check that
-enforces correct formatting. Run the formatter locally with
+## Real hardware checklist
 
-```bash
-cargo fmt
-```
+1. Verify the CH340 cable appears as `/dev/ttyUSB0` and note its numeric GID.
+2. Confirm no other native app, container, or WebUSB tab owns the interface.
+3. Start with the tester idle and no battery/load at unsafe limits.
+4. Connect and verify model, firmware, voltage, and current readings.
+5. Run a short low-current discharge and confirm live samples and stop behavior.
+6. Download `/api/history.csv` and verify `/data/samples.csv` after restart.
+7. Start another short test, close the remote browser, reopen it, and verify the test continued.
+8. Restart the server during a controlled test and verify it reports recovery as uncertain without auto-starting.
+9. Exercise charge, constant-power, adjustment, resume, and calibration only with appropriate instrumentation and safe limits.
 
-To only check without modifying files, run
+The available protocol documentation is ambiguous about serial parity. This
+project preserves the known-working odd-parity implementation; deployment work
+does not change protocol behavior.
 
-```bash
-cargo fmt -- --check
-```
+## API outline
 
-### Clippy
+All endpoints are under `/api`:
 
-This project uses Clippy linter. There is also a CI check that fails on any
-warnings. Run Clippy locally with
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/status` | Current authoritative snapshot |
+| `GET` | `/api/history` | Measurement history as JSON |
+| `GET` | `/api/history.csv` | Measurement history as CSV |
+| `GET` | `/api/runs` | Archived run summaries |
+| `GET` | `/api/runs/{id}.csv` | Archived run CSV download |
+| `GET` | `/api/ws` | Snapshot/sample WebSocket stream |
+| `POST` | `/api/connect`, `/api/disconnect` | Serial connection control |
+| `POST` | `/api/test/start`, `/api/test/adjust` | JSON test configuration |
+| `POST` | `/api/test/stop`, `/api/test/resume` | Test lifecycle |
+| `POST` | `/api/calibration` | JSON calibration command |
 
-```bash
-cargo clippy --target wasm32-unknown-unknown
-```
+Every mutating `POST` requires `X-EBC-Command: 1`; the remote UI sends it and API
+errors are displayed in the connection panel. Browser WebSockets require an
+`Origin`. By default an HTTP or HTTPS origin must match `Host`; when TLS terminates or
+the public host differs at a reverse proxy, set `EBC_ALLOWED_ORIGIN` to the exact
+external value such as `https://battery.example.com`. Forward the original
+`Origin`, support WebSocket upgrades, and do not strip `X-EBC-Command`.
 
-### Creating a Release
+The custom header and origin checks reduce accidental cross-site commands but
+are not authentication or authorization. Treat the server as a hardware control
+endpoint: expose it only on a trusted LAN, or place it behind an HTTPS reverse
+proxy with authentication and WebSocket support. Do not publish port 8080
+directly to the internet.
 
-1. Bump the version in `Cargo.toml`.
-2. Commit and push to main, then wait for CI to pass.
-3. Tag the commit with the matching version and push the tag:
+## Current limitations
 
-```bash
-git tag v<version>
-git push --tags
-```
+- One device per process.
+- No cycle-program configuration, internal-resistance test, plot image export,
+  imported CSV/`.dat` replay, firmware update, or support guarantee for models
+  other than EBC-A20.
+- Server recovery is conservative and does not automatically restart a test.
 
-The release workflow will validate that the tag matches the version in `Cargo.toml`,
-build Linux, Windows and WASM targets, and publish a GitHub release with all three
-as downloadable assets.
+## Protocol and firmware research
 
-## Important Resources
+- [Frame reference](FRAMES.md)
+- [Reverse-engineering notes](REVERSE_ENGINEERING.md)
+- `extract_firmware_from_exe.py` extracts firmware images from the original
+  Windows executable.
+- `extract_firmware.py firmware-update.pcap firmware_extracted.bin` reconstructs
+  an image from a USB capture.
 
-- [ZKETECH EBC-A20 reverse engineering blog post](https://pop.fsck.pl/hardware/zketech-ebc-a20.html) —
-  the starting point for the protocol work; incomplete and contains some inaccuracies.
-- [Python CLI tool for EBC devices](https://gist.github.com/enkiusz/6408645efd622b8a638a14957cd37f47) —
-  command-line tool to control an EBC device from Python.
-- [WebUsbSerialTerminal serial.js](https://github.com/selevo/WebUsbSerialTerminal/blob/main/serial.js) —
-  example code for configuring the CH340 serial chip via WebUSB (baud rate, parity, etc.).
+The firmware files are not distributed by this project. The protocol work began
+from the [ZKETECH EBC-A20 reverse-engineering article](https://pop.fsck.pl/hardware/zketech-ebc-a20.html)
+and the [WebUsbSerialTerminal CH340 implementation](https://github.com/selevo/WebUsbSerialTerminal/blob/main/serial.js).
+
+This project was featured by
+[Hackaday](https://hackaday.com/2026/06/18/battery-tester-gets-an-app-upgrade/).

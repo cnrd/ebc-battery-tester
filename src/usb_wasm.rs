@@ -5,10 +5,34 @@ use wasm_bindgen_futures::JsFuture;
 
 #[path = "usb_wasm/connection.rs"]
 mod connection;
+#[path = "usb_wasm/remote.rs"]
+mod remote;
 #[path = "usb_wasm/worker.rs"]
 mod worker;
 
+pub fn is_remote_transport() -> bool {
+    let Some(window) = web_sys::window() else {
+        return crate::session::select_wasm_transport(
+            option_env!("EBC_WASM_DEFAULT_TRANSPORT").unwrap_or("webusb"),
+            "",
+        ) == crate::session::TransportMode::Remote;
+    };
+    let location = window.location();
+    let switches = format!(
+        "{}&{}",
+        location.search().unwrap_or_default(),
+        location.hash().unwrap_or_default()
+    );
+    crate::session::select_wasm_transport(
+        option_env!("EBC_WASM_DEFAULT_TRANSPORT").unwrap_or("webusb"),
+        &switches,
+    ) == crate::session::TransportMode::Remote
+}
+
 pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
+    if is_remote_transport() {
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async move {
         let Some(window) = web_sys::window() else {
             return;
@@ -52,6 +76,9 @@ pub fn enumerate_devices(event_tx: UnboundedSender<DeviceEvent>) {
 }
 
 pub fn request_device(event_tx: UnboundedSender<DeviceEvent>) {
+    if is_remote_transport() {
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async move {
         let Some(window) = web_sys::window() else {
             return;
@@ -74,5 +101,9 @@ pub fn spawn_device_worker(
     cmd_rx: UnboundedReceiver<OutboundFrame>,
     event_tx: UnboundedSender<DeviceEvent>,
 ) {
-    wasm_bindgen_futures::spawn_local(worker::device_task(ctx, cmd_rx, event_tx));
+    if is_remote_transport() {
+        wasm_bindgen_futures::spawn_local(remote::remote_task(ctx, cmd_rx, event_tx));
+    } else {
+        wasm_bindgen_futures::spawn_local(worker::device_task(ctx, cmd_rx, event_tx));
+    }
 }

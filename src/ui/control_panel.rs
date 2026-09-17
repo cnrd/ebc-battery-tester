@@ -37,6 +37,30 @@ impl ControlPanel {
     pub(crate) fn ui(&mut self, session: &mut DeviceSession, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Control");
+        self.settings_ui(ui);
+        self.buttons_ui(session, ui);
+    }
+
+    pub(crate) fn ui_mobile_primary(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Control");
+        ui.label(self.selected_device_mode.to_string());
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size = egui::vec2(96.0, 44.0);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            self.buttons_ui(session, ui);
+        });
+    }
+
+    pub(crate) fn ui_mobile_settings(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Test settings")
+            .default_open(true)
+            .show(ui, |ui| self.settings_ui(ui));
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let selected_mode = self.selected_device_mode;
         egui::Grid::new("control_grid").show(ui, |ui| {
             ui.label("Device Mode:");
@@ -64,6 +88,10 @@ impl ControlPanel {
                 }
             }
         });
+    }
+
+    fn buttons_ui(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
+        let selected_mode = self.selected_device_mode;
         match selected_mode {
             device::DeviceMode::DischargeConstantCurrent => {
                 self.discharge_constant_current_buttons(session, ui);
@@ -119,11 +147,11 @@ impl ControlPanel {
     }
 
     fn discharge_constant_current_buttons(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if session.mode_on {
                 if ui.button("Stop").clicked() {
                     session.send_cmd(OutboundFrame::Stop, ui.ctx());
-                    session.stop_mode(ui.ctx());
+                    session.stop_mode();
                 }
             } else if ui
                 .add_enabled(session.has_live_voltage(), egui::Button::new("Start"))
@@ -142,7 +170,7 @@ impl ControlPanel {
                     ),
                     ui.ctx(),
                 );
-                session.start_mode(ui.ctx());
+                session.start_mode();
             }
             if ui
                 .add_enabled(
@@ -163,7 +191,7 @@ impl ControlPanel {
                     ),
                     ui.ctx(),
                 );
-                session.continue_mode(ui.ctx());
+                session.continue_mode();
             }
             if ui
                 .add_enabled(
@@ -228,11 +256,11 @@ impl ControlPanel {
     }
 
     fn discharge_constant_power_buttons(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if session.mode_on {
                 if ui.button("Stop").clicked() {
                     session.send_cmd(OutboundFrame::Stop, ui.ctx());
-                    session.stop_mode(ui.ctx());
+                    session.stop_mode();
                 }
             } else if ui
                 .add_enabled(session.has_live_voltage(), egui::Button::new("Start"))
@@ -251,7 +279,7 @@ impl ControlPanel {
                     ),
                     ui.ctx(),
                 );
-                session.start_mode(ui.ctx());
+                session.start_mode();
             }
             if ui
                 .add_enabled(
@@ -272,7 +300,7 @@ impl ControlPanel {
                     ),
                     ui.ctx(),
                 );
-                session.continue_mode(ui.ctx());
+                session.continue_mode();
             }
         });
     }
@@ -319,11 +347,11 @@ impl ControlPanel {
     }
 
     fn charge_constant_voltage_buttons(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if session.mode_on {
                 if ui.button("Stop").clicked() {
                     session.send_cmd(OutboundFrame::Stop, ui.ctx());
-                    session.stop_mode(ui.ctx());
+                    session.stop_mode();
                 }
             } else if ui
                 .add_enabled(session.has_live_voltage(), egui::Button::new("Start"))
@@ -338,7 +366,7 @@ impl ControlPanel {
                     ),
                     ui.ctx(),
                 );
-                session.start_mode(ui.ctx());
+                session.start_mode();
             }
             if ui
                 .add_enabled(
@@ -355,7 +383,7 @@ impl ControlPanel {
                     ),
                     ui.ctx(),
                 );
-                session.continue_mode(ui.ctx());
+                session.continue_mode();
             }
         });
     }

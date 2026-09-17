@@ -1,0 +1,24 @@
+services:
+  ebc-battery-tester:
+    image: ebc-battery-tester:local
+    build:
+      context: .
+      args:
+        TRUNK_VERSION: ${TRUNK_VERSION:-0.21.14}
+    user: "${PUID:-99}:${PGID:-100}"
+    group_add:
+      - "${SERIAL_GID:-20}"
+    devices:
+      - "${EBC_DEVICE:-/dev/ttyUSB0}:/dev/ttyUSB0"
+    ports:
+      - "${EBC_PORT:-8080}:8080"
+    volumes:
+      - "${EBC_DATA_PATH:-/mnt/cache/appdata/ebc-battery-tester}:/data"
+    environment:
+      EBC_HTTP_ADDR: 0.0.0.0:8080
+      EBC_SERIAL_PORT: /dev/ttyUSB0
+      EBC_DATA_DIR: /data
+      EBC_STATIC_DIR: /app/dist
+      EBC_MOCK: ${EBC_MOCK:-false}
+      RUST_LOG: ${RUST_LOG:-info}
+    restart: unless-stopped

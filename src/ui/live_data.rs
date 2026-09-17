@@ -27,10 +27,7 @@ pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
         ui.end_row();
 
         ui.label("Energy:");
-        ui.label(format!(
-            "{:.0} mWh",
-            (session.live_voltage_mv as f32) * (session.live_milli_ampere_hours as f32) / 1000.0
-        ));
+        ui.label(format!("{:.4} Wh", session.live_energy_wh));
         ui.end_row();
 
         ui.label("Capacity:");
@@ -38,13 +35,13 @@ pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
         ui.end_row();
 
         ui.label("Time:");
-        ui.label(format_duration(
-            session.displayed_elapsed_secs(ui.ctx().input(|i| i.time)),
-        ));
+        ui.label(format_duration(session.displayed_elapsed_secs()));
         ui.end_row();
 
         ui.label("Mode:");
-        if let Some(current_device_mode) = session.current_device_mode {
+        if !session.activity_known {
+            ui.colored_label(ui.visuals().warn_fg_color, "Unknown (recovering)");
+        } else if let Some(current_device_mode) = session.current_device_mode {
             ui.colored_label(
                 if session.mode_on {
                     ui.visuals().warn_fg_color

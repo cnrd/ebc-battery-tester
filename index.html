@@ -3,8 +3,7 @@
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 
-    <!-- Disable zooming: -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
     <title>EBC Battery Tester</title>
 
@@ -25,6 +24,9 @@
 
     <link rel="manifest" href="manifest.json">
     <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="EBC Tester">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="white">
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#404040">
 
@@ -130,13 +132,31 @@
         <div class="lds-dual-ring"></div>
     </div>
 
-    <!--Register Service Worker. this will cache the wasm / js scripts for offline use (for PWA functionality). -->
-    <!-- Force refresh (Ctrl + F5) to load the latest files instead of cached files  -->
     <script>
-        // We disable caching during development so that we always view the latest version.
-        if ('serviceWorker' in navigator && window.location.hash !== "#dev") {
+        const EBC_CACHE_PREFIX = 'ebc-battery-tester-';
+        const appScope = new URL('./', document.baseURI).href;
+        const generatedMarkup = document.documentElement.innerHTML;
+        if ('serviceWorker' in navigator && window.location.hash === "#dev") {
+            Promise.all([
+                navigator.serviceWorker.getRegistrations()
+                    .then(registrations => Promise.all(registrations
+                        .filter(registration => registration.scope === appScope)
+                        .map(registration => registration.unregister()))),
+                'caches' in window
+                    ? caches.keys().then(names => Promise.all(names
+                        .filter(name => name.startsWith(EBC_CACHE_PREFIX))
+                        .map(name => caches.delete(name))))
+                    : Promise.resolve()
+            ]);
+        } else if ('serviceWorker' in navigator) {
             window.addEventListener('load', function () {
-                navigator.serviceWorker.register('sw.js');
+                crypto.subtle.digest('SHA-256', new TextEncoder().encode(generatedMarkup))
+                    .then(hash => Array.from(new Uint8Array(hash))
+                        .map(byte => byte.toString(16).padStart(2, '0')).join(''))
+                    .then(build => navigator.serviceWorker.register(
+                        `sw.js?build=${build}`,
+                        { updateViaCache: 'none' }
+                    ));
             });
         }
     </script>

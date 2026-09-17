@@ -22,9 +22,7 @@ pub const MAX_VOLTAGE_MV: u16 = 30000;
 pub const MIN_CUTOFF_TIME_MIN: u16 = 0;
 pub const MAX_CUTOFF_TIME_MIN: u16 = 999;
 // Max minutes to wait between charge and discharge cycle.
-#[expect(unused)]
 pub const AUTO_MODE_TIME_MIN_MINS: u16 = 0;
-#[expect(unused)]
 pub const AUTO_MODE_TIME_MAX_MINS: u16 = 10;
 
 // ZKETECH EBC model codes sent from the device.
@@ -42,7 +40,7 @@ fn get_device_model_name(device_type_code: u8) -> String {
         _ => format!("Unknown ({device_type_code:#04x})"),
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbDeviceInfo {
     pub product_name: String,
     pub manufacturer_name: String,
@@ -68,7 +66,7 @@ impl std::fmt::Display for UsbDeviceInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -93,7 +91,7 @@ impl std::fmt::Display for DeviceMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum OutboundFrame {
     // Send connect command to the device. This will display '-PC-' on the LCD
     // screen. The usize is the index of the device to connect to.
@@ -239,76 +237,61 @@ enum StatusReportType {
     ChargeConstantCurrentEnd = 0x16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirmwareReport {
     pub device_mode: DeviceMode,
     pub in_progress: bool,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
     pub firmware_version: String,
     // Calibration parameters, offset and gain maybe?
-    #[expect(unused)]
     pub unknown1: u16, // Always 2988
-    #[expect(unused)]
     pub unknown2: u16, // Always 2087
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChargeReport {
     pub in_progress: bool,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
-    #[expect(unused)]
     pub charge_current_ma: u16,
-    #[expect(unused)]
     pub charge_voltage_mv: u16,
-    #[expect(unused)]
     pub cutoff_current_ma: u16,
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DischargeConstantCurrentReport {
     pub in_progress: bool,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
-    #[expect(unused)]
     pub discharge_current_ma: u16,
-    #[expect(unused)]
     pub cutoff_voltage_mv: u16,
-    #[expect(unused)]
     pub cutoff_time_min: u16,
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DischargeConstantPowerReport {
     pub in_progress: bool,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
-    #[expect(unused)]
     pub discharge_power_w: u16,
-    #[expect(unused)]
     pub cutoff_voltage_mv: u16,
-    #[expect(unused)]
     pub cutoff_time_min: u16,
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum InboundFrame {
     Firmware(FirmwareReport),
     DischargeConstantCurrent(DischargeConstantCurrentReport),
@@ -480,6 +463,21 @@ pub enum DeviceEvent {
     // Vec of available devices.
     DevicesUpdated(Vec<UsbDeviceInfo>),
     Frame(InboundFrame, Vec<u8>),
+    RemoteConnectionChanged(RemoteConnectionStatus),
+    Remote(crate::core::WebSocketEvent),
+    RemoteCommandSucceeded,
+    RemoteCommandError(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteConnectionStatus {
+    #[default]
+    NotUsed,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Error(String),
 }
 
 impl std::fmt::Debug for DeviceEvent {
@@ -489,6 +487,15 @@ impl std::fmt::Debug for DeviceEvent {
             Self::DevicesUpdated(d) => f.debug_tuple("DevicesUpdated").field(d).finish(),
             Self::Frame(frame, _) => {
                 write!(f, "Frame({frame:?})")
+            }
+            Self::RemoteConnectionChanged(status) => f
+                .debug_tuple("RemoteConnectionChanged")
+                .field(status)
+                .finish(),
+            Self::Remote(event) => f.debug_tuple("Remote").field(event).finish(),
+            Self::RemoteCommandSucceeded => write!(f, "RemoteCommandSucceeded"),
+            Self::RemoteCommandError(error) => {
+                f.debug_tuple("RemoteCommandError").field(error).finish()
             }
         }
     }
