@@ -138,7 +138,11 @@ are limited to 5000 presentation samples, and the browser remains bounded to
 5000 points for the lifetime of the page. Incremental deterministic compaction
 keeps the first and latest samples plus voltage/current extrema from time
 buckets. This affects only browser memory and plotting; raw current and archived
-CSV downloads remain complete.
+CSV downloads remain complete. Export requests flush and sync the current CSV,
+capture its durable byte length, and then stream only that prefix from an
+independent file handle. A concurrent sample append therefore cannot extend or
+corrupt an in-progress download, and a slow download does not block device
+telemetry or commands.
 
 Samples and test status include cumulative `energy_wh`. The server integrates
 measured voltage and current with the trapezoidal rule over backend elapsed
@@ -152,20 +156,27 @@ diagnostics, while samples, test status, run summaries, browser live capacity,
 and CSV use the normalized cumulative value (divide by 1000 for Ah). Existing
 CSV and JSON data without energy fields loads with zero energy.
 
-After a server restart, saved history and configuration are recovered, but a
-previously running test is marked `recovered_uncertain`, device activity is
+After a server restart or any serial observation gap, saved history and
+configuration are retained but ownership of a pending or running test is
+invalidated. The test is marked `recovered_uncertain`, device activity is
 unknown, and its clock is stopped. The server never automatically starts or
 blindly resumes it. An active hardware report keeps the run uncertain and does
 not advance backend elapsed time or energy because ownership of that interval
 cannot be proven. An inactive report resolves the run to `stopped`; the user can
-then start a fresh run. While recovery remains uncertain, Start, Resume, Adjust,
-and Calibration are rejected; explicit Stop and Disconnect remain available.
-If no usable report arrives, the state remains uncertain. Disconnects, serial
-errors, and uncertain recovery break
-the trapezoidal energy accumulator, so neither elapsed time nor energy is
-invented across an observation gap. A confirmed backend-owned start/resume
-starts a fresh clock at zero or resumes from the preserved elapsed value,
-respectively.
+then start a fresh run or explicitly resume a stopped run. While recovery
+remains uncertain, Start, Resume, Adjust, and Calibration are rejected; explicit
+Stop and Disconnect remain available. Start and Stop are exposed as `starting`
+and `stopping` until a fresh hardware report confirms their result. If no usable
+report arrives, the pending or uncertain state remains visible. Disconnects,
+serial errors, and uncertain recovery break the trapezoidal energy accumulator,
+so neither elapsed time nor energy is invented across an observation gap. A
+confirmed backend-owned start/resume starts a fresh clock at zero or resumes
+from the preserved elapsed value, respectively.
+
+Start and Calibration require telemetry from the current serial connection;
+persisted or pre-disconnect voltage/activity values are never accepted as proof
+that hardware is ready. All four calibration references must be staged on the
+same uninterrupted connection before Confirm is accepted.
 
 Metadata replacement and run archival use write, sync, rename, and directory
 sync. Samples are append-only and flushed with `sync_data` at least once per
@@ -280,7 +291,9 @@ not replace a real-device check.
 6. Download `/api/history.csv` and verify `/data/samples.csv` after restart.
 7. Start another short test, close the remote browser, reopen it, and verify the test continued.
 8. Restart the server during a controlled test and verify it reports recovery as uncertain without auto-starting.
-9. Exercise charge, constant-power, adjustment, resume, and calibration only with appropriate instrumentation and safe limits.
+9. Interrupt and restore serial communication during Starting, Running, and Stopping; verify an active report remains uncertain and an inactive report resolves to stopped.
+10. During a controlled multi-minute run, compare the tester's display and cutoff behavior with and without `0x0A` timer sync before relying on it operationally.
+11. Exercise charge, constant-power, adjustment, resume, and calibration only with appropriate instrumentation and safe limits.
 
 The available protocol documentation is ambiguous about serial parity. This
 project preserves the known-working odd-parity implementation; deployment work

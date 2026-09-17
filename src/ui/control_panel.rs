@@ -148,13 +148,16 @@ impl ControlPanel {
 
     fn discharge_constant_current_buttons(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if session.mode_on {
-                if ui.button("Stop").clicked() {
+            if session.show_stop_control() {
+                if ui
+                    .add_enabled(session.can_stop(), egui::Button::new("Stop"))
+                    .clicked()
+                {
                     session.send_cmd(OutboundFrame::Stop, ui.ctx());
                     session.stop_mode();
                 }
             } else if ui
-                .add_enabled(session.has_live_voltage(), egui::Button::new("Start"))
+                .add_enabled(session.can_start(), egui::Button::new("Start"))
                 .on_disabled_hover_text("Connect the device to a battery first")
                 .clicked()
             {
@@ -173,10 +176,7 @@ impl ControlPanel {
                 session.start_mode();
             }
             if ui
-                .add_enabled(
-                    session.has_live_voltage() && !session.mode_on,
-                    egui::Button::new("Continue"),
-                )
+                .add_enabled(session.can_resume(), egui::Button::new("Continue"))
                 .clicked()
             {
                 session.send_cmd(
@@ -257,13 +257,16 @@ impl ControlPanel {
 
     fn discharge_constant_power_buttons(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if session.mode_on {
-                if ui.button("Stop").clicked() {
+            if session.show_stop_control() {
+                if ui
+                    .add_enabled(session.can_stop(), egui::Button::new("Stop"))
+                    .clicked()
+                {
                     session.send_cmd(OutboundFrame::Stop, ui.ctx());
                     session.stop_mode();
                 }
             } else if ui
-                .add_enabled(session.has_live_voltage(), egui::Button::new("Start"))
+                .add_enabled(session.can_start(), egui::Button::new("Start"))
                 .on_disabled_hover_text("Connect device to battery first")
                 .clicked()
             {
@@ -282,10 +285,7 @@ impl ControlPanel {
                 session.start_mode();
             }
             if ui
-                .add_enabled(
-                    session.has_live_voltage() && !session.mode_on,
-                    egui::Button::new("Continue"),
-                )
+                .add_enabled(session.can_resume(), egui::Button::new("Continue"))
                 .clicked()
             {
                 session.send_cmd(
@@ -348,13 +348,16 @@ impl ControlPanel {
 
     fn charge_constant_voltage_buttons(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if session.mode_on {
-                if ui.button("Stop").clicked() {
+            if session.show_stop_control() {
+                if ui
+                    .add_enabled(session.can_stop(), egui::Button::new("Stop"))
+                    .clicked()
+                {
                     session.send_cmd(OutboundFrame::Stop, ui.ctx());
                     session.stop_mode();
                 }
             } else if ui
-                .add_enabled(session.has_live_voltage(), egui::Button::new("Start"))
+                .add_enabled(session.can_start(), egui::Button::new("Start"))
                 .on_disabled_hover_text("Connect device to battery first")
                 .clicked()
             {
@@ -369,10 +372,7 @@ impl ControlPanel {
                 session.start_mode();
             }
             if ui
-                .add_enabled(
-                    session.has_live_voltage() && !session.mode_on,
-                    egui::Button::new("Continue"),
-                )
+                .add_enabled(session.can_resume(), egui::Button::new("Continue"))
                 .clicked()
             {
                 session.send_cmd(

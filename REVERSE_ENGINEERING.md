@@ -273,6 +273,16 @@ next power cycle, after which the previous stored calibration is restored.
 Both charge and discharge modes send an elapsed-minutes counter to the device
 once per minute using command `0x0A`. The minute count is base240-encoded in
 payload bytes 1–2. The device does not respond beyond its normal report frames.
+The available captures do not show whether this updates only the display,
+affects a configured time cutoff, or acts as a keep-alive. That effect must be
+tested on real hardware; it must not be inferred from the frame cadence alone.
+The server sends timer sync only while connection, hardware activity, and
+backend ownership have remained continuously confirmed. A serial observation
+gap stops elapsed projection and timer sync rather than guessing the missing
+minutes. The shared protocol encoder permits values through 57,839 by allowing
+`0xf0` in the high byte; no further sync frame is sent after that bound. Whether
+the hardware accepts that final non-canonical range also requires real-device
+validation.
 
 ```text
 1 min → fa 0a 00 01 00 00 00 00 0b f8

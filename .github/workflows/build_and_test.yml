@@ -152,6 +152,16 @@ jobs:
 
           COMMAND=(-H 'X-EBC-Command: 1')
           curl --fail --silent --show-error -X POST "${COMMAND[@]}" http://127.0.0.1:18080/api/connect >/dev/null
+          for _ in $(seq 1 20); do
+            STATUS=$(curl --fail --silent --show-error http://127.0.0.1:18080/api/status)
+            if printf '%s' "$STATUS" | grep -q '"activity_known":true' && \
+               printf '%s' "$STATUS" | grep -q '"active":false'; then
+              break
+            fi
+            sleep 0.1
+          done
+          printf '%s' "$STATUS" | grep -q '"activity_known":true'
+          printf '%s' "$STATUS" | grep -q '"active":false'
           curl --fail --silent --show-error -X POST "${COMMAND[@]}" \
             -H 'Content-Type: application/json' \
             --data '{"mode":"discharge_constant_current","current_ma":100,"cutoff_voltage_mv":3000,"cutoff_time_min":0}' \

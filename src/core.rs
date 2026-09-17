@@ -40,7 +40,9 @@ pub enum ServerConnectionState {
 pub enum TestState {
     #[default]
     Idle,
+    Starting,
     Running,
+    Stopping,
     Stopped,
     Completed,
     RecoveredUncertain,

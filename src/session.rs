@@ -208,7 +208,36 @@ impl DeviceSession {
     }
 
     pub(crate) fn has_live_voltage(&self) -> bool {
-        self.live_voltage_mv > 0
+        self.activity_known && self.live_voltage_mv > 0
+    }
+
+    pub(crate) fn can_start(&self) -> bool {
+        self.has_live_voltage()
+            && !self.mode_on
+            && matches!(
+                self.test_state,
+                TestState::Idle | TestState::Stopped | TestState::Completed
+            )
+    }
+
+    pub(crate) fn can_resume(&self) -> bool {
+        self.has_live_voltage() && !self.mode_on && self.test_state == TestState::Stopped
+    }
+
+    pub(crate) fn can_calibrate(&self) -> bool {
+        self.can_start()
+    }
+
+    pub(crate) fn show_stop_control(&self) -> bool {
+        self.mode_on
+            || matches!(
+                self.test_state,
+                TestState::Starting | TestState::Stopping | TestState::RecoveredUncertain
+            )
+    }
+
+    pub(crate) fn can_stop(&self) -> bool {
+        self.show_stop_control() && self.test_state != TestState::Stopping
     }
 
     pub(crate) fn can_control_device(&self) -> bool {
@@ -232,10 +261,10 @@ impl DeviceSession {
         if self.is_remote() {
             return;
         }
-        self.mode_on = true;
+        self.mode_on = false;
         self.activity_known = false;
-        self.test_state = TestState::Running;
-        self.mode_started_at = Some(Instant::now());
+        self.test_state = TestState::Starting;
+        self.mode_started_at = None;
         self.mode_accumulated = Duration::ZERO;
         self.last_timer_sync_min = 0;
         self.samples.clear();
@@ -245,10 +274,10 @@ impl DeviceSession {
         if self.is_remote() {
             return;
         }
-        self.mode_on = true;
+        self.mode_on = false;
         self.activity_known = false;
-        self.test_state = TestState::Running;
-        self.mode_started_at = Some(Instant::now());
+        self.test_state = TestState::Starting;
+        self.mode_started_at = None;
     }
 
     pub(crate) fn stop_mode(&mut self) {
@@ -256,15 +285,31 @@ impl DeviceSession {
             return;
         }
         self.freeze_timer();
-        self.mode_on = false;
-        self.activity_known = false;
-        self.test_state = TestState::Stopped;
+        self.test_state = TestState::Stopping;
     }
 
     fn freeze_timer(&mut self) {
         if let Some(started) = self.mode_started_at.take() {
             self.mode_accumulated += started.elapsed();
         }
+    }
+
+    fn invalidate_direct_for_gap(&mut self) {
+        self.freeze_timer();
+        if self.mode_on
+            || matches!(
+                self.test_state,
+                TestState::Starting
+                    | TestState::Running
+                    | TestState::Stopping
+                    | TestState::RecoveredUncertain
+            )
+        {
+            self.test_state = TestState::RecoveredUncertain;
+        }
+        self.mode_on = false;
+        self.activity_known = false;
+        self.current_device_mode = None;
     }
 
     /// Direct transports synchronize the device timer. The remote server owns
@@ -448,13 +493,23 @@ impl DeviceSession {
         self.activity_known = true;
         self.mode_on = active;
         if active {
+            if self.test_state == TestState::Starting {
+                self.test_state = TestState::Running;
+            }
             if self.test_state == TestState::Running && self.mode_started_at.is_none() {
                 self.mode_started_at = Some(Instant::now());
             }
         } else {
             self.freeze_timer();
-            if was_on && self.test_state == TestState::Running {
-                self.test_state = TestState::Completed;
+            self.test_state = match self.test_state.clone() {
+                TestState::Starting | TestState::Stopping | TestState::RecoveredUncertain => {
+                    TestState::Stopped
+                }
+                TestState::Running if was_on => TestState::Completed,
+                state => state,
+            };
+            if matches!(self.test_state, TestState::Stopped | TestState::Completed) {
+                self.mode_on = false;
             }
         }
     }
@@ -468,10 +523,7 @@ impl DeviceSession {
                         ConnectionStatus::Disconnected | ConnectionStatus::Error(_)
                     ) && !self.is_remote()
                     {
-                        self.freeze_timer();
-                        self.mode_on = false;
-                        self.activity_known = false;
-                        self.current_device_mode = None;
+                        self.invalidate_direct_for_gap();
                     }
                     log::info!("Device status changed: {status:?}");
                     self.status = status;
@@ -703,6 +755,54 @@ mod tests {
         );
         assert_eq!(session.pending_timer_sync_minute(), None);
         assert!(session.mode_started_at.is_none());
+    }
+
+    #[test]
+    fn controls_require_fresh_authoritative_activity() {
+        let mut session = DeviceSession {
+            live_voltage_mv: 3900,
+            ..DeviceSession::default()
+        };
+        assert!(!session.can_start());
+        assert!(!session.can_calibrate());
+
+        session.activity_known = true;
+        assert!(session.can_start());
+        assert!(session.can_calibrate());
+
+        session.start_mode();
+        assert_eq!(session.test_state, TestState::Starting);
+        assert!(session.show_stop_control());
+        assert!(session.can_stop());
+        assert!(!session.can_start());
+        assert!(!session.can_calibrate());
+
+        session.test_state = TestState::Stopping;
+        assert!(!session.can_stop());
+    }
+
+    #[test]
+    fn direct_connection_gap_never_reclaims_running_state() {
+        let mut session = DeviceSession {
+            activity_known: true,
+            mode_on: true,
+            test_state: TestState::Running,
+            mode_started_at: Some(Instant::now()),
+            ..DeviceSession::default()
+        };
+
+        session.invalidate_direct_for_gap();
+        assert_eq!(session.test_state, TestState::RecoveredUncertain);
+        assert!(!session.activity_known);
+        assert!(!session.mode_on);
+        assert!(session.mode_started_at.is_none());
+
+        session.apply_direct_activity(true);
+        assert_eq!(session.test_state, TestState::RecoveredUncertain);
+        assert!(session.mode_started_at.is_none());
+
+        session.apply_direct_activity(false);
+        assert_eq!(session.test_state, TestState::Stopped);
     }
 
     #[test]

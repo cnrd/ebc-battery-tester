@@ -318,7 +318,12 @@ Observed to be sent once per minute during active charge or discharge
 operations. Bytes 3–4 carry a base240-encoded minute counter starting from 1.
 The exact purpose is not confirmed. It may synchronise the device's internal
 timer, drive the elapsed-time display, or serve as a keep-alive. The device
-does not send a dedicated reply beyond its normal periodic status reports.
+does not send a dedicated reply beyond its normal periodic status reports. No
+capture in this repository establishes whether omitting, delaying, or resetting
+this command changes cutoff behavior. The host therefore sends it only during
+an uninterrupted, confirmed host-owned run. The current encoder stops after
+57,839 minutes; its use of high byte `0xf0` for the final 240 values has not
+been validated on hardware.
 
 ```text
 [fa] [0a] [minutes_h] [minutes_l] [00] [00] [00] [00] [checksum] [f8]

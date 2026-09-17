@@ -83,7 +83,7 @@ impl eframe::App for MainApp {
                 ui.separator();
                 if ui
                     .add_enabled(
-                        self.session.can_control_device() && self.session.has_live_voltage(),
+                        self.session.can_control_device() && self.session.can_calibrate(),
                         egui::Button::new("Calibrate"),
                     )
                     .on_disabled_hover_text("Connect the device to a battery first")
@@ -131,7 +131,7 @@ impl eframe::App for MainApp {
 
         if is_mobile_layout(ui.available_width()) {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for section in mobile_sections(self.session.mode_on) {
+                for section in mobile_sections(self.session.show_stop_control()) {
                     match section {
                         MobileSection::Connection => ui::usb_panel::ui(&mut self.session, ui),
                         MobileSection::LiveData => {
