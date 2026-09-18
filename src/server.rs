@@ -179,6 +179,7 @@ impl Persistence {
                 connection_error: None,
                 device: metadata.device,
                 test: metadata.test,
+                capabilities: Default::default(),
                 history: Vec::new(),
             }
         } else {
@@ -1201,6 +1202,7 @@ impl DeviceActor {
         self.controller.update_elapsed();
         self.snapshot.device = self.controller.device().clone();
         self.snapshot.test = self.controller.test().clone();
+        self.snapshot.capabilities = self.controller.capabilities();
     }
 
     fn snapshot_for_clients(&self) -> AuthoritativeSnapshot {

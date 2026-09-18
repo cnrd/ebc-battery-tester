@@ -10,7 +10,6 @@ use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
 use gloo_timers::future::TimeoutFuture;
 use wasm_bindgen::JsCast as _;
-use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 const INBOUND_BUFFER_SIZE: u32 = 64;
@@ -55,13 +54,22 @@ pub(super) async fn local_backend_task(
                         if device.is_some() {
                             disconnect_device(
                                 LocalBackend::safe_disconnect(),
+                                &mut backend,
                                 &mut device,
                                 &mut out_endpoint_num,
                                 &mut stop_reading_tx,
                                 &event_tx,
                             ).await;
                         }
-                        publish(backend.begin_connection(), device.as_ref(), out_endpoint_num, &event_tx).await;
+                        publish(
+                            backend.begin_connection(),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
                         event_tx.send(outgoing(OutboundFrame::Connect(index)));
                         match connection::connect(index).await {
                             Ok(state) => {
@@ -77,10 +85,26 @@ pub(super) async fn local_backend_task(
                                     generation,
                                 ));
                                 device = Some(dev);
-                                publish(backend.connection_established(), device.as_ref(), out_endpoint_num, &event_tx).await;
+                                publish(
+                                    backend.connection_established(),
+                                    &mut backend,
+                                    &mut generation,
+                                    &mut device,
+                                    &mut out_endpoint_num,
+                                    &mut stop_reading_tx,
+                                    &event_tx,
+                                ).await;
                             }
                             Err(error) => {
-                                publish(backend.connection_failed(error), device.as_ref(), out_endpoint_num, &event_tx).await;
+                                publish(
+                                    backend.connection_failed(error),
+                                    &mut backend,
+                                    &mut generation,
+                                    &mut device,
+                                    &mut out_endpoint_num,
+                                    &mut stop_reading_tx,
+                                    &event_tx,
+                                ).await;
                             }
                         }
                     }
@@ -88,22 +112,48 @@ pub(super) async fn local_backend_task(
                         generation = generation.wrapping_add(1);
                         disconnect_device(
                             LocalBackend::safe_disconnect(),
+                            &mut backend,
                             &mut device,
                             &mut out_endpoint_num,
                             &mut stop_reading_tx,
                             &event_tx,
                         ).await;
-                        publish(backend.disconnected(), None, None, &event_tx).await;
+                        publish(
+                            backend.disconnected(),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
                     }
                     BackendCommand::Api(command) => {
-                        publish(backend.command(command), device.as_ref(), out_endpoint_num, &event_tx).await;
+                        publish(
+                            backend.command(command),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
                     }
                     BackendCommand::Resume(config) => {
-                        publish(backend.resume(config), device.as_ref(), out_endpoint_num, &event_tx).await;
+                        publish(
+                            backend.resume(config),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
                     }
                     BackendCommand::Shutdown => {
                         disconnect_device(
                             backend.shutdown(),
+                            &mut backend,
                             &mut device,
                             &mut out_endpoint_num,
                             &mut stop_reading_tx,
@@ -116,7 +166,15 @@ pub(super) async fn local_backend_task(
             input = input => match input {
                 Some(InputEvent::Frame { generation: event_generation, frame, raw })
                     if event_generation == generation => {
-                    publish(backend.frame(frame, raw), device.as_ref(), out_endpoint_num, &event_tx).await;
+                    publish(
+                        backend.frame(frame, raw),
+                        &mut backend,
+                        &mut generation,
+                        &mut device,
+                        &mut out_endpoint_num,
+                        &mut stop_reading_tx,
+                        &event_tx,
+                    ).await;
                 }
                 Some(InputEvent::Error { generation: event_generation, message })
                     if event_generation == generation => {
@@ -127,13 +185,29 @@ pub(super) async fn local_backend_task(
                     }
                     out_endpoint_num = None;
                     stop_reading_tx = None;
-                    publish(backend.connection_failed(message), None, None, &event_tx).await;
+                    publish(
+                        backend.connection_failed(message),
+                        &mut backend,
+                        &mut generation,
+                        &mut device,
+                        &mut out_endpoint_num,
+                        &mut stop_reading_tx,
+                        &event_tx,
+                    ).await;
                 }
                 Some(InputEvent::Frame { .. } | InputEvent::Error { .. }) => {}
                 None => break,
             },
             () = tick => {
-                publish(backend.tick(), device.as_ref(), out_endpoint_num, &event_tx).await;
+                publish(
+                    backend.tick(),
+                    &mut backend,
+                    &mut generation,
+                    &mut device,
+                    &mut out_endpoint_num,
+                    &mut stop_reading_tx,
+                    &event_tx,
+                ).await;
             }
         }
     }
@@ -141,14 +215,16 @@ pub(super) async fn local_backend_task(
 
 async fn disconnect_device(
     output: LocalOutput,
+    backend: &mut LocalBackend,
     device: &mut Option<web_sys::UsbDevice>,
     out_endpoint_num: &mut Option<u8>,
     stop_reading_tx: &mut Option<oneshot::Sender<()>>,
     event_tx: &BackendEventSender,
 ) {
-    for frame in output.frames {
+    for send in output.sends {
+        let frame = send.frame();
         event_tx.send(outgoing(frame));
-        if let (Some(current), Some(endpoint)) = (device.as_ref(), *out_endpoint_num) {
+        let result = if let (Some(current), Some(endpoint)) = (device.as_ref(), *out_endpoint_num) {
             let result = match frame {
                 OutboundFrame::Stop => connection::stop(current, endpoint).await,
                 OutboundFrame::Disconnect => {
@@ -157,11 +233,17 @@ async fn disconnect_device(
                     }
                     connection::disconnect(current, endpoint).await
                 }
-                _ => send_frame(current, endpoint, frame).await,
+                _ => connection::send_frame(current, endpoint, frame).await,
             };
-            if let Err(error) = result {
-                log::error!("Failed to send {frame:?}: {error:?}");
-            }
+            result.map_err(|error| format!("{error:?}"))
+        } else {
+            Err("WebUSB device is not open".to_owned())
+        };
+        if let Err(error) = &result {
+            log::error!("Failed to send {frame:?}: {error}");
+        }
+        for event in backend.finish_send(send, result).events {
+            event_tx.send(event);
         }
     }
     for event in output.events {
@@ -173,16 +255,41 @@ async fn disconnect_device(
 
 async fn publish(
     output: LocalOutput,
-    device: Option<&web_sys::UsbDevice>,
-    out_endpoint_num: Option<u8>,
+    backend: &mut LocalBackend,
+    generation: &mut u64,
+    device: &mut Option<web_sys::UsbDevice>,
+    out_endpoint_num: &mut Option<u8>,
+    stop_reading_tx: &mut Option<oneshot::Sender<()>>,
     event_tx: &BackendEventSender,
 ) {
-    for frame in output.frames {
+    for send in output.sends {
+        let frame = send.frame();
         event_tx.send(outgoing(frame));
-        if let (Some(device), Some(endpoint)) = (device, out_endpoint_num)
-            && let Err(error) = send_frame(device, endpoint, frame).await
-        {
-            log::error!("Failed to send {frame:?}: {error:?}");
+        let result = if let (Some(current), Some(endpoint)) = (device.as_ref(), *out_endpoint_num) {
+            connection::send_frame(current, endpoint, frame)
+                .await
+                .map_err(|error| format!("{error:?}"))
+        } else {
+            Err("WebUSB device is not open".to_owned())
+        };
+        if let Err(error) = &result {
+            log::error!("Failed to send {frame:?}: {error}");
+        }
+        let failed = result.is_err();
+        for event in backend.finish_send(send, result).events {
+            event_tx.send(event);
+        }
+        if failed {
+            *generation = generation.wrapping_add(1);
+            if let Some(stop_tx) = stop_reading_tx.take() {
+                let _stopped = stop_tx.send(());
+            }
+            if let Some(current) = device.take()
+                && let Err(error) = JsFuture::from(current.close()).await
+            {
+                log::error!("Failed to close WebUSB device after write error: {error:?}");
+            }
+            *out_endpoint_num = None;
         }
     }
     for event in output.events {
@@ -196,21 +303,6 @@ fn outgoing(frame: OutboundFrame) -> BackendEvent {
         label: format!("{frame:?}"),
         raw_bytes: <[u8; OUTBOUND_FRAME_SIZE]>::from(frame).to_vec(),
     })
-}
-
-async fn send_frame(
-    device: &web_sys::UsbDevice,
-    out_endpoint_num: u8,
-    frame: OutboundFrame,
-) -> Result<(), JsValue> {
-    let mut bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
-    let promise = device
-        .transfer_out_with_u8_slice(out_endpoint_num, &mut bytes)
-        .map_err(|error| format!("Failed to start transfer: {error:?}"))?;
-    JsFuture::from(promise)
-        .await
-        .map_err(|error| format!("Frame send failed: {error:?}"))?;
-    Ok(())
 }
 
 async fn reading_task(
@@ -228,6 +320,16 @@ async fn reading_task(
             result = transfer => match result {
                 Ok(value) => {
                     let result: web_sys::UsbInTransferResult = value.unchecked_into();
+                    if result.status() != web_sys::UsbTransferStatus::Ok {
+                        input_tx.unbounded_send(InputEvent::Error {
+                            generation,
+                            message: format!(
+                                "WebUSB read returned {:?}: connection lost",
+                                result.status()
+                            ),
+                        }).ok();
+                        break;
+                    }
                     if let Some(data) = result.data() {
                         buffer.extend_from_slice(&js_sys::Uint8Array::new(&data.buffer()).to_vec());
                         for (frame, raw) in crate::device::process_buffer(&mut buffer) {

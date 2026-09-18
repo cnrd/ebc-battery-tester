@@ -3,7 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crate::core::{
-    ApiCommand, CalibrationCommand, DeviceState, Sample, TestConfiguration, TestState, TestStatus,
+    ApiCommand, CalibrationCommand, Capabilities, DeviceState, Sample, TestConfiguration,
+    TestState, TestStatus,
 };
 use crate::device::{self, DeviceMode, ModeReportState, OutboundFrame};
 
@@ -101,18 +102,6 @@ impl PreparedCommand {
     pub fn kind(&self) -> CommandKind {
         self.kind
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Capabilities {
-    pub start: bool,
-    pub resume: bool,
-    pub stop: bool,
-    pub show_stop: bool,
-    pub adjust: bool,
-    pub calibrate_voltage: bool,
-    pub calibrate_current: bool,
-    pub confirm_calibration: bool,
 }
 
 #[derive(Default)]

@@ -1,6 +1,6 @@
 use crate::backend::{
-    BackendCapabilities, BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender,
-    BackendState, DiagnosticDirection, DiagnosticEvent, remote_api_commands,
+    BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, BackendState,
+    DiagnosticDirection, DiagnosticEvent, remote_api_commands,
 };
 use crate::core::{ApiCommand, AuthoritativeSnapshot, SnapshotUpdate, WebSocketEvent};
 use futures::channel::mpsc::UnboundedReceiver;
@@ -124,23 +124,14 @@ pub(super) async fn remote_task(
 
 fn publish_websocket(event: WebSocketEvent, event_tx: &BackendEventSender) {
     match event {
-        WebSocketEvent::Snapshot(snapshot) => {
-            let update = SnapshotUpdate::from(&snapshot);
-            event_tx.send(BackendEvent::Snapshot {
-                capabilities: BackendCapabilities::from_remote(&update),
-                snapshot,
-            });
-        }
+        WebSocketEvent::Snapshot(snapshot) => event_tx.send(BackendEvent::Snapshot(snapshot)),
         WebSocketEvent::Update(update) => publish_update(update, event_tx),
         WebSocketEvent::Sample(sample) => event_tx.send(BackendEvent::Sample(sample)),
     }
 }
 
 fn publish_update(update: SnapshotUpdate, event_tx: &BackendEventSender) {
-    event_tx.send(BackendEvent::Update(BackendState {
-        capabilities: BackendCapabilities::from_remote(&update),
-        update,
-    }));
+    event_tx.send(BackendEvent::Update(BackendState { update }));
 }
 
 fn send_connection(event_tx: &BackendEventSender, status: BackendConnectionStatus) {

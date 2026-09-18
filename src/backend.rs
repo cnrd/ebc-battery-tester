@@ -4,10 +4,8 @@ use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
 
-use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Sample, SnapshotUpdate, TestConfiguration, TestState,
-};
-use crate::device::{DeviceMode, UsbDeviceInfo};
+use crate::core::{ApiCommand, AuthoritativeSnapshot, Sample, SnapshotUpdate, TestConfiguration};
+use crate::device::UsbDeviceInfo;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BackendCommand {
@@ -19,72 +17,9 @@ pub(crate) enum BackendCommand {
     Shutdown,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct BackendCapabilities {
-    pub start: bool,
-    pub resume: bool,
-    pub stop: bool,
-    pub show_stop: bool,
-    pub adjust: bool,
-    pub calibrate_voltage: bool,
-    pub calibrate_current: bool,
-    pub confirm_calibration: bool,
-}
-
-impl BackendCapabilities {
-    #[cfg_attr(
-        all(not(target_arch = "wasm32"), not(test)),
-        expect(
-            dead_code,
-            reason = "remote state projection is used by the WASM client"
-        )
-    )]
-    pub(crate) fn from_remote(update: &SnapshotUpdate) -> Self {
-        let connected = update.connection == crate::core::ServerConnectionState::Connected;
-        let fresh = connected && update.device.activity_known;
-        let inactive = fresh && !update.device.active;
-        let active = fresh && update.device.active;
-        let live_voltage = update.device.voltage_mv.unwrap_or(0) > 0;
-        let idle = matches!(
-            update.test.state,
-            TestState::Idle | TestState::Stopped | TestState::Completed
-        );
-        let show_stop = update.device.active
-            || matches!(
-                update.test.state,
-                TestState::Starting
-                    | TestState::Running
-                    | TestState::Stopping
-                    | TestState::RecoveredUncertain
-            );
-        let calibration_state_allowed = !matches!(
-            update.test.state,
-            TestState::RecoveredUncertain | TestState::Starting | TestState::Stopping
-        );
-        let calibrate_voltage = fresh && calibration_state_allowed && live_voltage;
-        Self {
-            start: inactive && live_voltage && idle,
-            resume: inactive && live_voltage && update.test.state == TestState::Stopped,
-            stop: connected && show_stop && update.test.state != TestState::Stopping,
-            show_stop,
-            adjust: active
-                && update.test.state == TestState::Running
-                && update.device.mode == Some(DeviceMode::DischargeConstantCurrent),
-            calibrate_voltage,
-            calibrate_current: calibrate_voltage
-                && active
-                && update.test.state == TestState::Running
-                && update.device.mode == Some(DeviceMode::DischargeConstantCurrent),
-            // The server remains authoritative for calibration staging.
-            confirm_calibration: calibrate_voltage,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct BackendState {
     pub update: SnapshotUpdate,
-    pub capabilities: BackendCapabilities,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,10 +63,7 @@ pub(crate) enum BackendConnectionStatus {
 pub(crate) enum BackendEvent {
     DevicesUpdated(Vec<UsbDeviceInfo>),
     BackendConnectionChanged(BackendConnectionStatus),
-    Snapshot {
-        snapshot: AuthoritativeSnapshot,
-        capabilities: BackendCapabilities,
-    },
+    Snapshot(AuthoritativeSnapshot),
     Update(BackendState),
     Sample(Sample),
     CommandSucceeded,

@@ -14,37 +14,49 @@ pub(super) struct UsbState {
 // Every CH340 control write carries a 1-byte null payload alongside the register/value in
 // the SETUP packet wValue/wIndex fields.
 async fn ch340_configure(device: &web_sys::UsbDevice) -> Result<(), JsValue> {
-    // Each call sends one vendor control OUT transfer with a 1-byte null data stage.
-    // request = CH340 vendor command, value = register address, index = register value.
-    let send = |request: u8, value: u16, index: u16| {
-        let mut data = [0u8; 1];
-        device
-            .control_transfer_out_with_u8_slice(
-                &web_sys::UsbControlTransferParameters::new(
-                    index,
-                    web_sys::UsbRecipient::Device,
-                    request,
-                    web_sys::UsbRequestType::Vendor,
-                    value,
-                ),
-                &mut data,
-            )
-            .map(JsFuture::from)
-    };
-
     // The CH340 requires a specific sequence of control transfers to initialize the serial port.
-    send(0xA1, 0xC29C, 0xB2B9)?.await?; // serial init
-    send(0xA4, 0x00DF, 0x0000)?.await?; // modem ctrl: DTR + RTS on
-    send(0xA4, 0x009F, 0x0000)?.await?; // modem ctrl: call mode
-    send(0x9A, 0x2727, 0x0000)?.await?; // reset control status
-    send(0x9A, 0x1312, 0xB282)?.await?; // baud factor: 9600
-    send(0x9A, 0x0F2C, 0x0008)?.await?; // baud offset: 9600
-    send(0x9A, 0x2518, 0x00CB)?.await?; // line control: 8 bit | odd parity | 1 stop
-    send(0x9A, 0x2727, 0x0000)?.await?; // control status
-    send(0x9A, 0x1312, 0xB282)?.await?; // baud factor: 9600 (final set)
-    send(0x9A, 0x0F2C, 0x0008)?.await?; // baud offset: 9600 (final set)
-    send(0x9A, 0x2727, 0x0000)?.await?; // control status (final)
+    ch340_control(device, 0xA1, 0xC29C, 0xB2B9).await?; // serial init
+    ch340_control(device, 0xA4, 0x00DF, 0x0000).await?; // modem ctrl: DTR + RTS on
+    ch340_control(device, 0xA4, 0x009F, 0x0000).await?; // modem ctrl: call mode
+    ch340_control(device, 0x9A, 0x2727, 0x0000).await?; // reset control status
+    ch340_control(device, 0x9A, 0x1312, 0xB282).await?; // baud factor: 9600
+    ch340_control(device, 0x9A, 0x0F2C, 0x0008).await?; // baud offset: 9600
+    ch340_control(device, 0x9A, 0x2518, 0x00CB).await?; // line control: 8O1
+    ch340_control(device, 0x9A, 0x2727, 0x0000).await?; // control status
+    ch340_control(device, 0x9A, 0x1312, 0xB282).await?; // baud factor: 9600 (final)
+    ch340_control(device, 0x9A, 0x0F2C, 0x0008).await?; // baud offset: 9600 (final)
+    ch340_control(device, 0x9A, 0x2727, 0x0000).await?; // control status (final)
 
+    Ok(())
+}
+
+async fn ch340_control(
+    device: &web_sys::UsbDevice,
+    request: u8,
+    value: u16,
+    index: u16,
+) -> Result<(), JsValue> {
+    let mut data = [0u8; 1];
+    let promise = device.control_transfer_out_with_u8_slice(
+        &web_sys::UsbControlTransferParameters::new(
+            index,
+            web_sys::UsbRecipient::Device,
+            request,
+            web_sys::UsbRequestType::Vendor,
+            value,
+        ),
+        &mut data,
+    )?;
+    let value = JsFuture::from(promise).await?;
+    let result: web_sys::UsbOutTransferResult = value.unchecked_into();
+    if result.status() != web_sys::UsbTransferStatus::Ok || result.bytes_written() != 1 {
+        return Err(format!(
+            "CH340 control transfer returned {:?} after writing {} of 1 bytes",
+            result.status(),
+            result.bytes_written()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -107,13 +119,16 @@ pub(super) async fn connect(device_index: usize) -> Result<UsbState, String> {
         .await
         .map_err(|e| format!("Failed to claim interface {interface_num}: {e:?}"))?;
 
-    let mut bytes: [u8; OUTBOUND_FRAME_SIZE] = OutboundFrame::Connect(device_index).into();
-    let promise = device
-        .transfer_out_with_u8_slice(out_endpoint_num, &mut bytes)
-        .map_err(|e| format!("Failed to start transfer: {e:?}"))?;
-    JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("Connect command failed: {e:?}"))?;
+    if let Err(error) = send_frame(
+        &device,
+        out_endpoint_num,
+        OutboundFrame::Connect(device_index),
+    )
+    .await
+    {
+        let _closed = JsFuture::from(device.close()).await;
+        return Err(format!("Connect command failed: {error}"));
+    }
 
     Ok(UsbState {
         device,
@@ -125,26 +140,40 @@ pub(super) async fn connect(device_index: usize) -> Result<UsbState, String> {
 pub(super) async fn disconnect(
     device: &web_sys::UsbDevice,
     out_endpoint_num: u8,
-) -> Result<(), JsValue> {
+) -> Result<(), String> {
     log::info!("Disconnecting from device...");
-    let mut bytes: [u8; OUTBOUND_FRAME_SIZE] = OutboundFrame::Disconnect.into();
-    let promise = device
-        .transfer_out_with_u8_slice(out_endpoint_num, &mut bytes)
-        .map_err(|e| format!("Failed to start transfer: {e:?}"))?;
-    JsFuture::from(promise)
+    send_frame(device, out_endpoint_num, OutboundFrame::Disconnect).await?;
+    JsFuture::from(device.close())
         .await
-        .map_err(|e| format!("Disconnect command failed: {e:?}"))?;
-    JsFuture::from(device.close()).await?;
+        .map_err(|error| format!("Failed to close device: {error:?}"))?;
     Ok(())
 }
 
-pub(super) async fn stop(device: &web_sys::UsbDevice, out_endpoint_num: u8) -> Result<(), JsValue> {
-    let mut bytes: [u8; OUTBOUND_FRAME_SIZE] = OutboundFrame::Stop.into();
+pub(super) async fn stop(device: &web_sys::UsbDevice, out_endpoint_num: u8) -> Result<(), String> {
+    send_frame(device, out_endpoint_num, OutboundFrame::Stop).await
+}
+
+pub(super) async fn send_frame(
+    device: &web_sys::UsbDevice,
+    out_endpoint_num: u8,
+    frame: OutboundFrame,
+) -> Result<(), String> {
+    let mut bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
     let promise = device
         .transfer_out_with_u8_slice(out_endpoint_num, &mut bytes)
-        .map_err(|e| format!("Failed to start transfer: {e:?}"))?;
-    JsFuture::from(promise)
+        .map_err(|error| format!("Failed to start transfer: {error:?}"))?;
+    let value = JsFuture::from(promise)
         .await
-        .map_err(|e: JsValue| format!("Stop command failed: {e:?}"))?;
+        .map_err(|error| format!("Frame send failed: {error:?}"))?;
+    let result: web_sys::UsbOutTransferResult = value.unchecked_into();
+    if result.status() != web_sys::UsbTransferStatus::Ok {
+        return Err(format!("Frame send returned {:?}", result.status()));
+    }
+    if result.bytes_written() != OUTBOUND_FRAME_SIZE as u32 {
+        return Err(format!(
+            "Frame send wrote {} of {OUTBOUND_FRAME_SIZE} bytes",
+            result.bytes_written()
+        ));
+    }
     Ok(())
 }

@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
 use crate::backend::{
-    BackendCapabilities, BackendCommand, BackendConnectionStatus, BackendEvent, BackendState,
-    DiagnosticDirection,
+    BackendCommand, BackendConnectionStatus, BackendEvent, BackendState, DiagnosticDirection,
 };
 use crate::backend_client::BackendClient;
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Sample, ServerConnectionState, TestConfiguration, TestState,
+    ApiCommand, AuthoritativeSnapshot, Capabilities, Sample, ServerConnectionState,
+    TestConfiguration, TestState,
 };
 use crate::device::{self, ConnectionStatus};
 use crate::export::{LogDirection, LogEntry};
@@ -119,7 +119,7 @@ pub(crate) struct DeviceSession {
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) command_error: Option<String>,
     transport_mode: TransportMode,
-    capabilities: BackendCapabilities,
+    capabilities: Capabilities,
     elapsed_seconds: u64,
     remote_run_id: Option<String>,
     last_remote_sequence: Option<u64>,
@@ -147,7 +147,7 @@ impl Default for DeviceSession {
             log_entries: Vec::new(),
             command_error: None,
             transport_mode: TransportMode::Direct,
-            capabilities: BackendCapabilities::default(),
+            capabilities: Capabilities::default(),
             elapsed_seconds: 0,
             remote_run_id: None,
             last_remote_sequence: None,
@@ -195,7 +195,19 @@ impl DeviceSession {
     }
 
     pub(crate) fn can_calibrate(&self) -> bool {
-        self.can_start()
+        self.capabilities.calibrate_voltage
+    }
+
+    pub(crate) fn can_calibrate_voltage(&self) -> bool {
+        self.capabilities.calibrate_voltage
+    }
+
+    pub(crate) fn can_calibrate_current(&self) -> bool {
+        self.capabilities.calibrate_current
+    }
+
+    pub(crate) fn can_confirm_calibration(&self) -> bool {
+        self.capabilities.confirm_calibration
     }
 
     pub(crate) fn can_adjust(&self) -> bool {
@@ -257,14 +269,9 @@ impl DeviceSession {
         self.backend.shutdown();
     }
 
-    fn apply_snapshot(
-        &mut self,
-        snapshot: AuthoritativeSnapshot,
-        capabilities: BackendCapabilities,
-    ) {
+    fn apply_snapshot(&mut self, snapshot: AuthoritativeSnapshot) {
         self.apply_state(BackendState {
             update: crate::core::SnapshotUpdate::from(&snapshot),
-            capabilities,
         });
         let mut history = snapshot.history;
         self.remote_run_id = history.last().map(|sample| sample.run_id.clone());
@@ -279,7 +286,7 @@ impl DeviceSession {
 
     fn apply_state(&mut self, state: BackendState) {
         let update = state.update;
-        self.capabilities = state.capabilities;
+        self.capabilities = update.capabilities;
         self.status = match update.connection {
             ServerConnectionState::Disconnected => ConnectionStatus::Disconnected,
             ServerConnectionState::Connecting => ConnectionStatus::Connecting,
@@ -347,10 +354,7 @@ impl DeviceSession {
                     }
                 }
                 BackendEvent::BackendConnectionChanged(status) => self.remote_status = status,
-                BackendEvent::Snapshot {
-                    snapshot,
-                    capabilities,
-                } => self.apply_snapshot(snapshot, capabilities),
+                BackendEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
                 BackendEvent::Update(state) => self.apply_state(state),
                 BackendEvent::Sample(sample) => self.apply_sample(sample),
                 BackendEvent::CommandSucceeded => self.command_error = None,
@@ -372,7 +376,7 @@ impl DeviceSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DeviceState, SnapshotUpdate, TestStatus};
+    use crate::core::{DeviceState, TestStatus};
 
     #[test]
     fn semantic_snapshot_reconstructs_view_state() {
@@ -380,47 +384,60 @@ mod tests {
             transport_mode: TransportMode::Remote,
             ..DeviceSession::default()
         };
-        session.apply_snapshot(
-            AuthoritativeSnapshot {
-                connection: ServerConnectionState::Connected,
-                device: DeviceState {
-                    activity_known: true,
-                    active: true,
-                    voltage_mv: Some(3900),
-                    current_ma: Some(1000),
-                    capacity_mah: Some(5),
-                    mode: Some(device::DeviceMode::DischargeConstantCurrent),
-                    ..DeviceState::default()
-                },
-                test: TestStatus {
-                    state: TestState::Running,
-                    elapsed_seconds: 12,
-                    capacity_mah: Some(100_005),
-                    ..TestStatus::default()
-                },
-                history: vec![sample("new-run", 0, 12)],
-                ..AuthoritativeSnapshot::default()
+        session.apply_snapshot(AuthoritativeSnapshot {
+            connection: ServerConnectionState::Connected,
+            device: DeviceState {
+                activity_known: true,
+                active: true,
+                voltage_mv: Some(3900),
+                current_ma: Some(1000),
+                capacity_mah: Some(5),
+                mode: Some(device::DeviceMode::DischargeConstantCurrent),
+                ..DeviceState::default()
             },
-            BackendCapabilities::from_remote(&SnapshotUpdate {
-                connection: ServerConnectionState::Connected,
-                device: DeviceState {
-                    activity_known: true,
-                    active: true,
-                    voltage_mv: Some(3900),
-                    mode: Some(device::DeviceMode::DischargeConstantCurrent),
-                    ..DeviceState::default()
-                },
-                test: TestStatus {
-                    state: TestState::Running,
-                    ..TestStatus::default()
-                },
-                ..SnapshotUpdate::default()
-            }),
-        );
+            test: TestStatus {
+                state: TestState::Running,
+                elapsed_seconds: 12,
+                capacity_mah: Some(100_005),
+                ..TestStatus::default()
+            },
+            capabilities: Capabilities {
+                adjust: true,
+                ..Capabilities::default()
+            },
+            history: vec![sample("new-run", 0, 12)],
+            ..AuthoritativeSnapshot::default()
+        });
         assert_eq!(session.samples, vec![sample("new-run", 0, 12)]);
         assert_eq!(session.live_milli_ampere_hours, 100_005);
         assert!(session.mode_on);
         assert!(session.can_adjust());
+    }
+
+    #[test]
+    fn remote_snapshot_uses_serialized_capabilities_without_reconstructing_policy() {
+        let mut session = DeviceSession {
+            transport_mode: TransportMode::Remote,
+            ..DeviceSession::default()
+        };
+        session.apply_snapshot(AuthoritativeSnapshot {
+            connection: ServerConnectionState::Connected,
+            device: DeviceState {
+                activity_known: true,
+                active: false,
+                voltage_mv: Some(4200),
+                ..DeviceState::default()
+            },
+            test: TestStatus {
+                state: TestState::Idle,
+                ..TestStatus::default()
+            },
+            capabilities: Capabilities::default(),
+            ..AuthoritativeSnapshot::default()
+        });
+
+        assert!(!session.can_start());
+        assert!(!session.can_calibrate());
     }
 
     #[test]

@@ -82,33 +82,54 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                     event_tx.send(BackendEvent::DevicesUpdated(available_devices()));
                 }
                 Ok(BackendCommand::Connect(idx)) => {
-                    publish(backend.begin_connection(), &mut port, &event_tx);
+                    buffer.clear();
+                    publish(
+                        backend.begin_connection(),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
                     event_tx.send(outgoing(OutboundFrame::Connect(idx)));
                     match connect(idx) {
                         Ok(p) => {
                             port = Some(p);
-                            publish(backend.connection_established(), &mut port, &event_tx);
+                            publish(
+                                backend.connection_established(),
+                                &mut port,
+                                &event_tx,
+                                &mut backend,
+                            );
                         }
                         Err(e) => {
                             log::error!("Failed to connect: {e}");
-                            publish(backend.connection_failed(e), &mut port, &event_tx);
+                            publish(
+                                backend.connection_failed(e),
+                                &mut port,
+                                &event_tx,
+                                &mut backend,
+                            );
                         }
                     }
                 }
                 Ok(BackendCommand::Disconnect) => {
-                    publish(LocalBackend::safe_disconnect(), &mut port, &event_tx);
+                    publish(
+                        LocalBackend::safe_disconnect(),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
                     port = None;
                     buffer.clear();
-                    publish(backend.disconnected(), &mut port, &event_tx);
+                    publish(backend.disconnected(), &mut port, &event_tx, &mut backend);
                 }
                 Ok(BackendCommand::Api(command)) => {
-                    publish(backend.command(command), &mut port, &event_tx);
+                    publish(backend.command(command), &mut port, &event_tx, &mut backend);
                 }
                 Ok(BackendCommand::Resume(config)) => {
-                    publish(backend.resume(config), &mut port, &event_tx);
+                    publish(backend.resume(config), &mut port, &event_tx, &mut backend);
                 }
                 Ok(BackendCommand::Shutdown) => {
-                    publish(backend.shutdown(), &mut port, &event_tx);
+                    publish(backend.shutdown(), &mut port, &event_tx, &mut backend);
                     break 'runtime;
                 }
                 Err(futures::channel::mpsc::TryRecvError::Empty) => break,
@@ -122,7 +143,12 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                 Ok(n) if n > 0 => {
                     buffer.extend_from_slice(&temp_buffer[..n]);
                     for (frame, raw) in crate::device::process_buffer(&mut buffer) {
-                        publish(backend.frame(frame, raw), &mut port, &event_tx);
+                        publish(
+                            backend.frame(frame, raw),
+                            &mut port,
+                            &event_tx,
+                            &mut backend,
+                        );
                     }
                 }
                 Ok(_) => {}
@@ -135,13 +161,14 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                         backend.connection_failed("Read error: connection lost".to_owned()),
                         &mut port,
                         &event_tx,
+                        &mut backend,
                     );
                 }
             }
         } else {
             std::thread::sleep(SLEEP_DURATION);
         }
-        publish(backend.tick(), &mut port, &event_tx);
+        publish(backend.tick(), &mut port, &event_tx, &mut backend);
     }
 }
 
@@ -149,14 +176,28 @@ fn publish(
     output: LocalOutput,
     port: &mut Option<Box<dyn serialport::SerialPort>>,
     event_tx: &BackendEventSender,
+    backend: &mut LocalBackend,
 ) {
-    for frame in output.frames {
+    for send in output.sends {
+        let frame = send.frame();
         event_tx.send(outgoing(frame));
-        if let Some(port) = port {
+        let result = if let Some(port) = port {
             let bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
-            if let Err(error) = port.write_all(&bytes) {
-                log::error!("Failed to send {frame:?}: {error}");
-            }
+            port.write_all(&bytes)
+                .map_err(|error| format!("serial write failed: {error}"))
+        } else {
+            Err("serial port is not open".to_owned())
+        };
+        if let Err(error) = &result {
+            log::error!("Failed to send {frame:?}: {error}");
+        }
+        let failed = result.is_err();
+        let completion = backend.finish_send(send, result);
+        for event in completion.events {
+            event_tx.send(event);
+        }
+        if failed {
+            *port = None;
         }
     }
     for event in output.events {

@@ -1,9 +1,9 @@
 //! Local physical-test backend shared by native serial and browser `WebUSB` runners.
 
-use crate::backend::{
-    BackendCapabilities, BackendEvent, BackendState, DiagnosticDirection, DiagnosticEvent,
+use crate::backend::{BackendEvent, BackendState, DiagnosticDirection, DiagnosticEvent};
+use crate::controller::{
+    CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
-use crate::controller::{ControllerMode, DeviceReport, ReportState, TestController};
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, Sample, ServerConnectionState, SnapshotUpdate,
     TestConfiguration,
@@ -12,8 +12,27 @@ use crate::device::{self, InboundFrame, OutboundFrame};
 
 #[derive(Default)]
 pub(crate) struct LocalOutput {
-    pub frames: Vec<OutboundFrame>,
+    pub sends: Vec<LocalSend>,
     pub events: Vec<BackendEvent>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalSend {
+    frame: OutboundFrame,
+    completion: SendCompletion,
+}
+
+impl LocalSend {
+    pub(crate) fn frame(self) -> OutboundFrame {
+        self.frame
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SendCompletion {
+    Command(PreparedCommand),
+    TimerSync,
+    BestEffort,
 }
 
 pub(crate) struct LocalBackend {
@@ -72,17 +91,55 @@ impl LocalBackend {
             Ok(prepared) => prepared,
             Err(error) => return Self::command_error(error),
         };
-        let mut output = LocalOutput::default();
         if let Some(frame) = prepared.frame() {
-            output.frames.push(frame);
+            return LocalOutput {
+                sends: vec![LocalSend {
+                    frame,
+                    completion: SendCompletion::Command(prepared),
+                }],
+                ..LocalOutput::default()
+            };
         }
+        self.command_succeeded(prepared)
+    }
+
+    pub(crate) fn resume(&self, config: TestConfiguration) -> LocalOutput {
+        let prepared = match self.controller.prepare_resume(config) {
+            Ok(prepared) => prepared,
+            Err(error) => return Self::command_error(error),
+        };
+        let Some(frame) = prepared.frame() else {
+            return Self::command_error("resume did not produce a protocol frame".to_owned());
+        };
+        LocalOutput {
+            sends: vec![LocalSend {
+                frame,
+                completion: SendCompletion::Command(prepared),
+            }],
+            ..LocalOutput::default()
+        }
+    }
+
+    pub(crate) fn finish_send(
+        &mut self,
+        send: LocalSend,
+        result: Result<(), String>,
+    ) -> LocalOutput {
+        match result {
+            Ok(()) => match send.completion {
+                SendCompletion::Command(prepared) => self.command_succeeded(prepared),
+                SendCompletion::TimerSync | SendCompletion::BestEffort => LocalOutput::default(),
+            },
+            Err(error) => self.send_failed(send, &error),
+        }
+    }
+
+    fn command_succeeded(&mut self, prepared: PreparedCommand) -> LocalOutput {
+        let mut output = LocalOutput::default();
         self.controller.commit_command(prepared, None);
-        if matches!(command, ApiCommand::Start(_)) {
+        if prepared.kind() == CommandKind::Start {
             self.next_sequence = 0;
-            output.events.push(BackendEvent::Snapshot {
-                snapshot: self.snapshot(),
-                capabilities: self.capabilities(),
-            });
+            output.events.push(BackendEvent::Snapshot(self.snapshot()));
         } else {
             output.events.push(BackendEvent::Update(self.state()));
         }
@@ -90,24 +147,18 @@ impl LocalBackend {
         output
     }
 
-    pub(crate) fn resume(&mut self, config: TestConfiguration) -> LocalOutput {
-        let prepared = match self.controller.prepare_resume(config) {
-            Ok(prepared) => prepared,
-            Err(error) => return Self::command_error(error),
-        };
-        let mut output = LocalOutput::default();
-        if let Some(frame) = prepared.frame() {
-            output.frames.push(frame);
-        }
-        self.controller.commit_command(prepared, None);
-        output.events.push(BackendEvent::Update(self.state()));
-        output.events.push(BackendEvent::CommandSucceeded);
-        output
-    }
-
     pub(crate) fn safe_disconnect() -> LocalOutput {
         LocalOutput {
-            frames: vec![OutboundFrame::Stop, OutboundFrame::Disconnect],
+            sends: vec![
+                LocalSend {
+                    frame: OutboundFrame::Stop,
+                    completion: SendCompletion::BestEffort,
+                },
+                LocalSend {
+                    frame: OutboundFrame::Disconnect,
+                    completion: SendCompletion::BestEffort,
+                },
+            ],
             ..LocalOutput::default()
         }
     }
@@ -117,16 +168,16 @@ impl LocalBackend {
             return LocalOutput::default();
         }
         self.shutdown_started = true;
-        LocalOutput {
-            frames: vec![OutboundFrame::Stop, OutboundFrame::Disconnect],
-            ..LocalOutput::default()
-        }
+        Self::safe_disconnect()
     }
 
     pub(crate) fn tick(&mut self) -> LocalOutput {
         let mut output = LocalOutput::default();
         if let Some(minutes) = self.controller.next_timer_sync() {
-            output.frames.push(OutboundFrame::TimerSync(minutes));
+            output.sends.push(LocalSend {
+                frame: OutboundFrame::TimerSync(minutes),
+                completion: SendCompletion::TimerSync,
+            });
         }
         self.controller.update_elapsed();
         let elapsed = self.controller.test().elapsed_seconds;
@@ -239,8 +290,8 @@ impl LocalBackend {
                 connection_error: self.connection_error.clone(),
                 device: self.controller.device().clone(),
                 test: self.controller.test().clone(),
+                capabilities: self.controller.capabilities(),
             },
-            capabilities: self.capabilities(),
         }
     }
 
@@ -251,21 +302,8 @@ impl LocalBackend {
             connection_error: state.update.connection_error,
             device: state.update.device,
             test: state.update.test,
+            capabilities: state.update.capabilities,
             history: Vec::new(),
-        }
-    }
-
-    fn capabilities(&self) -> BackendCapabilities {
-        let capabilities = self.controller.capabilities();
-        BackendCapabilities {
-            start: capabilities.start,
-            resume: capabilities.resume,
-            stop: capabilities.stop,
-            show_stop: capabilities.show_stop,
-            adjust: capabilities.adjust,
-            calibrate_voltage: capabilities.calibrate_voltage,
-            calibrate_current: capabilities.calibrate_current,
-            confirm_calibration: capabilities.confirm_calibration,
         }
     }
 
@@ -274,6 +312,28 @@ impl LocalBackend {
             events: vec![BackendEvent::CommandError(error)],
             ..LocalOutput::default()
         }
+    }
+
+    fn send_failed(&mut self, send: LocalSend, error: &str) -> LocalOutput {
+        let message = format!("failed to send {:?}: {error}", send.frame);
+        if let SendCompletion::Command(prepared) = send.completion
+            && prepared.kind() == CommandKind::Start
+        {
+            self.controller.start_write_failed();
+        }
+        if !matches!(send.completion, SendCompletion::BestEffort) {
+            self.controller.disconnect(&message);
+            self.connection = ServerConnectionState::Error;
+            self.connection_error = Some(message.clone());
+            return LocalOutput {
+                events: vec![
+                    BackendEvent::Update(self.state()),
+                    BackendEvent::CommandError(message),
+                ],
+                ..LocalOutput::default()
+            };
+        }
+        Self::command_error(message)
     }
 
     #[cfg(test)]
@@ -327,7 +387,7 @@ mod tests {
             .iter()
             .find_map(|event| match event {
                 BackendEvent::Update(state) => Some(state),
-                BackendEvent::Snapshot { snapshot, .. } => {
+                BackendEvent::Snapshot(snapshot) => {
                     panic!("expected update, got snapshot: {snapshot:?}")
                 }
                 _ => None,
@@ -335,17 +395,32 @@ mod tests {
             .expect("semantic state event")
     }
 
+    fn send_frames(output: &LocalOutput) -> Vec<OutboundFrame> {
+        output.sends.iter().copied().map(LocalSend::frame).collect()
+    }
+
+    fn finish_success(backend: &mut LocalBackend, output: &LocalOutput) -> LocalOutput {
+        assert_eq!(output.sends.len(), 1);
+        backend.finish_send(output.sends[0], Ok(()))
+    }
+
+    fn finish_failure(backend: &mut LocalBackend, output: &LocalOutput) -> LocalOutput {
+        assert_eq!(output.sends.len(), 1);
+        backend.finish_send(output.sends[0], Err("injected write failure".to_owned()))
+    }
+
     #[test]
     fn start_buffered_idle_active_stop_idle_is_semantic() {
         let mut backend = connected_backend();
-        let start = backend.command(ApiCommand::Start(config()));
+        let request = backend.command(ApiCommand::Start(config()));
         assert!(matches!(
-            start.frames.as_slice(),
+            send_frames(&request).as_slice(),
             [OutboundFrame::StartConstantCurrentDischarge(1000, 3000, 0)]
         ));
+        let start = finish_success(&mut backend, &request);
         assert!(matches!(
             start.events.first(),
-            Some(BackendEvent::Snapshot { snapshot, .. })
+            Some(BackendEvent::Snapshot(snapshot))
                 if snapshot.test.state == TestState::Starting
         ));
 
@@ -367,8 +442,12 @@ mod tests {
                 .any(|event| matches!(event, BackendEvent::Sample(_)))
         );
 
-        let stop = backend.command(ApiCommand::Stop);
-        assert!(matches!(stop.frames.as_slice(), [OutboundFrame::Stop]));
+        let request = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&request).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        let stop = finish_success(&mut backend, &request);
         assert_eq!(state(&stop).update.test.state, TestState::Stopping);
         let stopped = backend.report(report(ReportState::Idle, 1), true);
         assert_eq!(state(&stopped).update.test.state, TestState::Stopped);
@@ -377,22 +456,24 @@ mod tests {
     #[test]
     fn timer_sync_is_backend_housekeeping_without_gui_polling() {
         let mut backend = connected_backend();
-        backend.command(ApiCommand::Start(config()));
+        let request = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &request);
         backend.report(report(ReportState::Active, 1), true);
         backend.set_elapsed_for_test(60);
 
         let tick = backend.tick();
         assert!(matches!(
-            tick.frames.as_slice(),
+            send_frames(&tick).as_slice(),
             [OutboundFrame::TimerSync(1)]
         ));
-        assert!(backend.tick().frames.is_empty());
+        assert!(backend.tick().sends.is_empty());
     }
 
     #[test]
     fn reports_are_processed_without_a_gui_event_loop() {
         let mut backend = connected_backend();
-        backend.command(ApiCommand::Start(config()));
+        let request = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &request);
         let output = backend.report(report(ReportState::Active, 5), true);
 
         assert_eq!(state(&output).update.test.state, TestState::Running);
@@ -406,7 +487,8 @@ mod tests {
     #[test]
     fn connection_gap_revokes_local_ownership() {
         let mut backend = connected_backend();
-        backend.command(ApiCommand::Start(config()));
+        let request = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &request);
         backend.report(report(ReportState::Active, 1), true);
 
         let output = backend.connection_failed("serial gap".to_owned());
@@ -416,16 +498,117 @@ mod tests {
             TestState::RecoveredUncertain
         );
         assert!(!state(&output).update.device.activity_known);
-        assert!(backend.tick().frames.is_empty());
+        assert!(backend.tick().sends.is_empty());
+    }
+
+    #[test]
+    fn local_state_carries_controller_capabilities() {
+        let mut backend = connected_backend();
+        let output = backend.report(report(ReportState::Idle, 0), true);
+
+        assert!(state(&output).update.capabilities.start);
+        assert_eq!(
+            state(&output).update.capabilities,
+            backend.controller.capabilities()
+        );
+    }
+
+    #[test]
+    fn start_is_committed_only_after_send_and_failure_is_uncertain() {
+        let mut backend = connected_backend();
+        let request = backend.command(ApiCommand::Start(config()));
+
+        assert_eq!(backend.controller.test().state, TestState::Idle);
+        assert!(request.events.is_empty());
+
+        let failed = finish_failure(&mut backend, &request);
+        assert_eq!(
+            state(&failed).update.test.state,
+            TestState::RecoveredUncertain
+        );
+        assert!(!state(&failed).update.device.activity_known);
+        assert!(matches!(
+            failed.events.last(),
+            Some(BackendEvent::CommandError(error)) if error.contains("injected write failure")
+        ));
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::CommandSucceeded))
+        );
+    }
+
+    #[test]
+    fn stop_adjust_and_calibration_failures_invalidate_transport_trust() {
+        let commands = [
+            ApiCommand::Adjust(config()),
+            ApiCommand::Stop,
+            ApiCommand::Calibration(crate::core::CalibrationCommand::VoltageLow(4000)),
+        ];
+
+        for command in commands {
+            let mut backend = connected_backend();
+            if matches!(command, ApiCommand::Adjust(_) | ApiCommand::Stop) {
+                let start = backend.command(ApiCommand::Start(config()));
+                finish_success(&mut backend, &start);
+                backend.report(report(ReportState::Active, 1), true);
+            }
+            let request = backend.command(command);
+            let failed = finish_failure(&mut backend, &request);
+
+            assert_eq!(
+                state(&failed).update.connection,
+                ServerConnectionState::Error
+            );
+            assert!(!state(&failed).update.device.activity_known);
+            assert!(matches!(
+                failed.events.last(),
+                Some(BackendEvent::CommandError(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn resume_and_timer_sync_failures_revoke_freshness_and_ownership() {
+        let mut backend = connected_backend();
+        let start = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        let stop = backend.command(ApiCommand::Stop);
+        finish_success(&mut backend, &stop);
+        backend.report(report(ReportState::Idle, 1), true);
+
+        let resume = backend.resume(config());
+        let failed = finish_failure(&mut backend, &resume);
+        assert_eq!(
+            state(&failed).update.connection,
+            ServerConnectionState::Error
+        );
+        assert!(!state(&failed).update.device.activity_known);
+
+        let mut backend = connected_backend();
+        let start = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        backend.set_elapsed_for_test(60);
+        let timer = backend.tick();
+        let failed = finish_failure(&mut backend, &timer);
+
+        assert_eq!(
+            state(&failed).update.test.state,
+            TestState::RecoveredUncertain
+        );
+        assert!(backend.tick().sends.is_empty());
     }
 
     #[test]
     fn local_shutdown_sends_stop_then_disconnect_once() {
         let mut backend = connected_backend();
         assert!(matches!(
-            backend.shutdown().frames.as_slice(),
+            send_frames(&backend.shutdown()).as_slice(),
             [OutboundFrame::Stop, OutboundFrame::Disconnect]
         ));
-        assert!(backend.shutdown().frames.is_empty());
+        assert!(backend.shutdown().sends.is_empty());
     }
 }

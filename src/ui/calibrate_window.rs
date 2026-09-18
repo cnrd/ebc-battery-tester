@@ -39,7 +39,13 @@ impl CalibrateWindow {
                             .max_decimals(3)
                             .custom_parser(|s| s.replace(',', ".").parse::<f64>().ok()),
                     );
-                    if ui.button("Calibrate").clicked() {
+                    if ui
+                        .add_enabled(
+                            session.can_calibrate_voltage(),
+                            egui::Button::new("Calibrate"),
+                        )
+                        .clicked()
+                    {
                         let mv = (self.voltage_low * 1000.0) as u16;
                         session.send_command(ApiCommand::Calibration(
                             CalibrationCommand::VoltageLow(mv),
@@ -55,7 +61,13 @@ impl CalibrateWindow {
                             .max_decimals(3)
                             .custom_parser(|s| s.replace(',', ".").parse::<f64>().ok()),
                     );
-                    if ui.button("Calibrate").clicked() {
+                    if ui
+                        .add_enabled(
+                            session.can_calibrate_voltage(),
+                            egui::Button::new("Calibrate"),
+                        )
+                        .clicked()
+                    {
                         let mv = (self.voltage_high * 1000.0) as u16;
                         session.send_command(ApiCommand::Calibration(
                             CalibrationCommand::VoltageHigh(mv),
@@ -65,11 +77,6 @@ impl CalibrateWindow {
                 });
                 ui.separator();
                 ui.heading("Current");
-                let discharge_active = session.mode_on
-                    && matches!(
-                        session.current_device_mode,
-                        Some(device::DeviceMode::DischargeConstantCurrent)
-                    );
                 ui.label(
                     "Start a constant current discharge session at a known reference \
                          level (~0.5 A for low, ~2 A for high). Place a multimeter in \
@@ -88,7 +95,10 @@ impl CalibrateWindow {
                             .custom_parser(|s| s.replace(',', ".").parse::<f64>().ok()),
                     );
                     if ui
-                        .add_enabled(discharge_active, egui::Button::new("Calibrate"))
+                        .add_enabled(
+                            session.can_calibrate_current(),
+                            egui::Button::new("Calibrate"),
+                        )
                         .on_disabled_hover_text("Start a discharge constant current session first")
                         .clicked()
                     {
@@ -108,7 +118,10 @@ impl CalibrateWindow {
                             .custom_parser(|s| s.replace(',', ".").parse::<f64>().ok()),
                     );
                     if ui
-                        .add_enabled(discharge_active, egui::Button::new("Calibrate"))
+                        .add_enabled(
+                            session.can_calibrate_current(),
+                            egui::Button::new("Calibrate"),
+                        )
                         .on_disabled_hover_text("Start a discharge constant current session first")
                         .clicked()
                     {
@@ -132,7 +145,10 @@ impl CalibrateWindow {
                         if ui.button("Cancel").clicked() {
                             self.open = false;
                         }
-                        if ui.button("OK").clicked() {
+                        if ui
+                            .add_enabled(session.can_confirm_calibration(), egui::Button::new("OK"))
+                            .clicked()
+                        {
                             session
                                 .send_command(ApiCommand::Calibration(CalibrationCommand::Confirm));
                             self.open = false;

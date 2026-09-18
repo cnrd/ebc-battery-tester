@@ -72,12 +72,34 @@ pub struct TestStatus {
     pub energy_wh: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    #[serde(default)]
+    pub start: bool,
+    #[serde(default)]
+    pub resume: bool,
+    #[serde(default)]
+    pub stop: bool,
+    #[serde(default)]
+    pub show_stop: bool,
+    #[serde(default)]
+    pub adjust: bool,
+    #[serde(default)]
+    pub calibrate_voltage: bool,
+    #[serde(default)]
+    pub calibrate_current: bool,
+    #[serde(default)]
+    pub confirm_calibration: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritativeSnapshot {
     pub connection: ServerConnectionState,
     pub connection_error: Option<String>,
     pub device: DeviceState,
     pub test: TestStatus,
+    #[serde(default)]
+    pub capabilities: Capabilities,
     pub history: Vec<Sample>,
 }
 
@@ -87,6 +109,8 @@ pub struct SnapshotUpdate {
     pub connection_error: Option<String>,
     pub device: DeviceState,
     pub test: TestStatus,
+    #[serde(default)]
+    pub capabilities: Capabilities,
 }
 
 impl From<&AuthoritativeSnapshot> for SnapshotUpdate {
@@ -96,6 +120,7 @@ impl From<&AuthoritativeSnapshot> for SnapshotUpdate {
             connection_error: snapshot.connection_error.clone(),
             device: snapshot.device.clone(),
             test: snapshot.test.clone(),
+            capabilities: snapshot.capabilities,
         }
     }
 }
@@ -331,6 +356,20 @@ mod tests {
         let decoded: AuthoritativeSnapshot =
             serde_json::from_str(&json).expect("deserialize snapshot");
         assert_eq!(decoded, snapshot);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn missing_wire_capabilities_default_to_denied() {
+        let mut value = serde_json::to_value(SnapshotUpdate::default()).expect("serialize update");
+        value
+            .as_object_mut()
+            .expect("update object")
+            .remove("capabilities");
+        let update: SnapshotUpdate =
+            serde_json::from_value(value).expect("deserialize legacy update");
+
+        assert_eq!(update.capabilities, Capabilities::default());
     }
 
     #[cfg(feature = "server")]
