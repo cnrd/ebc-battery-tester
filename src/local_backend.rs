@@ -316,13 +316,14 @@ impl LocalBackend {
 
     fn send_failed(&mut self, send: LocalSend, error: &str) -> LocalOutput {
         let message = format!("failed to send {:?}: {error}", send.frame);
-        if let SendCompletion::Command(prepared) = send.completion
-            && prepared.kind() == CommandKind::Start
-        {
-            self.controller.start_write_failed();
-        }
         if !matches!(send.completion, SendCompletion::BestEffort) {
-            self.controller.disconnect(&message);
+            match send.completion {
+                SendCompletion::Command(prepared) => self
+                    .controller
+                    .command_write_failed(prepared.kind(), &message),
+                SendCompletion::TimerSync => self.controller.disconnect(&message),
+                SendCompletion::BestEffort => unreachable!(),
+            }
             self.connection = ServerConnectionState::Error;
             self.connection_error = Some(message.clone());
             return LocalOutput {
@@ -526,6 +527,14 @@ mod tests {
             state(&failed).update.test.state,
             TestState::RecoveredUncertain
         );
+        assert!(
+            state(&failed)
+                .update
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("start outcome is unknown"))
+        );
         assert!(!state(&failed).update.device.activity_known);
         assert!(matches!(
             failed.events.last(),
@@ -540,16 +549,19 @@ mod tests {
     }
 
     #[test]
-    fn stop_adjust_and_calibration_failures_invalidate_transport_trust() {
+    fn adjust_and_calibration_failures_do_not_commit_and_invalidate_transport_trust() {
         let commands = [
-            ApiCommand::Adjust(config()),
-            ApiCommand::Stop,
+            ApiCommand::Adjust(TestConfiguration::DischargeConstantCurrent {
+                current_ma: 1500,
+                cutoff_voltage_mv: 3000,
+                cutoff_time_min: 0,
+            }),
             ApiCommand::Calibration(crate::core::CalibrationCommand::VoltageLow(4000)),
         ];
 
         for command in commands {
             let mut backend = connected_backend();
-            if matches!(command, ApiCommand::Adjust(_) | ApiCommand::Stop) {
+            if matches!(command, ApiCommand::Adjust(_)) {
                 let start = backend.command(ApiCommand::Start(config()));
                 finish_success(&mut backend, &start);
                 backend.report(report(ReportState::Active, 1), true);
@@ -562,15 +574,49 @@ mod tests {
                 ServerConnectionState::Error
             );
             assert!(!state(&failed).update.device.activity_known);
+            if matches!(command, ApiCommand::Adjust(_)) {
+                assert_eq!(state(&failed).update.test.config, Some(config()));
+            }
             assert!(matches!(
                 failed.events.last(),
                 Some(BackendEvent::CommandError(_))
             ));
+            assert!(
+                !failed
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::CommandSucceeded))
+            );
         }
     }
 
     #[test]
-    fn resume_and_timer_sync_failures_revoke_freshness_and_ownership() {
+    fn stop_write_failure_is_uncertain() {
+        let mut backend = connected_backend();
+        let start = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+
+        let stop = backend.command(ApiCommand::Stop);
+        let failed = finish_failure(&mut backend, &stop);
+
+        assert_eq!(
+            state(&failed).update.test.state,
+            TestState::RecoveredUncertain
+        );
+        assert!(
+            state(&failed)
+                .update
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("stop outcome is unknown"))
+        );
+        assert!(!state(&failed).update.device.activity_known);
+    }
+
+    #[test]
+    fn resume_write_failure_is_uncertain() {
         let mut backend = connected_backend();
         let start = backend.command(ApiCommand::Start(config()));
         finish_success(&mut backend, &start);
@@ -585,8 +631,23 @@ mod tests {
             state(&failed).update.connection,
             ServerConnectionState::Error
         );
+        assert_eq!(
+            state(&failed).update.test.state,
+            TestState::RecoveredUncertain
+        );
+        assert!(
+            state(&failed)
+                .update
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resume outcome is unknown"))
+        );
         assert!(!state(&failed).update.device.activity_known);
+    }
 
+    #[test]
+    fn timer_sync_failure_revokes_freshness_and_ownership() {
         let mut backend = connected_backend();
         let start = backend.command(ApiCommand::Start(config()));
         finish_success(&mut backend, &start);
@@ -599,7 +660,31 @@ mod tests {
             state(&failed).update.test.state,
             TestState::RecoveredUncertain
         );
+        assert_eq!(
+            state(&failed).update.connection,
+            ServerConnectionState::Error
+        );
         assert!(backend.tick().sends.is_empty());
+    }
+
+    #[test]
+    fn successful_resume_still_enters_starting() {
+        let mut backend = connected_backend();
+        let start = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        let stop = backend.command(ApiCommand::Stop);
+        finish_success(&mut backend, &stop);
+        backend.report(report(ReportState::Idle, 1), true);
+
+        let resume = backend.resume(config());
+        let resumed = finish_success(&mut backend, &resume);
+
+        assert_eq!(state(&resumed).update.test.state, TestState::Starting);
+        assert!(matches!(
+            resumed.events.last(),
+            Some(BackendEvent::CommandSucceeded)
+        ));
     }
 
     #[test]

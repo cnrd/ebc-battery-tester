@@ -673,10 +673,19 @@ impl TestController {
         }
     }
 
-    pub fn start_write_failed(&mut self) {
+    pub fn command_write_failed(&mut self, kind: CommandKind, reason: &str) {
+        self.disconnect(reason);
+        let operation = match kind {
+            CommandKind::Start => "start",
+            CommandKind::Resume => "resume",
+            CommandKind::Stop => "stop",
+            CommandKind::Adjust | CommandKind::Calibration => return,
+        };
         self.lifecycle = Lifecycle::RecoveredUncertain;
         self.test.state = TestState::RecoveredUncertain;
-        self.test.result = Some("start outcome is unknown after a write failure".to_owned());
+        self.test.result = Some(format!(
+            "{operation} outcome is unknown after a write failure: {reason}"
+        ));
     }
 
     #[expect(clippy::too_many_lines)]
@@ -1007,6 +1016,74 @@ mod tests {
         controller.invalidate_for_gap("gap");
         assert_eq!(controller.test.state, TestState::RecoveredUncertain);
         assert_eq!(controller.next_timer_sync(), None);
+    }
+
+    #[test]
+    fn running_state_command_write_failures_are_explicitly_uncertain() {
+        let mut start = controller();
+        start.command_write_failed(CommandKind::Start, "injected failure");
+        assert_eq!(start.test.state, TestState::RecoveredUncertain);
+        assert!(
+            start
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("start outcome is unknown"))
+        );
+
+        let mut resume = controller();
+        commit(&mut resume, ApiCommand::Start(config()));
+        resume.report(report(ReportState::Active, 1));
+        commit(&mut resume, ApiCommand::Stop);
+        resume.report(report(ReportState::Idle, 1));
+        resume.command_write_failed(CommandKind::Resume, "injected failure");
+        assert_eq!(resume.test.state, TestState::RecoveredUncertain);
+        assert!(
+            resume
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resume outcome is unknown"))
+        );
+
+        let mut stop = controller();
+        commit(&mut stop, ApiCommand::Start(config()));
+        stop.report(report(ReportState::Active, 1));
+        stop.command_write_failed(CommandKind::Stop, "injected failure");
+        assert_eq!(stop.test.state, TestState::RecoveredUncertain);
+        assert!(
+            stop.test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("stop outcome is unknown"))
+        );
+    }
+
+    #[test]
+    fn failed_adjust_and_calibration_writes_revoke_trust_without_committing() {
+        let mut adjust = controller();
+        commit(&mut adjust, ApiCommand::Start(config()));
+        adjust.report(report(ReportState::Active, 1));
+        let original = adjust.test.config;
+        adjust.command_write_failed(CommandKind::Adjust, "injected failure");
+        assert_eq!(adjust.test.state, TestState::RecoveredUncertain);
+        assert_eq!(adjust.test.config, original);
+        assert!(!adjust.connected);
+        assert!(!adjust.device.activity_known);
+
+        let mut calibration = controller();
+        commit(
+            &mut calibration,
+            ApiCommand::Calibration(CalibrationCommand::VoltageLow(1000)),
+        );
+        assert!(calibration.calibration_staging.references[0]);
+        calibration.command_write_failed(CommandKind::Calibration, "injected failure");
+        assert_eq!(
+            calibration.calibration_staging.references,
+            [false, false, false, false]
+        );
+        assert!(!calibration.connected);
+        assert!(!calibration.device.activity_known);
     }
 
     #[test]

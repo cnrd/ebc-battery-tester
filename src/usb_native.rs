@@ -82,6 +82,7 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                     event_tx.send(BackendEvent::DevicesUpdated(available_devices()));
                 }
                 Ok(BackendCommand::Connect(idx)) => {
+                    retire_existing_port(&mut backend, &mut port, &event_tx);
                     buffer.clear();
                     publish(
                         backend.begin_connection(),
@@ -172,12 +173,26 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
     }
 }
 
+fn retire_existing_port(
+    backend: &mut LocalBackend,
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    event_tx: &BackendEventSender,
+) {
+    if port.is_some() {
+        publish(LocalBackend::safe_disconnect(), port, event_tx, backend);
+        *port = None;
+    }
+}
+
 fn publish(
     output: LocalOutput,
     port: &mut Option<Box<dyn serialport::SerialPort>>,
     event_tx: &BackendEventSender,
     backend: &mut LocalBackend,
 ) {
+    for event in output.events {
+        event_tx.send(event);
+    }
     for send in output.sends {
         let frame = send.frame();
         event_tx.send(outgoing(frame));
@@ -199,9 +214,6 @@ fn publish(
         if failed {
             *port = None;
         }
-    }
-    for event in output.events {
-        event_tx.send(event);
     }
 }
 

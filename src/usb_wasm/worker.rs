@@ -221,6 +221,9 @@ async fn disconnect_device(
     stop_reading_tx: &mut Option<oneshot::Sender<()>>,
     event_tx: &BackendEventSender,
 ) {
+    for event in output.events {
+        event_tx.send(event);
+    }
     for send in output.sends {
         let frame = send.frame();
         event_tx.send(outgoing(frame));
@@ -246,9 +249,6 @@ async fn disconnect_device(
             event_tx.send(event);
         }
     }
-    for event in output.events {
-        event_tx.send(event);
-    }
     *device = None;
     *out_endpoint_num = None;
 }
@@ -262,6 +262,9 @@ async fn publish(
     stop_reading_tx: &mut Option<oneshot::Sender<()>>,
     event_tx: &BackendEventSender,
 ) {
+    for event in output.events {
+        event_tx.send(event);
+    }
     for send in output.sends {
         let frame = send.frame();
         event_tx.send(outgoing(frame));
@@ -291,9 +294,6 @@ async fn publish(
             }
             *out_endpoint_num = None;
         }
-    }
-    for event in output.events {
-        event_tx.send(event);
     }
 }
 

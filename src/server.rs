@@ -23,7 +23,9 @@ use tokio::{fs as tokio_fs, io::AsyncReadExt as _};
 use tokio_util::io::ReaderStream;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::controller::{ControllerMode, DeviceReport, ReportState, TestController};
+use crate::controller::{
+    CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
+};
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, RunSummary, Sample,
     ServerConnectionState, SnapshotUpdate, TestConfiguration, TestState, WebSocketEvent,
@@ -291,6 +293,23 @@ impl Persistence {
         self.archived_run_id = None;
         self.current_run_id = run_id;
         self.next_sequence = 0;
+    }
+
+    fn restore_current_samples(
+        &mut self,
+        archived_run_id: &str,
+        sample_count: usize,
+    ) -> Result<(), String> {
+        self.sample_writer = None;
+        let source = self.runs_dir.join(format!("{archived_run_id}.csv"));
+        let temporary = self.samples_path.with_extension("csv.tmp");
+        fs::copy(source, &temporary).map_err(|error| error.to_string())?;
+        File::open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        fs::rename(temporary, &self.samples_path).map_err(|error| error.to_string())?;
+        self.raw_sample_count = sample_count;
+        sync_parent(&self.samples_path)
     }
 
     fn new_run_id(&self) -> String {
@@ -719,6 +738,18 @@ struct DeviceActor {
     mock_idle_report_due: Option<Instant>,
     last_metadata_sync: Instant,
     snapshot_tx: broadcast::Sender<WebSocketEvent>,
+    #[cfg(test)]
+    write_failure: Option<String>,
+    #[cfg(test)]
+    start_metadata_failure: Option<String>,
+}
+
+struct StartPreparationRollback {
+    history: Vec<Sample>,
+    archived_run_id: Option<String>,
+    current_run_id: String,
+    next_sequence: u64,
+    raw_sample_count: usize,
 }
 
 impl DeviceActor {
@@ -749,6 +780,10 @@ impl DeviceActor {
             mock_idle_report_due: None,
             last_metadata_sync: Instant::now(),
             snapshot_tx,
+            #[cfg(test)]
+            write_failure: None,
+            #[cfg(test)]
+            start_metadata_failure: None,
         })
     }
 
@@ -869,8 +904,11 @@ impl DeviceActor {
     }
 
     fn disconnect(&mut self) -> Result<(), String> {
-        if let Some(port) = &mut self.port {
-            write_frame(port, OutboundFrame::Disconnect)?;
+        if let Some(port) = &mut self.port
+            && let Err(error) = write_frame(port, OutboundFrame::Disconnect)
+        {
+            self.handle_protocol_write_failure(None, &error);
+            return Err(error);
         }
         self.port = None;
         self.serial_buffer.clear();
@@ -886,22 +924,27 @@ impl DeviceActor {
         let prepared = self.controller.prepare_command(ApiCommand::Start(config))?;
         self.sync_controller_state();
         self.persistence.archive_current(&self.snapshot)?;
-        self.persistence.reset_samples()?;
+        let rollback = StartPreparationRollback {
+            history: self.snapshot.history.clone(),
+            archived_run_id: self.persistence.archived_run_id.clone(),
+            current_run_id: self.persistence.current_run_id.clone(),
+            next_sequence: self.persistence.next_sequence,
+            raw_sample_count: self.persistence.raw_sample_count,
+        };
+        if let Err(error) = self.persistence.reset_samples() {
+            return Err(self.restore_start_preparation(rollback, &error));
+        }
         self.snapshot.history.clear();
         let run_id = self.persistence.new_run_id();
         self.persistence.begin_current_run(run_id);
+        self.sync_controller_state();
+        if let Err(error) = self.save_start_metadata() {
+            return Err(self.restore_start_preparation(rollback, &error));
+        }
+        self.send_command_frame(prepared)?;
         self.controller
             .commit_command(prepared, Some(Utc::now().to_rfc3339()));
         self.sync_controller_state();
-        self.persistence.save_metadata(&self.snapshot)?;
-        if let Some(frame) = prepared.frame()
-            && let Err(error) = self.send(frame)
-        {
-            self.controller.start_write_failed();
-            self.sync_controller_state();
-            let _persisted = self.persistence.save_metadata(&self.snapshot);
-            return Err(error);
-        }
         if self.config.mock {
             self.controller.set_current_ma(mock_current(&config));
             self.sync_controller_state();
@@ -909,11 +952,46 @@ impl DeviceActor {
         Ok(())
     }
 
+    fn save_start_metadata(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(error) = &self.start_metadata_failure {
+            return Err(error.clone());
+        }
+        self.persistence.save_metadata(&self.snapshot)
+    }
+
+    fn restore_start_preparation(
+        &mut self,
+        rollback: StartPreparationRollback,
+        cause: &str,
+    ) -> String {
+        self.snapshot.history = rollback.history;
+        self.persistence.archived_run_id = rollback.archived_run_id.clone();
+        self.persistence.current_run_id = rollback.current_run_id;
+        self.persistence.next_sequence = rollback.next_sequence;
+        self.persistence.raw_sample_count = rollback.raw_sample_count;
+
+        let mut rollback_errors = Vec::new();
+        if let Some(archived_run_id) = rollback.archived_run_id
+            && let Err(error) = self
+                .persistence
+                .restore_current_samples(&archived_run_id, rollback.raw_sample_count)
+        {
+            rollback_errors.push(format!("failed to restore current samples: {error}"));
+        }
+        if let Err(error) = self.persistence.save_metadata(&self.snapshot) {
+            rollback_errors.push(format!("failed to restore current metadata: {error}"));
+        }
+        if rollback_errors.is_empty() {
+            cause.to_owned()
+        } else {
+            format!("{cause}; {}", rollback_errors.join("; "))
+        }
+    }
+
     fn stop_test(&mut self) -> Result<(), String> {
         let prepared = self.controller.prepare_command(ApiCommand::Stop)?;
-        if let Some(frame) = prepared.frame() {
-            self.send(frame)?;
-        }
+        self.send_command_frame(prepared)?;
         self.controller.commit_command(prepared, None);
         self.sync_controller_state();
         self.persistence.flush_samples()?;
@@ -927,7 +1005,7 @@ impl DeviceActor {
         let frame = prepared
             .frame()
             .ok_or_else(|| "adjustment did not produce a protocol frame".to_owned())?;
-        self.send(frame)?;
+        self.send_frame_with_recovery(frame, Some(prepared.kind()))?;
         self.controller.commit_command(prepared, None);
         if self.config.mock {
             let TestConfiguration::DischargeConstantCurrent { current_ma, .. } = config else {
@@ -944,7 +1022,7 @@ impl DeviceActor {
         let frame = prepared
             .frame()
             .ok_or_else(|| "resume did not produce a protocol frame".to_owned())?;
-        self.send(frame)?;
+        self.send_frame_with_recovery(frame, Some(prepared.kind()))?;
         self.controller.commit_command(prepared, None);
         self.sync_controller_state();
         Ok(())
@@ -957,13 +1035,17 @@ impl DeviceActor {
         let frame = prepared
             .frame()
             .ok_or_else(|| "calibration did not produce a protocol frame".to_owned())?;
-        self.send(frame)?;
+        self.send_frame_with_recovery(frame, Some(prepared.kind()))?;
         self.controller.commit_command(prepared, None);
         self.sync_controller_state();
         Ok(())
     }
 
     fn send(&mut self, frame: OutboundFrame) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(error) = self.write_failure.take() {
+            return Err(error);
+        }
         if self.config.mock {
             return Ok(());
         }
@@ -974,6 +1056,44 @@ impl DeviceActor {
         write_frame(port, frame)
     }
 
+    fn send_command_frame(&mut self, prepared: PreparedCommand) -> Result<(), String> {
+        let Some(frame) = prepared.frame() else {
+            return Ok(());
+        };
+        self.send_frame_with_recovery(frame, Some(prepared.kind()))
+    }
+
+    fn send_frame_with_recovery(
+        &mut self,
+        frame: OutboundFrame,
+        command: Option<CommandKind>,
+    ) -> Result<(), String> {
+        if let Err(error) = self.send(frame) {
+            self.handle_protocol_write_failure(command, &error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn handle_protocol_write_failure(&mut self, command: Option<CommandKind>, error: &str) {
+        self.port = None;
+        self.serial_buffer.clear();
+        self.mock_idle_report_due = None;
+        self.snapshot.connection = ServerConnectionState::Error;
+        self.snapshot.connection_error = Some(error.to_owned());
+        let reason = format!("protocol write failed; physical state is unknown: {error}");
+        if let Some(kind) = command {
+            self.controller.command_write_failed(kind, &reason);
+        } else {
+            self.controller.disconnect(&reason);
+        }
+        self.sync_controller_state();
+        if let Err(persistence_error) = self.persistence.save_metadata(&self.snapshot) {
+            log::error!("failed to persist protocol write failure: {persistence_error}");
+        }
+        self.publish();
+    }
+
     fn tick(&mut self) {
         if self.config.mock {
             self.tick_mock();
@@ -981,9 +1101,10 @@ impl DeviceActor {
             self.read_serial();
         }
         if let Some(minutes) = self.controller.next_timer_sync()
-            && let Err(error) = self.send(OutboundFrame::TimerSync(minutes))
+            && let Err(error) =
+                self.send_frame_with_recovery(OutboundFrame::TimerSync(minutes), None)
         {
-            self.set_connection_error(&error);
+            log::error!("timer sync write failed: {error}");
         }
         self.sync_controller_state();
     }
@@ -1166,6 +1287,7 @@ impl DeviceActor {
 
     fn set_connection_error(&mut self, error: &str) {
         self.port = None;
+        self.serial_buffer.clear();
         self.mock_idle_report_due = None;
         self.snapshot.connection = ServerConnectionState::Error;
         self.snapshot.connection_error = Some(error.to_owned());
@@ -1173,7 +1295,10 @@ impl DeviceActor {
             "device connection failed; physical test state is unknown: {error}"
         ));
         self.sync_controller_state();
-        let _persisted = self.persist_and_publish();
+        if let Err(persistence_error) = self.persistence.save_metadata(&self.snapshot) {
+            log::error!("failed to persist connection failure: {persistence_error}");
+        }
+        self.publish();
     }
 
     fn persist_and_publish(&mut self) -> Result<(), String> {
@@ -1823,6 +1948,31 @@ mod tests {
         );
     }
 
+    fn inject_write_failure(actor: &mut DeviceActor) {
+        actor.serial_buffer.extend_from_slice(&[0xAA, 0xBB]);
+        actor.write_failure = Some("injected serial write failure".to_owned());
+    }
+
+    fn confirm_running(actor: &mut DeviceActor) {
+        actor.start_test(test_config()).expect("start test");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+    }
+
+    fn assert_failed_transport(actor: &DeviceActor) {
+        assert_eq!(actor.snapshot.connection, ServerConnectionState::Error);
+        assert!(actor.port.is_none());
+        assert!(actor.serial_buffer.is_empty());
+        assert!(!actor.snapshot.device.activity_known);
+    }
+
     fn numbered_sample(sequence: u64, voltage_mv: u16, current_ma: u16) -> Sample {
         Sample {
             run_id: "run-1".to_owned(),
@@ -1969,6 +2119,235 @@ mod tests {
 
         assert_eq!(actor.mock_idle_report_due, None);
         assert!(!actor.snapshot.device.activity_known);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_start_write_is_persisted_as_uncertain_and_revokes_transport() {
+        let (mut actor, directory) = mock_actor("failed-start-write");
+        confirm_inactive(&mut actor);
+        inject_write_failure(&mut actor);
+
+        let error = actor
+            .handle_command(ApiCommand::Start(test_config()))
+            .expect_err("start write fails");
+
+        assert!(error.contains("injected serial write failure"));
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert!(
+            actor
+                .snapshot
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("start outcome is unknown"))
+        );
+        let persisted = actor.persistence.load().expect("load persisted failure");
+        assert_eq!(persisted.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn start_persistence_failure_does_not_commit_or_send() {
+        let (mut actor, directory) = mock_actor("failed-start-persistence");
+        confirm_inactive(&mut actor);
+        actor.persistence.metadata_path = directory.join("missing").join("session.json");
+        inject_write_failure(&mut actor);
+
+        actor
+            .start_test(test_config())
+            .expect_err("metadata write fails");
+
+        assert_eq!(actor.snapshot.test.state, TestState::Idle);
+        assert_eq!(actor.snapshot.connection, ServerConnectionState::Connected);
+        assert!(actor.snapshot.device.activity_known);
+        assert!(
+            actor.write_failure.is_some(),
+            "physical send was not attempted"
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn late_start_metadata_failure_restores_archived_run_for_retry() {
+        let (mut actor, directory) = mock_actor("late-start-metadata-failure");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor.stop_test().expect("stop previous run");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            0,
+            2,
+            ReportState::Idle,
+            "EBC-MOCK",
+            None,
+        );
+        let previous_history = actor.snapshot.history.clone();
+        let previous_run_id = actor.persistence.current_run_id.clone();
+        let previous_sample_count = actor.persistence.raw_sample_count;
+        actor.start_metadata_failure = Some("injected metadata failure".to_owned());
+        actor.write_failure = Some("physical send must not run".to_owned());
+
+        actor
+            .start_test(test_config())
+            .expect_err("metadata write fails");
+
+        assert_eq!(actor.snapshot.test.state, TestState::Stopped);
+        assert_eq!(actor.snapshot.history, previous_history);
+        assert_eq!(actor.persistence.current_run_id, previous_run_id);
+        assert_eq!(actor.persistence.raw_sample_count, previous_sample_count);
+        assert_eq!(actor.persistence.runs.len(), 1);
+        assert!(
+            actor.write_failure.is_some(),
+            "physical send was not attempted"
+        );
+
+        actor.write_failure = None;
+        actor.start_metadata_failure = None;
+        actor.start_test(test_config()).expect("retry start");
+        assert_eq!(actor.persistence.runs.len(), 1);
+        assert_eq!(actor.snapshot.test.state, TestState::Starting);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_resume_write_is_uncertain_and_revokes_transport() {
+        let (mut actor, directory) = mock_actor("failed-resume-write");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor.stop_test().expect("stop test");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            0,
+            1,
+            ReportState::Idle,
+            "EBC-MOCK",
+            None,
+        );
+        inject_write_failure(&mut actor);
+
+        actor.resume_test().expect_err("resume write fails");
+
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert!(
+            actor
+                .snapshot
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resume outcome is unknown"))
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_stop_write_is_uncertain_and_revokes_transport() {
+        let (mut actor, directory) = mock_actor("failed-stop-write");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        inject_write_failure(&mut actor);
+
+        actor.stop_test().expect_err("stop write fails");
+
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert!(
+            actor
+                .snapshot
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("stop outcome is unknown"))
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn write_failure_is_published_even_when_persistence_fails() {
+        let (mut actor, directory) = mock_actor("publish-failed-write");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        let mut updates = actor.snapshot_tx.subscribe();
+        actor.persistence.metadata_path = directory.join("missing").join("session.json");
+        inject_write_failure(&mut actor);
+
+        actor.stop_test().expect_err("stop write fails");
+
+        let WebSocketEvent::Update(update) = updates.try_recv().expect("failure update published")
+        else {
+            panic!("expected update");
+        };
+        assert_eq!(update.connection, ServerConnectionState::Error);
+        assert_eq!(update.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_adjust_write_does_not_commit_configuration() {
+        let (mut actor, directory) = mock_actor("failed-adjust-write");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        let original = actor.snapshot.test.config;
+        inject_write_failure(&mut actor);
+        let adjusted = TestConfiguration::DischargeConstantCurrent {
+            current_ma: 1500,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        };
+
+        actor.adjust_test(adjusted).expect_err("adjust write fails");
+
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert_eq!(actor.snapshot.test.config, original);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_calibration_write_does_not_stage_reference() {
+        let (mut actor, directory) = mock_actor("failed-calibration-write");
+        confirm_inactive(&mut actor);
+        inject_write_failure(&mut actor);
+
+        actor
+            .calibrate(CalibrationCommand::VoltageLow(1000))
+            .expect_err("calibration write fails");
+        assert_failed_transport(&actor);
+
+        actor.connect().expect("reconnect mock");
+        confirm_inactive(&mut actor);
+        actor
+            .calibrate(CalibrationCommand::VoltageHigh(4000))
+            .expect("stage high voltage");
+        confirm_running(&mut actor);
+        actor
+            .calibrate(CalibrationCommand::CurrentLow(500))
+            .expect("stage low current");
+        actor
+            .calibrate(CalibrationCommand::CurrentHigh(2000))
+            .expect("stage high current");
+        assert!(actor.calibrate(CalibrationCommand::Confirm).is_err());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_timer_sync_write_uses_transport_failure_policy() {
+        let (mut actor, directory) = mock_actor("failed-timer-sync-write");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        inject_write_failure(&mut actor);
+
+        actor
+            .send_frame_with_recovery(OutboundFrame::TimerSync(1), None)
+            .expect_err("timer sync write fails");
+
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert_eq!(actor.controller.next_timer_sync(), None);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
