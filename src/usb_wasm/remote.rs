@@ -1,27 +1,28 @@
 use crate::backend::{
-    BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, BackendState,
-    DiagnosticDirection, DiagnosticEvent, remote_api_commands,
+    BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
+    DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, SnapshotUpdate, WebSocketEvent};
+use crate::core::{ApiCommand, AuthoritativeSnapshot, WebSocketEvent};
+use crate::remote_backend::{
+    COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, command_endpoint,
+    publish_websocket,
+};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gloo_net::http::Request;
 use gloo_net::websocket::{Message, futures::WebSocket};
 use gloo_timers::future::TimeoutFuture;
 
-const MAX_RECONNECT_DELAY_MS: u32 = 15_000;
-const COMMAND_HEADER: &str = "X-EBC-Command";
-
 #[expect(clippy::too_many_lines)]
 pub(super) async fn remote_task(
     mut command_rx: UnboundedReceiver<BackendCommand>,
     event_tx: BackendEventSender,
 ) {
-    let mut reconnect_delay_ms = 1_000;
+    let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
     loop {
         send_connection(
             &event_tx,
-            if reconnect_delay_ms == 1_000 {
+            if reconnect_delay_ms == INITIAL_RECONNECT_DELAY_MS {
                 BackendConnectionStatus::Connecting
             } else {
                 BackendConnectionStatus::Reconnecting
@@ -46,9 +47,11 @@ pub(super) async fn remote_task(
                         incoming = message => match incoming {
                             Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                                 Ok(event) => {
-                                    if !received_snapshot {
+                                    if matches!(event, WebSocketEvent::Snapshot(_))
+                                        && !received_snapshot
+                                    {
                                         received_snapshot = true;
-                                        reconnect_delay_ms = 1_000;
+                                        reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                                         send_connection(&event_tx, BackendConnectionStatus::Connected);
                                     }
                                     publish_websocket(event, &event_tx);
@@ -78,14 +81,14 @@ pub(super) async fn remote_task(
                                     raw_bytes: Vec::new(),
                                 }));
                                 match send_command(command).await {
-                                    Ok(snapshot) => {
-                                        event_tx.send(BackendEvent::CommandSucceeded);
-                                        publish_update(SnapshotUpdate::from(&snapshot), &event_tx);
-                                    }
-                                    Err(error) => {
-                                        log::error!("remote command failed: {error}");
-                                        event_tx.send(BackendEvent::CommandError(error));
-                                    }
+                                Ok(_snapshot) => {
+                                    event_tx.send(BackendEvent::CommandSucceeded);
+                                }
+                                Err(error) => {
+                                    log::error!("remote command failed: {error}");
+                                    event_tx.send(BackendEvent::CommandError(error));
+                                    break;
+                                }
                                 }
                             }
                         },
@@ -95,7 +98,7 @@ pub(super) async fn remote_task(
             Err(error) => log::warn!("failed to open server websocket: {error}"),
         }
         send_connection(&event_tx, BackendConnectionStatus::Reconnecting);
-        let timeout = TimeoutFuture::new(reconnect_delay_ms).fuse();
+        let timeout = TimeoutFuture::new(reconnect_delay_ms as u32).fuse();
         futures::pin_mut!(timeout);
         loop {
             let command = command_rx.next().fuse();
@@ -122,18 +125,6 @@ pub(super) async fn remote_task(
     }
 }
 
-fn publish_websocket(event: WebSocketEvent, event_tx: &BackendEventSender) {
-    match event {
-        WebSocketEvent::Snapshot(snapshot) => event_tx.send(BackendEvent::Snapshot(snapshot)),
-        WebSocketEvent::Update(update) => publish_update(update, event_tx),
-        WebSocketEvent::Sample(sample) => event_tx.send(BackendEvent::Sample(sample)),
-    }
-}
-
-fn publish_update(update: SnapshotUpdate, event_tx: &BackendEventSender) {
-    event_tx.send(BackendEvent::Update(BackendState { update }));
-}
-
 fn send_connection(event_tx: &BackendEventSender, status: BackendConnectionStatus) {
     event_tx.send(BackendEvent::BackendConnectionChanged(status));
 }
@@ -153,20 +144,14 @@ fn websocket_url() -> Result<String, String> {
 
 async fn send_command(command: ApiCommand) -> Result<AuthoritativeSnapshot, String> {
     let response = match command {
-        ApiCommand::Connect => {
-            Request::post("/api/connect")
-                .header(COMMAND_HEADER, "1")
-                .send()
-                .await
-        }
-        ApiCommand::Disconnect => {
-            Request::post("/api/disconnect")
+        ApiCommand::Connect | ApiCommand::Disconnect | ApiCommand::Stop | ApiCommand::Resume => {
+            Request::post(command_endpoint(command))
                 .header(COMMAND_HEADER, "1")
                 .send()
                 .await
         }
         ApiCommand::Start(config) => {
-            Request::post("/api/test/start")
+            Request::post(command_endpoint(command))
                 .header(COMMAND_HEADER, "1")
                 .json(&config)
                 .map_err(|error| error.to_string())?
@@ -174,27 +159,15 @@ async fn send_command(command: ApiCommand) -> Result<AuthoritativeSnapshot, Stri
                 .await
         }
         ApiCommand::Adjust(config) => {
-            Request::post("/api/test/adjust")
+            Request::post(command_endpoint(command))
                 .header(COMMAND_HEADER, "1")
                 .json(&config)
                 .map_err(|error| error.to_string())?
                 .send()
                 .await
         }
-        ApiCommand::Stop => {
-            Request::post("/api/test/stop")
-                .header(COMMAND_HEADER, "1")
-                .send()
-                .await
-        }
-        ApiCommand::Resume => {
-            Request::post("/api/test/resume")
-                .header(COMMAND_HEADER, "1")
-                .send()
-                .await
-        }
         ApiCommand::Calibration(calibration) => {
-            Request::post("/api/calibration")
+            Request::post(command_endpoint(command))
                 .header(COMMAND_HEADER, "1")
                 .json(&calibration)
                 .map_err(|error| error.to_string())?

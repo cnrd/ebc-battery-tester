@@ -1023,7 +1023,9 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-http",
+ "tungstenite",
  "ureq",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -4133,8 +4135,11 @@ dependencies = [
  "httparse",
  "log",
  "rand",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

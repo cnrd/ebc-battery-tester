@@ -11,10 +11,6 @@ use serialport::SerialPortType;
 const BAUD_RATE: u32 = 9600;
 const SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(10);
 
-pub const fn is_remote_backend() -> bool {
-    false
-}
-
 fn available_devices() -> Vec<UsbDeviceInfo> {
     let all_ports = serialport::available_ports().unwrap_or_default();
     log::debug!("All serial ports: {all_ports:?}");
@@ -36,13 +32,14 @@ fn available_devices() -> Vec<UsbDeviceInfo> {
         .collect()
 }
 
-pub fn spawn_backend(command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
-    if let Err(error) = std::thread::Builder::new()
+pub fn spawn_backend(
+    command_rx: UnboundedReceiver<BackendCommand>,
+    event_tx: BackendEventSender,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    std::thread::Builder::new()
         .name("ebc-local-backend".to_owned())
         .spawn(move || backend_thread(command_rx, event_tx))
-    {
-        log::error!("failed to spawn local backend thread: {error}");
-    }
+        .map_err(|error| format!("failed to spawn local backend thread: {error}"))
 }
 
 fn find_ch340_port(idx: usize) -> Option<String> {

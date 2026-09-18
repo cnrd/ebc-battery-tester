@@ -4,6 +4,8 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendState, DiagnosticDirection,
 };
 use crate::backend_client::BackendClient;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::backend_client::BackendTarget;
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, Capabilities, Sample, ServerConnectionState,
     TestConfiguration, TestState,
@@ -156,8 +158,22 @@ impl Default for DeviceSession {
 }
 
 impl DeviceSession {
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn new(ctx: &egui::Context) -> Self {
         let backend = BackendClient::new(ctx);
+        Self::with_backend(backend)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new(
+        ctx: &egui::Context,
+        target: BackendTarget,
+        remote_url: &str,
+    ) -> Result<Self, String> {
+        BackendClient::new(ctx, target, remote_url).map(Self::with_backend)
+    }
+
+    fn with_backend(backend: BackendClient) -> Self {
         let transport_mode = if backend.is_remote() {
             TransportMode::Remote
         } else {
@@ -176,6 +192,18 @@ impl DeviceSession {
             },
             ..Self::default()
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn switch_backend(
+        &mut self,
+        ctx: &egui::Context,
+        target: BackendTarget,
+        remote_url: &str,
+    ) -> Result<(), String> {
+        let replacement = Self::new(ctx, target, remote_url)?;
+        *self = replacement;
+        Ok(())
     }
 
     pub(crate) fn is_remote(&self) -> bool {

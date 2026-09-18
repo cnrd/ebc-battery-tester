@@ -24,6 +24,10 @@ pub mod device;
 mod export;
 #[cfg(feature = "gui")]
 mod local_backend;
+#[cfg(feature = "gui")]
+mod remote_backend;
+#[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
+mod remote_native;
 #[cfg(all(not(target_arch = "wasm32"), feature = "server"))]
 pub mod server;
 #[cfg(feature = "gui")]

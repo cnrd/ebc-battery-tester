@@ -27,6 +27,8 @@ gui = [
     "dep:serialport",
     "dep:serde_json",
     "dep:ureq",
+    "dep:tungstenite",
+    "dep:url",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:web-sys",
@@ -76,6 +78,8 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 tower-http = { version = "0.6", features = ["fs"], optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
+tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
+url = { version = "2", optional = true }
 
 # web:
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -1,6 +1,9 @@
 use crate::session::DeviceSession;
 use crate::ui;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::backend_client::BackendTarget;
+
 const MOBILE_BREAKPOINT: f32 = 700.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +38,14 @@ fn mobile_sections(active: bool) -> [MobileSection; 5] {
 #[serde(default)]
 pub struct MainApp {
     control_panel: ui::control_panel::ControlPanel,
+    #[cfg(not(target_arch = "wasm32"))]
+    backend_target: BackendTarget,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[serde(default = "default_remote_url")]
+    remote_url: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[serde(skip)]
+    remote_url_draft: String,
     #[serde(skip)]
     session: DeviceSession,
     #[serde(skip)]
@@ -52,10 +63,49 @@ impl MainApp {
         } else {
             Default::default()
         };
-        app.session = DeviceSession::new(&cc.egui_ctx);
+        #[cfg(target_arch = "wasm32")]
+        {
+            app.session = DeviceSession::new(&cc.egui_ctx);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if app.remote_url.trim().is_empty() {
+                app.remote_url = default_remote_url();
+            }
+            app.remote_url_draft.clone_from(&app.remote_url);
+            app.session =
+                match DeviceSession::new(&cc.egui_ctx, app.backend_target, &app.remote_url) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        app.backend_target = BackendTarget::Local;
+                        let mut session =
+                            DeviceSession::new(&cc.egui_ctx, BackendTarget::Local, &app.remote_url)
+                                .unwrap_or_default();
+                        session.command_error = Some(error);
+                        session
+                    }
+                };
+        }
         app.about_window = ui::about_window::AboutWindow::new(&cc.egui_ctx);
         app
     }
+
+    fn connection_ui(&mut self, ui: &mut egui::Ui) {
+        #[cfg(not(target_arch = "wasm32"))]
+        ui::usb_panel::backend_selector(
+            &mut self.session,
+            &mut self.backend_target,
+            &mut self.remote_url,
+            &mut self.remote_url_draft,
+            ui,
+        );
+        ui::usb_panel::ui(&mut self.session, ui);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_remote_url() -> String {
+    "http://127.0.0.1:8080".to_owned()
 }
 
 impl eframe::App for MainApp {
@@ -132,7 +182,7 @@ impl eframe::App for MainApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for section in mobile_sections(self.session.show_stop_control()) {
                     match section {
-                        MobileSection::Connection => ui::usb_panel::ui(&mut self.session, ui),
+                        MobileSection::Connection => self.connection_ui(ui),
                         MobileSection::LiveData => {
                             if self.session.can_control_device() {
                                 ui::live_data::ui(&self.session, ui);
@@ -159,7 +209,7 @@ impl eframe::App for MainApp {
             });
         } else {
             egui::Panel::left("left_panel").show_inside(ui, |ui| {
-                ui::usb_panel::ui(&mut self.session, ui);
+                self.connection_ui(ui);
                 ui.push_id("control_section", |ui| {
                     if self.session.can_control_device() {
                         ui::live_data::ui(&self.session, ui);
@@ -195,5 +245,25 @@ mod tests {
         assert_eq!(idle[3], MobileSection::Plot);
         assert_eq!(active[3], MobileSection::Plot);
         assert_eq!(idle[4], MobileSection::Settings);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unapplied_remote_url_draft_is_not_persisted() {
+        let app = MainApp {
+            backend_target: BackendTarget::Remote,
+            remote_url: "http://active.example:8080".to_owned(),
+            remote_url_draft: "not a valid url".to_owned(),
+            ..MainApp::default()
+        };
+        let serialized = serde_json::to_string(&app)
+            .unwrap_or_else(|error| panic!("failed to serialize app: {error}"));
+        let restored: MainApp = serde_json::from_str(&serialized)
+            .unwrap_or_else(|error| panic!("failed to restore app: {error}"));
+
+        assert_eq!(restored.backend_target, BackendTarget::Remote);
+        assert_eq!(restored.remote_url, "http://active.example:8080");
+        assert!(restored.remote_url_draft.is_empty());
+        assert!(!serialized.contains("not a valid url"));
     }
 }

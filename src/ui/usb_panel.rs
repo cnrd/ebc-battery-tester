@@ -2,6 +2,84 @@ use crate::backend::BackendConnectionStatus;
 use crate::device::ConnectionStatus;
 use crate::session::DeviceSession;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::backend_client::BackendTarget;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn backend_selector(
+    session: &mut DeviceSession,
+    active_target: &mut BackendTarget,
+    active_remote_url: &mut String,
+    remote_url_draft: &mut String,
+    ui: &mut egui::Ui,
+) {
+    ui.heading("Backend");
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(*active_target == BackendTarget::Local, "Local USB")
+            .clicked()
+            && *active_target != BackendTarget::Local
+        {
+            match session.switch_backend(ui.ctx(), BackendTarget::Local, active_remote_url) {
+                Ok(()) => *active_target = BackendTarget::Local,
+                Err(error) => session.command_error = Some(error),
+            }
+        }
+        if ui
+            .selectable_label(*active_target == BackendTarget::Remote, "Remote server")
+            .clicked()
+            && *active_target != BackendTarget::Remote
+        {
+            apply_remote(
+                session,
+                active_target,
+                active_remote_url,
+                remote_url_draft,
+                ui.ctx(),
+            );
+        }
+    });
+    ui.label("Remote server URL");
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(remote_url_draft);
+        if ui.button("Apply").clicked() {
+            apply_remote(
+                session,
+                active_target,
+                active_remote_url,
+                remote_url_draft,
+                ui.ctx(),
+            );
+        }
+    });
+    ui.separator();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_remote(
+    session: &mut DeviceSession,
+    active_target: &mut BackendTarget,
+    active_remote_url: &mut String,
+    remote_url_draft: &mut String,
+    ctx: &egui::Context,
+) {
+    let urls = match crate::remote_backend::RemoteUrls::parse(remote_url_draft) {
+        Ok(urls) => urls,
+        Err(error) => {
+            session.command_error = Some(error);
+            return;
+        }
+    };
+    match session.switch_backend(ctx, BackendTarget::Remote, &urls.base) {
+        Ok(()) => {
+            active_remote_url.clone_from(&urls.base);
+            remote_url_draft.clone_from(&urls.base);
+            *active_target = BackendTarget::Remote;
+        }
+        Err(error) => session.command_error = Some(error),
+    }
+}
+
 pub(crate) fn ui(session: &mut DeviceSession, ui: &mut egui::Ui) {
     if session.is_remote() {
         remote_ui(session, ui);
@@ -90,7 +168,7 @@ fn remote_ui(session: &DeviceSession, ui: &mut egui::Ui) {
     ui.heading("Remote Server");
     let browser_connected = session.remote_status == BackendConnectionStatus::Connected;
     egui::Grid::new("remote_connection_status").show(ui, |ui| {
-        ui.label("Browser:");
+        ui.label("Server:");
         match &session.remote_status {
             BackendConnectionStatus::NotUsed => {
                 ui.label("--");

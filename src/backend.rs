@@ -36,30 +36,23 @@ pub(crate) struct DiagnosticEvent {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), not(test)),
-    expect(
-        dead_code,
-        reason = "remote connection states are produced by the WASM client"
-    )
-)]
 pub(crate) enum BackendConnectionStatus {
     #[default]
     NotUsed,
     Connecting,
     Connected,
     Reconnecting,
+    #[cfg_attr(
+        all(not(target_arch = "wasm32"), not(test)),
+        expect(
+            dead_code,
+            reason = "native reconnect failures retain reconnecting status"
+        )
+    )]
     Error(String),
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), not(test)),
-    expect(
-        dead_code,
-        reason = "remote connection events are produced by the WASM client"
-    )
-)]
 pub(crate) enum BackendEvent {
     DevicesUpdated(Vec<UsbDeviceInfo>),
     BackendConnectionChanged(BackendConnectionStatus),
@@ -94,13 +87,6 @@ impl BackendEventSender {
     }
 }
 
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), not(test)),
-    expect(
-        dead_code,
-        reason = "remote API mapping is consumed by the WASM client"
-    )
-)]
 pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
     match command {
         BackendCommand::Connect(_) => vec![ApiCommand::Connect],
