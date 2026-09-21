@@ -2125,8 +2125,12 @@ mod tests {
     }
 
     #[test]
-    fn unowned_active_reports_update_live_state_without_appending_samples() {
-        let (mut actor, directory) = mock_actor("unowned-active-reports");
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test verifies one end-to-end provenance sequence"
+    )]
+    fn uncertain_stop_preserves_owned_metrics_and_does_not_append_samples() {
+        let (mut actor, directory) = mock_actor("uncertain-stop-metrics");
         confirm_inactive(&mut actor);
         confirm_running(&mut actor);
         actor
@@ -2177,6 +2181,12 @@ mod tests {
         assert_eq!(actor.persistence.raw_sample_count, sample_count);
         assert_eq!(actor.persistence.next_sequence, next_sequence);
 
+        actor.stop_test().expect("stop uncertain test");
+        assert_eq!(actor.snapshot.test.state, TestState::Stopping);
+        assert_eq!(actor.snapshot.history, history);
+        assert_eq!(actor.persistence.raw_sample_count, sample_count);
+        assert_eq!(actor.persistence.next_sequence, next_sequence);
+
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
             3800,
@@ -2188,6 +2198,10 @@ mod tests {
         );
 
         assert_eq!(actor.snapshot.test.state, TestState::Stopped);
+        assert_eq!(
+            actor.snapshot.test.result.as_deref(),
+            Some("stop confirmed by hardware")
+        );
         assert_eq!(actor.snapshot.device.capacity_mah, Some(40));
         assert_eq!(actor.snapshot.test.elapsed_seconds, owned_elapsed);
         assert_eq!(actor.snapshot.test.capacity_mah, owned_capacity);
@@ -2218,6 +2232,42 @@ mod tests {
         assert_eq!(persisted.test.elapsed_seconds, owned_elapsed);
         assert_eq!(persisted.test.capacity_mah, owned_capacity);
         assert!((persisted.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        let mut restarted = TestController::from_state(
+            ControllerMode::Server,
+            persisted.device.clone(),
+            persisted.test.clone(),
+            persisted.history.last(),
+        );
+        restarted.begin_connection("server restart");
+        restarted.connection_established();
+        restarted.report(DeviceReport {
+            mode: device::DeviceMode::DischargeConstantCurrent,
+            state: ReportState::Idle,
+            voltage_mv: 3800,
+            current_ma: 0,
+            capacity_mah: 50,
+            model: "EBC-MOCK".to_owned(),
+            firmware_version: None,
+        });
+        let resume = restarted
+            .prepare_command(ApiCommand::Resume)
+            .expect("prepare Continue after restart");
+        restarted.commit_command(resume, None);
+        let (_, measurement) = restarted.report(DeviceReport {
+            mode: device::DeviceMode::DischargeConstantCurrent,
+            state: ReportState::Active,
+            voltage_mv: 3800,
+            current_ma: 1000,
+            capacity_mah: 51,
+            model: "EBC-MOCK".to_owned(),
+            firmware_version: None,
+        });
+        assert!(measurement.is_some());
+        assert_eq!(
+            restarted.test().capacity_mah,
+            owned_capacity.map(|capacity| capacity + 1)
+        );
         while let Ok(event) = events.try_recv() {
             assert!(matches!(event, WebSocketEvent::Update(_)));
         }

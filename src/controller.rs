@@ -230,9 +230,19 @@ impl CapacityAccumulator {
         let capacity_mah = last_sample.map_or(persisted_capacity, |sample| {
             sample.capacity_mah.max(persisted_capacity)
         });
-        let previous_raw = last_sample.map_or(device.capacity_mah, |sample| {
-            u16::try_from(sample.capacity_mah % CAPACITY_MODULUS_MAH).ok()
-        });
+        let sample_raw = last_sample
+            .and_then(|sample| u16::try_from(sample.capacity_mah % CAPACITY_MODULUS_MAH).ok());
+        let previous_raw = if matches!(
+            test.state,
+            TestState::Starting
+                | TestState::Running
+                | TestState::Stopping
+                | TestState::RecoveredUncertain
+        ) {
+            sample_raw.or(device.capacity_mah)
+        } else {
+            device.capacity_mah.or(sample_raw)
+        };
         Self {
             capacity_mah,
             previous_raw,
@@ -242,6 +252,10 @@ impl CapacityAccumulator {
     fn reset(&mut self) {
         self.capacity_mah = 0;
         self.previous_raw = None;
+    }
+
+    fn rebase(&mut self, raw: u16) {
+        self.previous_raw = Some(raw);
     }
 
     fn observe(&mut self, raw: u16, allow_wrap: bool) -> u64 {
@@ -271,6 +285,7 @@ pub struct TestController {
     device: DeviceState,
     test: TestStatus,
     lifecycle: Lifecycle,
+    stopping_owns_metrics: bool,
     physical: PhysicalState,
     connection_generation: u64,
     report_generation: Option<u64>,
@@ -311,6 +326,7 @@ impl TestController {
             device,
             test,
             lifecycle,
+            stopping_owns_metrics: false,
             physical: PhysicalState::Unknown,
             connection_generation: 0,
             report_generation: None,
@@ -403,6 +419,7 @@ impl TestController {
             self.test.result = Some(reason.to_owned());
         }
         self.physical = PhysicalState::Unknown;
+        self.stopping_owns_metrics = false;
         self.report_generation = None;
         self.device.activity_known = false;
         self.device.active = false;
@@ -434,8 +451,11 @@ impl TestController {
             TestState::RecoveredUncertain => Lifecycle::RecoveredUncertain,
             _ => Lifecycle::Idle,
         };
+        self.stopping_owns_metrics = false;
         let running = test.state == TestState::Running && device.activity_known && device.active;
         self.clock.replace(test.elapsed_seconds, running);
+        self.energy = EnergyAccumulator::from_state(&test, None);
+        self.capacity = CapacityAccumulator::from_state(&device, &test, None);
         self.device = device;
         self.test = test;
     }
@@ -625,6 +645,7 @@ impl TestController {
                 self.energy.reset();
                 self.capacity.reset();
                 self.lifecycle = Lifecycle::Starting;
+                self.stopping_owns_metrics = false;
                 self.physical = PhysicalState::Unknown;
                 self.report_generation = None;
                 self.device.activity_known = false;
@@ -640,6 +661,7 @@ impl TestController {
             }
             ApiCommand::Stop if self.lifecycle != Lifecycle::Stopping => {
                 self.clock.stop();
+                self.stopping_owns_metrics = self.lifecycle == Lifecycle::RunningOwned;
                 self.lifecycle = Lifecycle::Stopping;
                 self.test.state = TestState::Stopping;
                 self.test.result = None;
@@ -649,6 +671,7 @@ impl TestController {
             ApiCommand::Adjust(config) => self.test.config = Some(config),
             ApiCommand::Resume => {
                 self.lifecycle = Lifecycle::Starting;
+                self.stopping_owns_metrics = false;
                 self.physical = PhysicalState::Unknown;
                 self.report_generation = None;
                 self.device.activity_known = false;
@@ -718,6 +741,7 @@ impl TestController {
             let owns_metrics = match previous_lifecycle {
                 Lifecycle::Starting => {
                     self.lifecycle = Lifecycle::RunningOwned;
+                    self.stopping_owns_metrics = false;
                     self.test.state = TestState::Running;
                     self.test.result = None;
                     self.clock.resume();
@@ -778,15 +802,11 @@ impl TestController {
             self.clock.stop();
             self.energy.break_gap();
             self.update_elapsed();
-            if matches!(
-                previous_lifecycle,
-                Lifecycle::RunningOwned | Lifecycle::Stopping
-            ) {
+            let owns_metrics = previous_lifecycle == Lifecycle::RunningOwned
+                || (previous_lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics);
+            if owns_metrics {
                 self.test.capacity_mah = Some(if self.mode == ControllerMode::Server {
-                    self.capacity.observe(
-                        report.capacity_mah,
-                        previous_lifecycle == Lifecycle::RunningOwned,
-                    )
+                    self.capacity.observe(report.capacity_mah, true)
                 } else {
                     u64::from(report.capacity_mah)
                 });
@@ -794,10 +814,15 @@ impl TestController {
                     self.test.energy_wh =
                         report.voltage_mv as f64 * report.capacity_mah as f64 / 1_000_000.0;
                 }
+            } else if self.mode == ControllerMode::Server
+                && previous_lifecycle != Lifecycle::Starting
+            {
+                self.capacity.rebase(report.capacity_mah);
             }
             match previous_lifecycle {
                 Lifecycle::RecoveredUncertain => {
                     self.lifecycle = Lifecycle::Idle;
+                    self.stopping_owns_metrics = false;
                     self.test.state = TestState::Stopped;
                     self.test.result =
                         Some("recovered previous test; hardware reports inactive".to_owned());
@@ -807,12 +832,14 @@ impl TestController {
                 Lifecycle::RunningOwned => match report.state {
                     ReportState::Finished => {
                         self.lifecycle = Lifecycle::Idle;
+                        self.stopping_owns_metrics = false;
                         self.test.state = TestState::Completed;
                         self.test.result = Some("device reported test complete".to_owned());
                         outcome.transitioned_to_inactive = true;
                     }
                     ReportState::Idle => {
                         self.lifecycle = Lifecycle::Idle;
+                        self.stopping_owns_metrics = false;
                         self.test.state = TestState::Stopped;
                         self.test.result = Some("device reported test idle".to_owned());
                         outcome.transitioned_to_inactive = true;
@@ -822,6 +849,7 @@ impl TestController {
                 },
                 Lifecycle::Stopping => {
                     self.lifecycle = Lifecycle::Idle;
+                    self.stopping_owns_metrics = false;
                     self.test.state = TestState::Stopped;
                     self.test.result = Some("stop confirmed by hardware".to_owned());
                     outcome.transitioned_to_inactive = true;
@@ -1236,6 +1264,110 @@ mod tests {
         assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
         assert_eq!(controller.test.capacity_mah, owned_capacity);
         assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        commit(&mut controller, ApiCommand::Resume);
+        let (_, resumed) = controller.report(report(ReportState::Active, 51));
+        assert!(resumed.is_some());
+        assert_eq!(
+            controller.test.capacity_mah,
+            owned_capacity.map(|capacity| capacity + 1)
+        );
+    }
+
+    #[test]
+    fn stop_from_uncertain_state_preserves_last_owned_metrics() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.clock.accumulated = Duration::from_secs(49);
+        let (_, owned) = controller.report(report(ReportState::Active, 13));
+        assert!(owned.is_some());
+        let owned_elapsed = controller.test.elapsed_seconds;
+        let owned_capacity = controller.test.capacity_mah;
+        let owned_energy = controller.test.energy_wh;
+
+        controller.invalidate_for_gap("serial gap");
+        controller.begin_connection("reconnect");
+        controller.connection_established();
+        for capacity in [40, 45] {
+            let (_, measurement) = controller.report(report(ReportState::Active, capacity));
+            assert!(measurement.is_none());
+        }
+        assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+
+        commit(&mut controller, ApiCommand::Stop);
+        assert_eq!(controller.test.state, TestState::Stopping);
+        let (outcome, measurement) = controller.report(report(ReportState::Idle, 50));
+
+        assert!(outcome.transitioned_to_inactive);
+        assert!(measurement.is_none());
+        assert_eq!(controller.test.state, TestState::Stopped);
+        assert_eq!(
+            controller.test.result.as_deref(),
+            Some("stop confirmed by hardware")
+        );
+        assert_eq!(controller.device.capacity_mah, Some(50));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        commit(&mut controller, ApiCommand::Resume);
+        let (_, resumed) = controller.report(report(ReportState::Active, 51));
+        assert!(resumed.is_some());
+        assert_eq!(
+            controller.test.capacity_mah,
+            owned_capacity.map(|capacity| capacity + 1)
+        );
+    }
+
+    #[test]
+    fn stop_from_owned_run_accounts_final_inactive_capacity() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        let (_, owned) = controller.report(report(ReportState::Active, 57_599));
+        assert!(owned.is_some());
+
+        commit(&mut controller, ApiCommand::Stop);
+        assert_eq!(controller.test.state, TestState::Stopping);
+        let (outcome, measurement) = controller.report(report(ReportState::Idle, 2));
+
+        assert!(outcome.transitioned_to_inactive);
+        assert!(measurement.is_none());
+        assert_eq!(controller.test.state, TestState::Stopped);
+        assert_eq!(controller.device.capacity_mah, Some(2));
+        assert_eq!(controller.test.capacity_mah, Some(57_602));
+    }
+
+    #[test]
+    fn authoritative_stopped_replacement_rebases_continue_metrics() {
+        let mut controller = controller();
+        controller.replace_authoritative(
+            true,
+            DeviceState {
+                mode: Some(DeviceMode::DischargeConstantCurrent),
+                activity_known: true,
+                active: false,
+                voltage_mv: Some(3_800),
+                current_ma: Some(0),
+                capacity_mah: Some(50),
+                ..DeviceState::default()
+            },
+            TestStatus {
+                state: TestState::Stopped,
+                config: Some(config()),
+                elapsed_seconds: 49,
+                capacity_mah: Some(10),
+                energy_wh: 0.25,
+                ..TestStatus::default()
+            },
+        );
+
+        commit(&mut controller, ApiCommand::Resume);
+        let (_, measurement) = controller.report(report(ReportState::Active, 51));
+
+        assert!(measurement.is_some());
+        assert_eq!(controller.test.capacity_mah, Some(11));
+        assert!((controller.test.energy_wh - 0.25).abs() < f64::EPSILON);
     }
 
     #[test]
