@@ -90,7 +90,7 @@ impl BackendEventSender {
 pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
     match command {
         BackendCommand::Connect(_) => vec![ApiCommand::Connect],
-        BackendCommand::Disconnect => vec![ApiCommand::Stop, ApiCommand::Disconnect],
+        BackendCommand::Disconnect => vec![ApiCommand::Disconnect],
         BackendCommand::Api(command) => vec![command],
         BackendCommand::Resume(_) => vec![ApiCommand::Resume],
         BackendCommand::RefreshDevices | BackendCommand::Shutdown => Vec::new(),
@@ -115,7 +115,7 @@ mod tests {
         assert!(remote_api_commands(BackendCommand::Shutdown).is_empty());
         assert!(matches!(
             remote_api_commands(BackendCommand::Disconnect).as_slice(),
-            [ApiCommand::Stop, ApiCommand::Disconnect]
+            [ApiCommand::Disconnect]
         ));
     }
 }

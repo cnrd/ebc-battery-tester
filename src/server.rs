@@ -741,6 +741,10 @@ struct DeviceActor {
     #[cfg(test)]
     write_failure: Option<String>,
     #[cfg(test)]
+    write_failure_after: Option<(usize, String)>,
+    #[cfg(test)]
+    sent_frames: Vec<OutboundFrame>,
+    #[cfg(test)]
     start_metadata_failure: Option<String>,
 }
 
@@ -782,6 +786,10 @@ impl DeviceActor {
             snapshot_tx,
             #[cfg(test)]
             write_failure: None,
+            #[cfg(test)]
+            write_failure_after: None,
+            #[cfg(test)]
+            sent_frames: Vec::new(),
             #[cfg(test)]
             start_metadata_failure: None,
         })
@@ -904,12 +912,10 @@ impl DeviceActor {
     }
 
     fn disconnect(&mut self) -> Result<(), String> {
-        if let Some(port) = &mut self.port
-            && let Err(error) = write_frame(port, OutboundFrame::Disconnect)
-        {
-            self.handle_protocol_write_failure(None, &error);
-            return Err(error);
+        if self.controller.requires_stop_before_disconnect() {
+            self.stop_test()?;
         }
+        self.send_frame_with_recovery(OutboundFrame::Disconnect, None)?;
         self.port = None;
         self.serial_buffer.clear();
         self.mock_idle_report_due = None;
@@ -1042,6 +1048,15 @@ impl DeviceActor {
     }
 
     fn send(&mut self, frame: OutboundFrame) -> Result<(), String> {
+        #[cfg(test)]
+        self.sent_frames.push(frame);
+        #[cfg(test)]
+        if let Some((successful_writes, error)) = self.write_failure_after.take() {
+            if successful_writes == 0 {
+                return Err(error);
+            }
+            self.write_failure_after = Some((successful_writes - 1, error));
+        }
         #[cfg(test)]
         if let Some(error) = self.write_failure.take() {
             return Err(error);
@@ -2119,6 +2134,264 @@ mod tests {
 
         assert_eq!(actor.mock_idle_report_due, None);
         assert!(!actor.snapshot.device.activity_known);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn idle_disconnect_sends_only_disconnect_and_succeeds() {
+        let (mut actor, directory) = mock_actor("idle-safe-disconnect");
+        confirm_inactive(&mut actor);
+        actor.sent_frames.clear();
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect("disconnect idle device");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Disconnect]
+        ));
+        assert_eq!(
+            actor.snapshot.connection,
+            ServerConnectionState::Disconnected
+        );
+        assert!(actor.port.is_none());
+        assert!(actor.serial_buffer.is_empty());
+        assert!(!actor.snapshot.device.activity_known);
+        assert_eq!(actor.snapshot.test.state, TestState::Idle);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn running_disconnect_stops_then_disconnects_and_notifies_all_clients() {
+        let (mut actor, directory) = mock_actor("running-safe-disconnect");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        let history = actor.snapshot.history.clone();
+        let current_run_id = actor.persistence.current_run_id.clone();
+        let archived_runs = actor.persistence.runs.len();
+        actor.sent_frames.clear();
+        let mut first_client = actor.snapshot_tx.subscribe();
+        let mut second_client = actor.snapshot_tx.subscribe();
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect("disconnect running device");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Stop, OutboundFrame::Disconnect]
+        ));
+        assert_eq!(
+            actor.snapshot.connection,
+            ServerConnectionState::Disconnected
+        );
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert_eq!(actor.snapshot.history, history);
+        assert_eq!(actor.persistence.current_run_id, current_run_id);
+        assert_eq!(actor.persistence.runs.len(), archived_runs);
+        let durable_samples = fs::read_to_string(&actor.persistence.samples_path)
+            .expect("read flushed current samples");
+        assert!(durable_samples.lines().count() >= 2);
+        assert!(actor.port.is_none());
+        for client in [&mut first_client, &mut second_client] {
+            let WebSocketEvent::Update(update) = client
+                .try_recv()
+                .expect("client receives disconnect update")
+            else {
+                panic!("expected disconnect update");
+            };
+            assert_eq!(update.connection, ServerConnectionState::Disconnected);
+            assert_eq!(update.test.state, TestState::RecoveredUncertain);
+        }
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn uncertain_active_disconnect_stops_before_disconnect() {
+        let (mut actor, directory) = mock_actor("uncertain-safe-disconnect");
+        confirm_inactive(&mut actor);
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        actor.sent_frames.clear();
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect("disconnect uncertain active device");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Stop, OutboundFrame::Disconnect]
+        ));
+        assert_eq!(
+            actor.snapshot.connection,
+            ServerConnectionState::Disconnected
+        );
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn starting_disconnect_stops_before_disconnect() {
+        let (mut actor, directory) = mock_actor("starting-safe-disconnect");
+        confirm_inactive(&mut actor);
+        actor.start_test(test_config()).expect("start test");
+        assert_eq!(actor.snapshot.test.state, TestState::Starting);
+        actor.sent_frames.clear();
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect("disconnect starting device");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Stop, OutboundFrame::Disconnect]
+        ));
+        assert_eq!(
+            actor.snapshot.connection,
+            ServerConnectionState::Disconnected
+        );
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn already_stopping_disconnect_does_not_duplicate_stop() {
+        let (mut actor, directory) = mock_actor("stopping-safe-disconnect");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor.stop_test().expect("begin stopping");
+        assert_eq!(actor.snapshot.test.state, TestState::Stopping);
+        actor.sent_frames.clear();
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect("disconnect stopping device");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Disconnect]
+        ));
+        assert_eq!(
+            actor.snapshot.connection,
+            ServerConnectionState::Disconnected
+        );
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn disconnect_stop_write_failure_is_uncertain_and_does_not_disconnect() {
+        let (mut actor, directory) = mock_actor("disconnect-stop-write-failure");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor.sent_frames.clear();
+        inject_write_failure(&mut actor);
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect_err("required stop write fails");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert!(
+            actor
+                .snapshot
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("stop outcome is unknown"))
+        );
+        let persisted = actor.persistence.load().expect("load persisted failure");
+        assert_eq!(persisted.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn disconnect_frame_write_failure_revokes_transport_trust() {
+        let (mut actor, directory) = mock_actor("disconnect-frame-write-failure");
+        confirm_inactive(&mut actor);
+        actor.sent_frames.clear();
+        inject_write_failure(&mut actor);
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect_err("disconnect frame write fails");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Disconnect]
+        ));
+        assert_failed_transport(&actor);
+        assert_ne!(
+            actor.snapshot.connection,
+            ServerConnectionState::Disconnected
+        );
+        assert_eq!(
+            actor.controller.physical_state(),
+            crate::controller::PhysicalState::Unknown
+        );
+        let persisted = actor.persistence.load().expect("load persisted failure");
+        assert!(!persisted.device.activity_known);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn disconnect_frame_failure_after_stop_remains_uncertain() {
+        let (mut actor, directory) = mock_actor("running-disconnect-frame-failure");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor.sent_frames.clear();
+        actor.write_failure_after = Some((1, "injected disconnect write failure".to_owned()));
+
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect_err("disconnect frame fails after stop");
+
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [OutboundFrame::Stop, OutboundFrame::Disconnect]
+        ));
+        assert_failed_transport(&actor);
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert!(
+            actor
+                .snapshot
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("injected disconnect write failure"))
+        );
+        let persisted = actor.persistence.load().expect("load persisted failure");
+        assert_eq!(persisted.test.state, TestState::RecoveredUncertain);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn disappearing_remote_client_does_not_change_running_test() {
+        let (mut actor, directory) = mock_actor("disappearing-remote-client");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor.sent_frames.clear();
+        let client = actor.snapshot_tx.subscribe();
+        drop(client);
+
+        assert!(actor.sent_frames.is_empty());
+        assert_eq!(actor.snapshot.connection, ServerConnectionState::Connected);
+        assert_eq!(actor.snapshot.test.state, TestState::Running);
+        assert!(actor.snapshot.device.active);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

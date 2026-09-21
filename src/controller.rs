@@ -361,6 +361,17 @@ impl TestController {
         self.lifecycle == Lifecycle::RunningOwned
     }
 
+    pub fn requires_stop_before_disconnect(&self) -> bool {
+        self.device.active
+            || matches!(
+                self.test.state,
+                TestState::Starting
+                    | TestState::Running
+                    | TestState::Stopping
+                    | TestState::RecoveredUncertain
+            )
+    }
+
     pub fn begin_connection(&mut self, reason: &str) {
         self.invalidate_for_gap(reason);
         self.connection_generation = self.connection_generation.wrapping_add(1);
@@ -444,14 +455,7 @@ impl TestController {
             && fresh_inactive
             && live_voltage
             && self.test.state == TestState::Stopped;
-        let show_stop = self.device.active
-            || matches!(
-                self.test.state,
-                TestState::Starting
-                    | TestState::Running
-                    | TestState::Stopping
-                    | TestState::RecoveredUncertain
-            );
+        let show_stop = self.requires_stop_before_disconnect();
         let stop = show_stop && self.lifecycle != Lifecycle::Stopping && self.connected;
         let adjust = self.lifecycle == Lifecycle::RunningOwned
             && fresh_active
