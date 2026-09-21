@@ -2125,6 +2125,106 @@ mod tests {
     }
 
     #[test]
+    fn unowned_active_reports_update_live_state_without_appending_samples() {
+        let (mut actor, directory) = mock_actor("unowned-active-reports");
+        confirm_inactive(&mut actor);
+        confirm_running(&mut actor);
+        actor
+            .persistence
+            .flush_samples()
+            .expect("flush owned sample");
+        let history = actor.snapshot.history.clone();
+        assert!(!history.is_empty());
+        let sample_count = actor.persistence.raw_sample_count;
+        let next_sequence = actor.persistence.next_sequence;
+        let csv_before = fs::read(&actor.persistence.samples_path).expect("read owned CSV");
+        let owned_elapsed = actor.snapshot.test.elapsed_seconds;
+        let owned_capacity = actor.snapshot.test.capacity_mah;
+        let owned_energy = actor.snapshot.test.energy_wh;
+
+        actor.controller.begin_connection("serial observation gap");
+        actor.controller.connection_established();
+        actor.sync_controller_state();
+        let mut events = actor.snapshot_tx.subscribe();
+
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            3900,
+            900,
+            20,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            3800,
+            800,
+            30,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+
+        assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert_eq!(actor.snapshot.device.voltage_mv, Some(3800));
+        assert_eq!(actor.snapshot.device.current_ma, Some(800));
+        assert_eq!(actor.snapshot.device.capacity_mah, Some(30));
+        assert_eq!(actor.snapshot.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(actor.snapshot.test.capacity_mah, owned_capacity);
+        assert!((actor.snapshot.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+        assert_eq!(actor.snapshot.history, history);
+        assert_eq!(actor.persistence.raw_sample_count, sample_count);
+        assert_eq!(actor.persistence.next_sequence, next_sequence);
+
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            3800,
+            0,
+            40,
+            ReportState::Idle,
+            "EBC-MOCK",
+            None,
+        );
+
+        assert_eq!(actor.snapshot.test.state, TestState::Stopped);
+        assert_eq!(actor.snapshot.device.capacity_mah, Some(40));
+        assert_eq!(actor.snapshot.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(actor.snapshot.test.capacity_mah, owned_capacity);
+        assert!((actor.snapshot.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+        assert_eq!(actor.snapshot.history, history);
+        assert_eq!(actor.persistence.raw_sample_count, sample_count);
+        assert_eq!(actor.persistence.next_sequence, next_sequence);
+
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            3800,
+            0,
+            50,
+            ReportState::Idle,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.snapshot.device.capacity_mah, Some(50));
+        assert_eq!(actor.snapshot.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(actor.snapshot.test.capacity_mah, owned_capacity);
+        assert!((actor.snapshot.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+        assert_eq!(actor.snapshot.history, history);
+        assert_eq!(actor.persistence.raw_sample_count, sample_count);
+        assert_eq!(actor.persistence.next_sequence, next_sequence);
+        let csv_after = fs::read(&actor.persistence.samples_path).expect("read recovered CSV");
+        assert_eq!(csv_after, csv_before);
+        let persisted = actor.persistence.load().expect("load recovered metadata");
+        assert_eq!(persisted.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(persisted.test.capacity_mah, owned_capacity);
+        assert!((persisted.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+        while let Ok(event) = events.try_recv() {
+            assert!(matches!(event, WebSocketEvent::Update(_)));
+        }
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn mock_disconnect_cancels_deferred_idle_report() {
         let (mut actor, directory) = mock_actor("mock-disconnect");
         actor.connect().expect("connect mock");

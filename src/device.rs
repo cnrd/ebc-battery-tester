@@ -359,8 +359,8 @@ impl InboundFrame {
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
             unknown: decode_base240(payload[7], payload[8]),
             charge_current_ma: decode_base240(payload[9], payload[10]) * 10,
-            charge_voltage_mv: decode_base240(payload[11], payload[12]),
-            cutoff_current_ma: decode_base240(payload[13], payload[14]),
+            charge_voltage_mv: decode_base240(payload[11], payload[12]) * 10,
+            cutoff_current_ma: decode_base240(payload[13], payload[14]) * 10,
             device_type: get_device_model_name(payload[15]),
         })
     }
@@ -378,7 +378,7 @@ impl InboundFrame {
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
             unknown: decode_base240(payload[7], payload[8]),
             discharge_current_ma: decode_base240(payload[9], payload[10]) * 10,
-            cutoff_voltage_mv: decode_base240(payload[11], payload[12]),
+            cutoff_voltage_mv: decode_base240(payload[11], payload[12]) * 10,
             cutoff_time_min: decode_base240(payload[13], payload[14]),
             device_type: get_device_model_name(payload[15]),
         })
@@ -397,7 +397,7 @@ impl InboundFrame {
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
             unknown: decode_base240(payload[7], payload[8]),
             discharge_power_w: decode_base240(payload[9], payload[10]),
-            cutoff_voltage_mv: decode_base240(payload[11], payload[12]),
+            cutoff_voltage_mv: decode_base240(payload[11], payload[12]) * 10,
             cutoff_time_min: decode_base240(payload[13], payload[14]),
             device_type: get_device_model_name(payload[15]),
         })
@@ -444,12 +444,9 @@ impl TryFrom<&[u8]> for InboundFrame {
         let payload = &value[1..value.len() - 2];
         let checksum = value[value.len() - 2];
         let calculated_checksum = xor_checksum(payload);
-        // It seems there is a bug in the device firmware. When you discharge to
-        // 3.3V with 1A. The checksum byte is wrong after about 2 mins of
-        // discharging. If the checksum is ignored, the frame still has correct
-        // data in it. This happens with firmware version 3.0.2 to me at least.
-        // So we log the checksum error instead.
-        if calculated_checksum != checksum {
+        // Captured inbound frames encode XOR values >= 0xf0 either verbatim or
+        // reduced by 0xf0. The reason for this device behavior is unknown.
+        if !inbound_checksum_valid(calculated_checksum, checksum) {
             log::warn!(
                 "Invalid checksum: expected {calculated_checksum:#04x}, got {checksum:#04x}"
             );
@@ -504,15 +501,23 @@ pub fn process_buffer(buf: &mut Vec<u8>) -> Vec<(InboundFrame, Vec<u8>)> {
             buf.clear();
             break;
         }
-        if let Some(end) = buf[1..].iter().position(|&b| b == END_BYTE) {
-            let frame_end = end + 2; // +1 for slice offset, +1 for inclusive
-            let raw = buf.drain(..frame_end).collect::<Vec<u8>>();
-            match InboundFrame::try_from(raw.as_slice()) {
-                Ok(f) => frames.push((f, raw)),
-                Err(e) => log::warn!("Failed to parse frame: {e}"),
-            }
-        } else {
+        if buf.len() < INBOUND_FRAME_SIZE {
             break;
+        }
+        if buf[INBOUND_FRAME_SIZE - 1] != END_BYTE {
+            buf.drain(..1);
+            continue;
+        }
+        let raw = buf[..INBOUND_FRAME_SIZE].to_vec();
+        match InboundFrame::try_from(raw.as_slice()) {
+            Ok(frame) => {
+                buf.drain(..INBOUND_FRAME_SIZE);
+                frames.push((frame, raw));
+            }
+            Err(error) => {
+                log::warn!("Failed to parse frame: {error}");
+                buf.drain(..1);
+            }
         }
     }
     frames
@@ -536,6 +541,10 @@ fn decode_base240(h: u8, l: u8) -> u16 {
 
 fn xor_checksum(data: &[u8]) -> u8 {
     data.iter().fold(0, |acc, &b| acc ^ b)
+}
+
+fn inbound_checksum_valid(calculated: u8, actual: u8) -> bool {
+    actual == calculated || (calculated >= 0xf0 && actual == calculated - 0xf0)
 }
 
 fn build_frame(payload: [u8; 7]) -> [u8; OUTBOUND_FRAME_SIZE] {
@@ -830,6 +839,26 @@ fn continue_constant_voltage_charge_command(
 mod tests {
     use super::*;
 
+    fn inbound_frame(payload: [u8; 16]) -> Vec<u8> {
+        let mut frame = vec![START_BYTE];
+        frame.extend_from_slice(&payload);
+        frame.push(xor_checksum(&payload));
+        frame.push(END_BYTE);
+        frame
+    }
+
+    fn set_base240(payload: &mut [u8; 16], offset: usize, value: u16) {
+        let (high, low) = encode_base240(value);
+        payload[offset] = high;
+        payload[offset + 1] = low;
+    }
+
+    fn report_frame(command: u8) -> Vec<u8> {
+        let mut payload = [0_u8; 16];
+        payload[0] = command;
+        inbound_frame(payload)
+    }
+
     #[test]
     fn mode_reports_preserve_idle_active_and_finished_states() {
         for (command, expected) in [
@@ -845,10 +874,7 @@ mod tests {
         ] {
             let mut payload = [0_u8; 16];
             payload[0] = command;
-            let mut frame = vec![START_BYTE];
-            frame.extend_from_slice(&payload);
-            frame.push(xor_checksum(&payload));
-            frame.push(END_BYTE);
+            let frame = inbound_frame(payload);
 
             let state = match InboundFrame::try_from(frame.as_slice()).expect("parse report") {
                 InboundFrame::Charge(report) => report.state,
@@ -858,5 +884,190 @@ mod tests {
             };
             assert_eq!(state, expected, "command {command:#04x}");
         }
+    }
+
+    #[test]
+    fn normal_reports_decode_all_configured_values_in_protocol_units() {
+        let mut charge = [0_u8; 16];
+        charge[0] = StatusReportType::ChargeConstantCurrentOnReport as u8;
+        set_base240(&mut charge, 9, 200);
+        set_base240(&mut charge, 11, 420);
+        set_base240(&mut charge, 13, 50);
+        let InboundFrame::Charge(charge) =
+            InboundFrame::try_from(inbound_frame(charge).as_slice()).expect("parse charge report")
+        else {
+            panic!("expected charge report");
+        };
+        assert_eq!(charge.charge_current_ma, 2_000);
+        assert_eq!(charge.charge_voltage_mv, 4_200);
+        assert_eq!(charge.cutoff_current_ma, 500);
+
+        let mut current = [0_u8; 16];
+        current[0] = StatusReportType::DischargeConstantCurrentOnReport as u8;
+        set_base240(&mut current, 9, 150);
+        set_base240(&mut current, 11, 390);
+        set_base240(&mut current, 13, 30);
+        let InboundFrame::DischargeConstantCurrent(current) =
+            InboundFrame::try_from(inbound_frame(current).as_slice()).expect("parse CC report")
+        else {
+            panic!("expected CC report");
+        };
+        assert_eq!(current.discharge_current_ma, 1_500);
+        assert_eq!(current.cutoff_voltage_mv, 3_900);
+        assert_eq!(current.cutoff_time_min, 30);
+
+        let mut power = [0_u8; 16];
+        power[0] = StatusReportType::DischargeConstantPowerOnReport as u8;
+        set_base240(&mut power, 9, 100);
+        set_base240(&mut power, 11, 300);
+        set_base240(&mut power, 13, 45);
+        let InboundFrame::DischargeConstantPower(power) =
+            InboundFrame::try_from(inbound_frame(power).as_slice()).expect("parse CP report")
+        else {
+            panic!("expected CP report");
+        };
+        assert_eq!(power.discharge_power_w, 100);
+        assert_eq!(power.cutoff_voltage_mv, 3_000);
+        assert_eq!(power.cutoff_time_min, 45);
+    }
+
+    #[test]
+    fn inbound_checksum_accepts_observed_high_range_encoding() {
+        assert!(inbound_checksum_valid(0xef, 0xef));
+        for (calculated, actual) in [
+            (0xf0, 0x00),
+            (0xf7, 0x07),
+            (0xfa, 0x0a),
+            (0xfe, 0x0e),
+            (0xff, 0x0f),
+        ] {
+            assert!(inbound_checksum_valid(calculated, calculated));
+            assert!(inbound_checksum_valid(calculated, actual));
+        }
+        assert!(!inbound_checksum_valid(0xfa, 0x0b));
+    }
+
+    #[test]
+    fn outbound_checksum_keeps_ordinary_high_xor() {
+        let frame = calibration_command(0x00, 5_039);
+        assert_eq!(xor_checksum(&frame[1..8]), 0xff);
+        assert_eq!(frame[8], 0xff);
+    }
+
+    #[test]
+    fn invalid_inbound_checksum_remains_tolerated() {
+        let mut frame = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        frame[INBOUND_FRAME_SIZE - 2] ^= 0x01;
+        let payload = &frame[1..INBOUND_FRAME_SIZE - 2];
+        assert!(!inbound_checksum_valid(
+            xor_checksum(payload),
+            frame[INBOUND_FRAME_SIZE - 2]
+        ));
+        assert!(InboundFrame::try_from(frame.as_slice()).is_ok());
+    }
+
+    #[test]
+    fn process_buffer_extracts_one_complete_frame() {
+        let expected = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let mut buffer = expected.clone();
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_retains_fragmented_and_incomplete_frames() {
+        let expected = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let mut buffer = expected[..7].to_vec();
+        assert!(process_buffer(&mut buffer).is_empty());
+        assert_eq!(buffer, expected[..7]);
+        buffer.extend_from_slice(&expected[7..15]);
+        assert!(process_buffer(&mut buffer).is_empty());
+        assert_eq!(buffer, expected[..15]);
+        buffer.extend_from_slice(&expected[15..]);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_extracts_concatenated_frames() {
+        let first = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let second = report_frame(StatusReportType::DischargeConstantPowerOffReport as u8);
+        let mut buffer = first.clone();
+        buffer.extend_from_slice(&second);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].1, first);
+        assert_eq!(frames[1].1, second);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_discards_garbage_before_valid_frame() {
+        let expected = report_frame(StatusReportType::ChargeConstantCurrentOffReport as u8);
+        let mut buffer = vec![0x00, 0x01, END_BYTE, 0x02];
+        buffer.extend_from_slice(&expected);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_resynchronizes_after_false_start() {
+        let expected = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let mut buffer = vec![START_BYTE, 0x01, 0x02, 0x03, 0x04];
+        buffer.extend_from_slice(&expected);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_allows_end_byte_in_checksum_position() {
+        let mut payload = [0_u8; 16];
+        payload[0] = StatusReportType::DischargeConstantCurrentOffReport as u8;
+        payload[15] = xor_checksum(&payload) ^ END_BYTE;
+        let expected = inbound_frame(payload);
+        assert_eq!(expected[INBOUND_FRAME_SIZE - 2], END_BYTE);
+        assert_eq!(expected[INBOUND_FRAME_SIZE - 1], END_BYTE);
+        let mut buffer = expected.clone();
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+    }
+
+    #[test]
+    fn process_buffer_preserves_nested_frame_with_end_byte_checksum() {
+        let mut payload = [0_u8; 16];
+        payload[0] = StatusReportType::DischargeConstantCurrentOffReport as u8;
+        payload[15] = xor_checksum(&payload) ^ END_BYTE;
+        let expected = inbound_frame(payload);
+        let mut buffer = vec![START_BYTE];
+        buffer.extend_from_slice(&expected);
+
+        let frames = process_buffer(&mut buffer);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_recovers_after_malformed_complete_frame() {
+        let mut malformed_payload = [0_u8; 16];
+        malformed_payload[0] = 0xff;
+        let malformed = inbound_frame(malformed_payload);
+        let expected = report_frame(StatusReportType::DischargeConstantPowerOffReport as u8);
+        let mut buffer = malformed;
+        buffer.extend_from_slice(&expected);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
     }
 }

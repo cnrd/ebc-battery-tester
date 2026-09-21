@@ -744,39 +744,44 @@ impl TestController {
                     false
                 }
             };
-            let elapsed = self.clock.elapsed();
-            let (capacity_mah, energy_wh) = if self.mode == ControllerMode::Server {
-                let energy_wh = if owns_metrics {
-                    self.energy
-                        .add(elapsed.as_secs_f64(), report.voltage_mv, report.current_ma)
+            if owns_metrics {
+                let elapsed = self.clock.elapsed();
+                let (capacity_mah, energy_wh) = if self.mode == ControllerMode::Server {
+                    (
+                        self.capacity.observe(report.capacity_mah, true),
+                        self.energy.add(
+                            elapsed.as_secs_f64(),
+                            report.voltage_mv,
+                            report.current_ma,
+                        ),
+                    )
                 } else {
-                    self.test.energy_wh
+                    (
+                        u64::from(report.capacity_mah),
+                        report.voltage_mv as f64 * report.capacity_mah as f64 / 1_000_000.0,
+                    )
                 };
-                (
-                    self.capacity.observe(report.capacity_mah, owns_metrics),
+                self.test.capacity_mah = Some(capacity_mah);
+                self.test.energy_wh = energy_wh;
+                Some(Measurement {
+                    elapsed_seconds: elapsed.as_secs(),
+                    voltage_mv: report.voltage_mv,
+                    current_ma: report.current_ma,
+                    capacity_mah,
                     energy_wh,
-                )
+                    mode: report.mode,
+                })
             } else {
-                (
-                    u64::from(report.capacity_mah),
-                    report.voltage_mv as f64 * report.capacity_mah as f64 / 1_000_000.0,
-                )
-            };
-            self.test.capacity_mah = Some(capacity_mah);
-            self.test.energy_wh = energy_wh;
-            Some(Measurement {
-                elapsed_seconds: elapsed.as_secs(),
-                voltage_mv: report.voltage_mv,
-                current_ma: report.current_ma,
-                capacity_mah,
-                energy_wh,
-                mode: report.mode,
-            })
+                None
+            }
         } else {
             self.clock.stop();
             self.energy.break_gap();
             self.update_elapsed();
-            if previous_lifecycle != Lifecycle::Starting {
+            if matches!(
+                previous_lifecycle,
+                Lifecycle::RunningOwned | Lifecycle::Stopping
+            ) {
                 self.test.capacity_mah = Some(if self.mode == ControllerMode::Server {
                     self.capacity.observe(
                         report.capacity_mah,
@@ -1176,13 +1181,41 @@ mod tests {
     fn recovered_active_stays_uncertain_until_inactive() {
         let mut controller = controller();
         commit(&mut controller, ApiCommand::Start(config()));
-        controller.report(report(ReportState::Active, 1));
+        let (_, owned) = controller.report(report(ReportState::Active, 10));
+        assert!(owned.is_some());
+        controller.clock.accumulated = Duration::from_secs(49);
+        controller.update_elapsed();
+        let owned_elapsed = controller.test.elapsed_seconds;
+        let owned_capacity = controller.test.capacity_mah;
+        let owned_energy = controller.test.energy_wh;
         controller.invalidate_for_gap("serial gap");
         controller.begin_connection("reconnect");
         controller.connection_established();
 
-        controller.report(report(ReportState::Active, 2));
+        let mut first_unowned = report(ReportState::Active, 20);
+        first_unowned.voltage_mv = 3900;
+        first_unowned.current_ma = 900;
+        let (_, measurement) = controller.report(first_unowned);
+        assert!(measurement.is_none());
         assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+        assert_eq!(controller.device.voltage_mv, Some(3900));
+        assert_eq!(controller.device.current_ma, Some(900));
+        assert_eq!(controller.device.capacity_mah, Some(20));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        let mut second_unowned = report(ReportState::Active, 30);
+        second_unowned.voltage_mv = 3800;
+        second_unowned.current_ma = 800;
+        let (_, measurement) = controller.report(second_unowned);
+        assert!(measurement.is_none());
+        assert_eq!(controller.device.voltage_mv, Some(3800));
+        assert_eq!(controller.device.current_ma, Some(800));
+        assert_eq!(controller.device.capacity_mah, Some(30));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
         assert_eq!(controller.next_timer_sync(), None);
         assert!(
             controller
@@ -1190,9 +1223,60 @@ mod tests {
                 .is_err()
         );
 
-        controller.report(report(ReportState::Idle, 2));
+        controller.report(report(ReportState::Idle, 40));
         assert_eq!(controller.test.state, TestState::Stopped);
+        assert_eq!(controller.device.capacity_mah, Some(40));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
         assert!(controller.capabilities().start);
+
+        controller.report(report(ReportState::Idle, 50));
+        assert_eq!(controller.device.capacity_mah, Some(50));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn first_active_report_confirms_start_even_with_zero_current() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        let mut active = report(ReportState::Active, 1);
+        active.current_ma = 0;
+
+        let (_, measurement) = controller.report(active);
+
+        assert_eq!(controller.test.state, TestState::Running);
+        assert_eq!(measurement.expect("owned measurement").current_ma, 0);
+    }
+
+    #[test]
+    fn completed_remains_latched_through_following_idle_report() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        controller.report(report(ReportState::Finished, 2));
+        let mut idle = report(ReportState::Idle, 2);
+        idle.current_ma = 1_000;
+
+        controller.report(idle);
+
+        assert_eq!(controller.test.state, TestState::Completed);
+    }
+
+    #[test]
+    fn stop_confirmation_does_not_require_zero_current() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        commit(&mut controller, ApiCommand::Stop);
+        let mut idle = report(ReportState::Idle, 2);
+        idle.current_ma = 1_000;
+
+        controller.report(idle);
+
+        assert_eq!(controller.test.state, TestState::Stopped);
     }
 
     #[test]
