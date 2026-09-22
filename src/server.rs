@@ -28,8 +28,8 @@ use crate::controller::{
 };
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CycleRecipe, CycleRunContext,
-    CycleState, CycleStatus, RunSummary, Sample, ServerConnectionState, SnapshotUpdate,
-    TestConfiguration, TestState, WebSocketEvent,
+    CycleSample, CycleState, CycleStatus, RunSummary, Sample, ServerConnectionState,
+    SnapshotUpdate, TestConfiguration, TestState, WebSocketEvent, cycle_presentation_history,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
@@ -78,15 +78,16 @@ impl ServerConfig {
 #[derive(Clone)]
 struct AppState {
     actor_tx: std_mpsc::Sender<ActorMessage>,
-    snapshot_tx: broadcast::Sender<WebSocketEvent>,
     allowed_origin: Option<String>,
 }
 
 enum ActorRequest {
     Snapshot,
-    CompleteSnapshot,
+    Subscribe,
     History,
     HistoryCsv,
+    CycleHistoryCsv,
+    CycleCsv(String),
     Runs,
     RunCsv(String),
     Command(ApiCommand),
@@ -95,12 +96,9 @@ enum ActorRequest {
     Shutdown,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "actor responses are transferred across the channel without cloning"
-)]
 enum ActorResponse {
     Snapshot(AuthoritativeSnapshot),
+    Subscription(AuthoritativeSnapshot, broadcast::Receiver<WebSocketEvent>),
     History(Vec<Sample>),
     Runs(Vec<RunSummary>),
     Export(ExportDescriptor),
@@ -129,6 +127,11 @@ struct Persistence {
     raw_sample_count: usize,
     sample_writer: Option<BufWriter<File>>,
     last_sample_sync: Instant,
+    cycles_dir: PathBuf,
+    current_cycle_id: Option<String>,
+    next_cycle_sequence: u64,
+    cycle_writer: Option<BufWriter<File>>,
+    last_cycle_sync: Instant,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,6 +167,13 @@ impl Persistence {
                 runs_dir.display()
             )
         })?;
+        let cycles_dir = data_dir.join("cycles");
+        fs::create_dir_all(&cycles_dir).map_err(|error| {
+            format!(
+                "failed to create cycle telemetry directory {}: {error}",
+                cycles_dir.display()
+            )
+        })?;
         let mut persistence = Self {
             metadata_path: data_dir.join("session.json"),
             samples_path: data_dir.join("samples.csv"),
@@ -176,6 +186,11 @@ impl Persistence {
             raw_sample_count: 0,
             sample_writer: None,
             last_sample_sync: Instant::now(),
+            cycles_dir,
+            current_cycle_id: None,
+            next_cycle_sequence: 0,
+            cycle_writer: None,
+            last_cycle_sync: Instant::now(),
         };
         persistence.runs = persistence.load_run_summaries()?;
         Ok(persistence)
@@ -199,6 +214,7 @@ impl Persistence {
                 cycle: metadata.cycle,
                 capabilities: Default::default(),
                 history: Vec::new(),
+                cycle_history: Vec::new(),
             }
         } else {
             AuthoritativeSnapshot::default()
@@ -259,6 +275,14 @@ impl Persistence {
             if self.current_run_id.is_empty() {
                 self.current_run_id.clone_from(&last.run_id);
             }
+        }
+        if let Some(execution_id) = snapshot.cycle.execution_id.clone() {
+            let cycle_history = self.load_cycle_samples(&execution_id)?;
+            self.current_cycle_id = Some(execution_id);
+            self.next_cycle_sequence = cycle_history
+                .last()
+                .map_or(0, |sample| sample.sequence.saturating_add(1));
+            snapshot.cycle_history = cycle_history;
         }
         Ok(snapshot)
     }
@@ -484,6 +508,89 @@ impl Persistence {
         )
     }
 
+    fn begin_cycle(&mut self, execution_id: String) -> Result<(), String> {
+        if !valid_run_id(&execution_id) {
+            return Err("invalid cycle execution id".to_owned());
+        }
+        self.flush_cycle_samples()?;
+        self.cycle_writer = None;
+        let path = self.cycle_path(&execution_id);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        file.write_all(cycle_csv_header().as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        sync_directory(&self.cycles_dir)?;
+        self.current_cycle_id = Some(execution_id);
+        self.next_cycle_sequence = 0;
+        self.last_cycle_sync = Instant::now();
+        Ok(())
+    }
+
+    fn append_cycle_sample(&mut self, sample: &CycleSample) -> Result<(), String> {
+        if self.current_cycle_id.as_deref() != Some(sample.execution_id.as_str()) {
+            return Err(
+                "cycle sample execution does not match the active telemetry file".to_owned(),
+            );
+        }
+        if self.cycle_writer.is_none() {
+            let path = self.cycle_path(&sample.execution_id);
+            self.cycle_writer = Some(BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| error.to_string())?,
+            ));
+        }
+        self.cycle_writer
+            .as_mut()
+            .ok_or_else(|| "cycle sample writer was not initialized".to_owned())?
+            .write_all(cycle_sample_csv_row(sample).as_bytes())
+            .map_err(|error| error.to_string())?;
+        if self.last_cycle_sync.elapsed() >= Duration::from_secs(1) {
+            self.flush_cycle_samples()?;
+        }
+        self.next_cycle_sequence = sample.sequence.saturating_add(1);
+        Ok(())
+    }
+
+    fn flush_cycle_samples(&mut self) -> Result<(), String> {
+        if let Some(writer) = &mut self.cycle_writer {
+            writer.flush().map_err(|error| error.to_string())?;
+            writer
+                .get_ref()
+                .sync_data()
+                .map_err(|error| error.to_string())?;
+        }
+        self.last_cycle_sync = Instant::now();
+        Ok(())
+    }
+
+    fn cycle_export(&mut self, execution_id: Option<&str>) -> Result<ExportDescriptor, String> {
+        let id = execution_id
+            .map(str::to_owned)
+            .or_else(|| self.current_cycle_id.clone())
+            .ok_or_else(|| "cycle telemetry is unavailable".to_owned())?;
+        if !valid_run_id(&id) {
+            return Err("invalid cycle execution id".to_owned());
+        }
+        if self.current_cycle_id.as_deref() == Some(id.as_str()) {
+            self.flush_cycle_samples()?;
+        }
+        let path = self.cycle_path(&id);
+        if !path.is_file() {
+            return Err("cycle telemetry was not found".to_owned());
+        }
+        open_export(&path, format!("{id}.csv"))
+    }
+
+    fn cycle_path(&self, execution_id: &str) -> PathBuf {
+        self.cycles_dir.join(format!("{execution_id}.csv"))
+    }
+
     fn append_sample(&mut self, sample: &Sample) -> Result<(), String> {
         if self.sample_writer.is_none() {
             let new_file = !self.samples_path.exists();
@@ -568,6 +675,73 @@ impl Persistence {
             let mut file = OpenOptions::new()
                 .append(true)
                 .open(&self.samples_path)
+                .map_err(|error| error.to_string())?;
+            file.write_all(b"\n").map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+        }
+        Ok(samples)
+    }
+
+    fn load_cycle_samples(&self, execution_id: &str) -> Result<Vec<CycleSample>, String> {
+        let path = self.cycle_path(execution_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let terminated = bytes.last() == Some(&b'\n');
+        let text = String::from_utf8(bytes.clone()).map_err(|error| error.to_string())?;
+        let mut lines = text.split_terminator('\n');
+        if lines.next().unwrap_or_default() != cycle_csv_header().trim_end() {
+            return Err(format!(
+                "invalid cycle telemetry header in {}",
+                path.display()
+            ));
+        }
+        let rows: Vec<&str> = lines.collect();
+        let mut samples = Vec::with_capacity(rows.len());
+        for (index, line) in rows.iter().enumerate() {
+            if line.is_empty() {
+                return Err("invalid empty complete cycle telemetry row".to_owned());
+            }
+            match parse_cycle_sample(line) {
+                Ok(sample) if sample.execution_id == execution_id => {
+                    if samples
+                        .last()
+                        .is_some_and(|previous: &CycleSample| previous.sequence >= sample.sequence)
+                    {
+                        return Err(
+                            "cycle telemetry sequence is not strictly increasing".to_owned()
+                        );
+                    }
+                    samples.push(sample);
+                }
+                Ok(_) => return Err("cycle telemetry execution id mismatch".to_owned()),
+                Err(_) if !terminated && index + 1 == rows.len() => {
+                    let length = bytes
+                        .iter()
+                        .rposition(|byte| *byte == b'\n')
+                        .map_or(0, |position| position + 1);
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .map_err(|error| error.to_string())?;
+                    file.set_len(u64::try_from(length).map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                    file.sync_all().map_err(|error| error.to_string())?;
+                    sync_parent(&path)?;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !terminated
+            && rows
+                .last()
+                .is_some_and(|line| parse_cycle_sample(line).is_ok())
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
                 .map_err(|error| error.to_string())?;
             file.write_all(b"\n").map_err(|error| error.to_string())?;
             file.sync_all().map_err(|error| error.to_string())?;
@@ -672,6 +846,117 @@ fn parse_sample(line: &str) -> Result<Sample, String> {
             .map_err(|error| format!("invalid capacity: {error}"))?,
         energy_wh,
         mode,
+    })
+}
+
+fn cycle_csv_header() -> &'static str {
+    "execution_id,sequence,timestamp_utc,elapsed_milliseconds,repeat_index,step_index,cycle_state,test_state,mode,activity_known,active,voltage_mv,current_ma,device_capacity_mah,test_capacity_mah,test_energy_wh\n"
+}
+
+fn cycle_sample_csv_row(sample: &CycleSample) -> String {
+    format!(
+        "{},{},{},{},{},{},{:?},{:?},{:?},{},{},{},{},{},{},{:.9}\n",
+        sample.execution_id,
+        sample.sequence,
+        sample.timestamp_utc,
+        sample.elapsed_milliseconds,
+        sample.repeat_index,
+        sample.step_index,
+        sample.cycle_state,
+        sample.test_state,
+        sample.mode,
+        u8::from(sample.activity_known),
+        u8::from(sample.active),
+        sample.voltage_mv,
+        sample.current_ma,
+        sample.device_capacity_mah,
+        sample
+            .test_capacity_mah
+            .map_or_else(String::new, |value| value.to_string()),
+        sample.test_energy_wh,
+    )
+}
+
+fn parse_cycle_sample(line: &str) -> Result<CycleSample, String> {
+    let fields: Vec<&str> = line.split(',').collect();
+    if fields.len() != 16 {
+        return Err(format!("invalid cycle telemetry row: {line}"));
+    }
+    let cycle_state = match fields[6] {
+        "Idle" => CycleState::Idle,
+        "Preparing" => CycleState::Preparing,
+        "StartingStep" => CycleState::StartingStep,
+        "RunningStep" => CycleState::RunningStep,
+        "Settling" => CycleState::Settling,
+        "Resting" => CycleState::Resting,
+        "Stopping" => CycleState::Stopping,
+        "Completed" => CycleState::Completed,
+        "Stopped" => CycleState::Stopped,
+        "Interrupted" => CycleState::Interrupted,
+        value => return Err(format!("invalid cycle state in telemetry: {value}")),
+    };
+    let test_state = match fields[7] {
+        "Idle" => TestState::Idle,
+        "Starting" => TestState::Starting,
+        "Running" => TestState::Running,
+        "Stopping" => TestState::Stopping,
+        "Stopped" => TestState::Stopped,
+        "Completed" => TestState::Completed,
+        "RecoveredUncertain" => TestState::RecoveredUncertain,
+        value => return Err(format!("invalid test state in cycle telemetry: {value}")),
+    };
+    let mode = match fields[8] {
+        "DischargeConstantCurrent" => device::DeviceMode::DischargeConstantCurrent,
+        "DischargeConstantPower" => device::DeviceMode::DischargeConstantPower,
+        "ChargeConstantVoltage" => device::DeviceMode::ChargeConstantVoltage,
+        value => return Err(format!("invalid device mode in cycle telemetry: {value}")),
+    };
+    let parse_bool = |value: &str| match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(format!("invalid boolean in cycle telemetry: {value}")),
+    };
+    Ok(CycleSample {
+        execution_id: fields[0].to_owned(),
+        sequence: fields[1]
+            .parse()
+            .map_err(|error| format!("invalid cycle sequence: {error}"))?,
+        timestamp_utc: fields[2].to_owned(),
+        elapsed_milliseconds: fields[3]
+            .parse()
+            .map_err(|error| format!("invalid cycle elapsed time: {error}"))?,
+        repeat_index: fields[4]
+            .parse()
+            .map_err(|error| format!("invalid repeat index: {error}"))?,
+        step_index: fields[5]
+            .parse()
+            .map_err(|error| format!("invalid step index: {error}"))?,
+        cycle_state,
+        test_state,
+        mode,
+        activity_known: parse_bool(fields[9])?,
+        active: parse_bool(fields[10])?,
+        voltage_mv: fields[11]
+            .parse()
+            .map_err(|error| format!("invalid cycle voltage: {error}"))?,
+        current_ma: fields[12]
+            .parse()
+            .map_err(|error| format!("invalid cycle current: {error}"))?,
+        device_capacity_mah: fields[13]
+            .parse()
+            .map_err(|error| format!("invalid cycle device capacity: {error}"))?,
+        test_capacity_mah: if fields[14].is_empty() {
+            None
+        } else {
+            Some(
+                fields[14]
+                    .parse()
+                    .map_err(|error| format!("invalid cycle test capacity: {error}"))?,
+            )
+        },
+        test_energy_wh: fields[15]
+            .parse()
+            .map_err(|error| format!("invalid cycle test energy: {error}"))?,
     })
 }
 
@@ -796,6 +1081,10 @@ impl DeviceActor {
         if snapshot.history.len() > SNAPSHOT_SAMPLE_LIMIT {
             snapshot.history = presentation_history(&snapshot.history, SNAPSHOT_SAMPLE_LIMIT);
         }
+        if snapshot.cycle_history.len() > SNAPSHOT_SAMPLE_LIMIT {
+            snapshot.cycle_history =
+                cycle_presentation_history(&snapshot.cycle_history, SNAPSHOT_SAMPLE_LIMIT);
+        }
         Ok(Self {
             config,
             snapshot,
@@ -854,21 +1143,33 @@ impl DeviceActor {
     fn shutdown(&mut self) -> Result<(), String> {
         self.sync_controller_state();
         self.persistence.flush_samples()?;
+        self.persistence.flush_cycle_samples()?;
         self.persistence.save_metadata(&self.snapshot)
     }
 
     fn handle_message(&mut self, message: ActorMessage) {
         let result = match message.request {
             ActorRequest::Snapshot => Ok(ActorResponse::Snapshot(self.current_snapshot())),
-            ActorRequest::CompleteSnapshot => {
+            ActorRequest::Subscribe => {
                 self.sync_controller_state();
-                Ok(ActorResponse::Snapshot(self.snapshot_for_clients()))
+                Ok(ActorResponse::Subscription(
+                    self.snapshot_for_clients(),
+                    self.snapshot_tx.subscribe(),
+                ))
             }
             ActorRequest::History => Ok(ActorResponse::History(presentation_history(
                 &self.snapshot.history,
                 SNAPSHOT_SAMPLE_LIMIT,
             ))),
             ActorRequest::HistoryCsv => self.persistence.live_export().map(ActorResponse::Export),
+            ActorRequest::CycleHistoryCsv => self
+                .persistence
+                .cycle_export(None)
+                .map(ActorResponse::Export),
+            ActorRequest::CycleCsv(id) => self
+                .persistence
+                .cycle_export(Some(&id))
+                .map(ActorResponse::Export),
             ActorRequest::Runs => Ok(ActorResponse::Runs(self.persistence.run_summaries())),
             ActorRequest::RunCsv(id) => self.persistence.run_export(&id).map(ActorResponse::Export),
             ActorRequest::Command(command) => self
@@ -1023,6 +1324,9 @@ impl DeviceActor {
 
     fn start_cycle(&mut self, recipe: CycleRecipe) -> Result<(), String> {
         recipe.validate().map_err(|error| error.to_string())?;
+        if self.cycle.is_executing() {
+            return Err("a cycle is already active".to_owned());
+        }
         if !self.controller.capabilities().start {
             return Err(
                 "cycle start requires a fresh current-connection inactive report".to_owned(),
@@ -1033,10 +1337,12 @@ impl DeviceActor {
         }
         let started_at = Utc::now().to_rfc3339();
         let execution_id = format!("cycle-{}", started_at.replace([':', '.', '+'], "-"));
+        self.persistence.begin_cycle(execution_id.clone())?;
         let action = self
             .cycle
             .start(recipe, execution_id, Some(started_at), Instant::now())
             .map_err(|error| error.to_string())?;
+        self.snapshot.cycle_history.clear();
         self.sync_controller_state();
         if let Some(action) = action {
             self.execute_cycle_action(action)?;
@@ -1066,6 +1372,9 @@ impl DeviceActor {
             self.cycle
                 .on_action_failed(format!("cycle physical action failed: {error}"));
             self.sync_controller_state();
+            if let Err(persistence_error) = self.persistence.flush_cycle_samples() {
+                log::error!("failed to flush interrupted cycle telemetry: {persistence_error}");
+            }
             if let Err(persistence_error) = self.persistence.save_metadata(&self.snapshot) {
                 log::error!("failed to persist interrupted cycle action: {persistence_error}");
             }
@@ -1235,6 +1544,9 @@ impl DeviceActor {
             self.controller.disconnect(&reason);
         }
         self.sync_controller_state();
+        if let Err(persistence_error) = self.persistence.flush_cycle_samples() {
+            log::error!("failed to flush interrupted cycle telemetry: {persistence_error}");
+        }
         if let Err(persistence_error) = self.persistence.save_metadata(&self.snapshot) {
             log::error!("failed to persist protocol write failure: {persistence_error}");
         }
@@ -1281,7 +1593,16 @@ impl DeviceActor {
                 .device
                 .mode
                 .unwrap_or(device::DeviceMode::DischargeConstantCurrent);
-            self.record_report(mode, 4200, 0, 0, ReportState::Idle, "EBC-MOCK", None);
+            self.record_report_with_source(
+                mode,
+                4200,
+                0,
+                0,
+                ReportState::Idle,
+                true,
+                "EBC-MOCK",
+                None,
+            );
             return;
         }
         if self.controller.is_stopping() {
@@ -1290,12 +1611,13 @@ impl DeviceActor {
                 .device
                 .mode
                 .unwrap_or(device::DeviceMode::DischargeConstantCurrent);
-            self.record_report(
+            self.record_report_with_source(
                 mode,
                 self.controller.device().voltage_mv.unwrap_or(4200),
                 0,
                 self.controller.device().capacity_mah.unwrap_or(0),
                 ReportState::Idle,
+                true,
                 "EBC-MOCK",
                 None,
             );
@@ -1314,12 +1636,13 @@ impl DeviceActor {
         let voltage =
             4200_u16.saturating_sub(u16::try_from(self.mock_sample_number / 5).unwrap_or(u16::MAX));
         let capacity = u16::try_from(self.mock_sample_number / 3).unwrap_or(u16::MAX);
-        self.record_report(
+        self.record_report_with_source(
             config.mode(),
             voltage,
             mock_current(&config),
             capacity,
             ReportState::Active,
+            true,
             "EBC-MOCK",
             None,
         );
@@ -1343,7 +1666,7 @@ impl DeviceActor {
 
     fn handle_frame(&mut self, frame: InboundFrame) {
         match frame {
-            InboundFrame::Firmware(report) => self.record_report(
+            InboundFrame::Firmware(report) => self.record_report_with_source(
                 report.device_mode,
                 report.voltage_mv,
                 report.current_ma,
@@ -1353,39 +1676,44 @@ impl DeviceActor {
                 } else {
                     ReportState::InactiveUnknown
                 },
+                false,
                 &report.device_type,
                 Some(report.firmware_version),
             ),
-            InboundFrame::Charge(report) => self.record_report(
+            InboundFrame::Charge(report) => self.record_report_with_source(
                 device::DeviceMode::ChargeConstantVoltage,
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
                 report.state.into(),
+                true,
                 &report.device_type,
                 None,
             ),
-            InboundFrame::DischargeConstantCurrent(report) => self.record_report(
+            InboundFrame::DischargeConstantCurrent(report) => self.record_report_with_source(
                 device::DeviceMode::DischargeConstantCurrent,
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
                 report.state.into(),
+                true,
                 &report.device_type,
                 None,
             ),
-            InboundFrame::DischargeConstantPower(report) => self.record_report(
+            InboundFrame::DischargeConstantPower(report) => self.record_report_with_source(
                 device::DeviceMode::DischargeConstantPower,
                 report.voltage_mv,
                 report.current_ma,
                 report.milli_ampere_hours,
                 report.state.into(),
+                true,
                 &report.device_type,
                 None,
             ),
         }
     }
 
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments)]
     fn record_report(
         &mut self,
@@ -1397,8 +1725,34 @@ impl DeviceActor {
         model: &str,
         firmware: Option<String>,
     ) {
+        self.record_report_with_source(
+            mode,
+            voltage_mv,
+            current_ma,
+            capacity_mah,
+            report_state,
+            true,
+            model,
+            firmware,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn record_report_with_source(
+        &mut self,
+        mode: device::DeviceMode,
+        voltage_mv: u16,
+        current_ma: u16,
+        capacity_mah: u16,
+        report_state: ReportState,
+        normal_report: bool,
+        model: &str,
+        firmware: Option<String>,
+    ) {
         let active = report_state == ReportState::Active;
-        let (outcome, measurement) = self.controller.report(DeviceReport {
+        let now = Instant::now();
+        let timestamp_utc = Utc::now().to_rfc3339();
+        let report = DeviceReport {
             mode,
             state: report_state,
             voltage_mv,
@@ -1406,13 +1760,17 @@ impl DeviceActor {
             capacity_mah,
             model: model.to_owned(),
             firmware_version: firmware,
-        });
+        };
+        let (outcome, measurement) = self.controller.report(report.clone());
         self.sync_controller_state();
+        if normal_report && self.cycle.is_executing() {
+            self.record_cycle_sample(&report, &timestamp_utc, now);
+        }
         if let Some(measurement) = measurement {
             let sample = Sample {
                 run_id: self.persistence.current_run_id.clone(),
                 sequence: self.persistence.next_sequence,
-                timestamp_utc: Utc::now().to_rfc3339(),
+                timestamp_utc,
                 elapsed_seconds: measurement.elapsed_seconds,
                 voltage_mv: measurement.voltage_mv,
                 current_ma: measurement.current_ma,
@@ -1446,7 +1804,7 @@ impl DeviceActor {
         }
         let previous_cycle = self.cycle.status().clone();
         let action = self.cycle.on_physical_state(
-            Instant::now(),
+            now,
             self.controller.device(),
             self.controller.test(),
             true,
@@ -1464,6 +1822,43 @@ impl DeviceActor {
                 log::error!("failed to persist cycle report transition: {error}");
             }
         }
+    }
+
+    fn record_cycle_sample(&mut self, report: &DeviceReport, timestamp_utc: &str, now: Instant) {
+        let cycle_status = self.cycle.status();
+        let Some(execution_id) = cycle_status.execution_id.clone() else {
+            log::error!("executing cycle is missing its execution id");
+            return;
+        };
+        let sample = CycleSample {
+            execution_id,
+            sequence: self.persistence.next_cycle_sequence,
+            timestamp_utc: timestamp_utc.to_owned(),
+            elapsed_milliseconds: u64::try_from(self.cycle.elapsed(now).as_millis())
+                .unwrap_or(u64::MAX),
+            repeat_index: cycle_status.repeat_index,
+            step_index: cycle_status.step_index,
+            cycle_state: cycle_status.state,
+            test_state: self.controller.test().state.clone(),
+            mode: report.mode,
+            activity_known: self.controller.device().activity_known,
+            active: self.controller.device().active,
+            voltage_mv: report.voltage_mv,
+            current_ma: report.current_ma,
+            device_capacity_mah: report.capacity_mah,
+            test_capacity_mah: self.controller.test().capacity_mah,
+            test_energy_wh: self.controller.test().energy_wh,
+        };
+        if let Err(error) = self.persistence.append_cycle_sample(&sample) {
+            log::error!("failed to append cycle sample: {error}");
+            return;
+        }
+        self.snapshot.cycle_history.push(sample.clone());
+        if self.snapshot.cycle_history.len() > SNAPSHOT_SAMPLE_LIMIT {
+            self.snapshot.cycle_history =
+                cycle_presentation_history(&self.snapshot.cycle_history, SNAPSHOT_SAMPLE_LIMIT);
+        }
+        let _receivers = self.snapshot_tx.send(WebSocketEvent::CycleSample(sample));
     }
 
     fn archive_final_cycle_run(&mut self, previous: &CycleStatus) -> Result<(), String> {
@@ -1497,6 +1892,9 @@ impl DeviceActor {
             "device connection failed; physical test state is unknown: {error}"
         ));
         self.sync_controller_state();
+        if let Err(persistence_error) = self.persistence.flush_cycle_samples() {
+            log::error!("failed to flush interrupted cycle telemetry: {persistence_error}");
+        }
         if let Err(persistence_error) = self.persistence.save_metadata(&self.snapshot) {
             log::error!("failed to persist connection failure: {persistence_error}");
         }
@@ -1505,6 +1903,9 @@ impl DeviceActor {
 
     fn persist_and_publish(&mut self) -> Result<(), String> {
         self.sync_controller_state();
+        if !self.cycle.is_executing() {
+            self.persistence.flush_cycle_samples()?;
+        }
         self.persistence.save_metadata(&self.snapshot)?;
         self.publish();
         Ok(())
@@ -1546,6 +1947,8 @@ impl DeviceActor {
     fn snapshot_for_clients(&self) -> AuthoritativeSnapshot {
         let mut snapshot = self.snapshot.clone();
         snapshot.history = presentation_history(&snapshot.history, SNAPSHOT_SAMPLE_LIMIT);
+        snapshot.cycle_history =
+            cycle_presentation_history(&snapshot.cycle_history, SNAPSHOT_SAMPLE_LIMIT);
         snapshot
     }
 }
@@ -1612,13 +2015,14 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
 
     let state = AppState {
         actor_tx: actor_tx.clone(),
-        snapshot_tx,
         allowed_origin: std::env::var("EBC_ALLOWED_ORIGIN").ok(),
     };
     let api = Router::new()
         .route("/status", get(get_status))
         .route("/history", get(get_history))
         .route("/history.csv", get(get_history_csv))
+        .route("/cycle/history.csv", get(get_cycle_history_csv))
+        .route("/cycles/{id}/history.csv", get(get_cycle_csv))
         .route("/runs", get(get_runs))
         .route("/runs/{file}", get(get_run_csv))
         .route("/connect", post(connect))
@@ -1745,6 +2149,26 @@ async fn get_history(State(state): State<AppState>) -> Result<Json<Vec<Sample>>,
 
 async fn get_history_csv(State(state): State<AppState>) -> Result<Response, ApiError> {
     match request(&state, ActorRequest::HistoryCsv).await? {
+        ActorResponse::Export(export) => export_response(export),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+async fn get_cycle_history_csv(State(state): State<AppState>) -> Result<Response, ApiError> {
+    match request(&state, ActorRequest::CycleHistoryCsv).await? {
+        ActorResponse::Export(export) => export_response(export),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+async fn get_cycle_csv(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::bad_request("invalid cycle execution id"));
+    }
+    match request(&state, ActorRequest::CycleCsv(id)).await? {
         ActorResponse::Export(export) => export_response(export),
         _ => Err(ApiError::internal("unexpected actor response")),
     }
@@ -1946,12 +2370,14 @@ fn validate_origin(
 }
 
 async fn websocket_client(mut socket: WebSocket, state: AppState) {
-    let mut updates = state.snapshot_tx.subscribe();
-    if let Ok(ActorResponse::Snapshot(snapshot)) =
-        request(&state, ActorRequest::CompleteSnapshot).await
-        && send_event(&mut socket, &WebSocketEvent::Snapshot(snapshot))
-            .await
-            .is_err()
+    let Ok(ActorResponse::Subscription(snapshot, mut updates)) =
+        request(&state, ActorRequest::Subscribe).await
+    else {
+        return;
+    };
+    if send_event(&mut socket, &WebSocketEvent::Snapshot(snapshot))
+        .await
+        .is_err()
     {
         return;
     }
@@ -1959,8 +2385,11 @@ async fn websocket_client(mut socket: WebSocket, state: AppState) {
         let event = match updates.recv().await {
             Ok(event) => event,
             Err(broadcast::error::RecvError::Lagged(_)) => {
-                match request(&state, ActorRequest::CompleteSnapshot).await {
-                    Ok(ActorResponse::Snapshot(snapshot)) => WebSocketEvent::Snapshot(snapshot),
+                match request(&state, ActorRequest::Subscribe).await {
+                    Ok(ActorResponse::Subscription(snapshot, replacement)) => {
+                        updates = replacement;
+                        WebSocketEvent::Snapshot(snapshot)
+                    }
                     _ => break,
                 }
             }
@@ -2243,6 +2672,27 @@ mod tests {
             capacity_mah: sequence,
             energy_wh: sequence as f64 / 1000.0,
             mode: device::DeviceMode::DischargeConstantCurrent,
+        }
+    }
+
+    fn numbered_cycle_sample(execution_id: &str, sequence: u64) -> CycleSample {
+        CycleSample {
+            execution_id: execution_id.to_owned(),
+            sequence,
+            timestamp_utc: format!("2026-01-01T00:00:{sequence:02}Z"),
+            elapsed_milliseconds: sequence * 250,
+            repeat_index: 0,
+            step_index: 0,
+            cycle_state: CycleState::RunningStep,
+            test_state: TestState::Running,
+            mode: device::DeviceMode::DischargeConstantCurrent,
+            activity_known: true,
+            active: true,
+            voltage_mv: 4000,
+            current_ma: 1000,
+            device_capacity_mah: u16::try_from(sequence).unwrap_or(u16::MAX),
+            test_capacity_mah: Some(sequence),
+            test_energy_wh: sequence as f64 / 1000.0,
         }
     }
 
@@ -3176,6 +3626,102 @@ mod tests {
     }
 
     #[test]
+    fn cycle_csv_is_execution_specific_and_exports_a_durable_prefix() {
+        let directory = temporary_directory("cycle-export-prefix");
+        let mut persistence = Persistence::new(&directory).expect("create persistence");
+        persistence
+            .begin_cycle("cycle-one".to_owned())
+            .expect("begin cycle");
+        persistence
+            .append_cycle_sample(&numbered_cycle_sample("cycle-one", 0))
+            .expect("append first sample");
+        let prefix = persistence.cycle_export(None).expect("capture prefix");
+        let prefix_length = prefix.length;
+        persistence
+            .append_cycle_sample(&numbered_cycle_sample("cycle-one", 1))
+            .expect("append second sample");
+        let prefix_contents = read_export(prefix);
+        assert_eq!(
+            u64::try_from(prefix_contents.len()).expect("prefix length"),
+            prefix_length
+        );
+        assert_eq!(prefix_contents.lines().count(), 2);
+
+        persistence
+            .begin_cycle("cycle-two".to_owned())
+            .expect("begin second cycle");
+        persistence
+            .append_cycle_sample(&numbered_cycle_sample("cycle-two", 0))
+            .expect("append second cycle sample");
+        assert!(persistence.cycle_path("cycle-one").is_file());
+        assert!(persistence.cycle_path("cycle-two").is_file());
+        assert_eq!(
+            read_export(
+                persistence
+                    .cycle_export(Some("cycle-one"))
+                    .expect("export old cycle")
+            )
+            .lines()
+            .count(),
+            3
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn cycle_presentation_is_bounded_without_truncating_raw_csv() {
+        let directory = temporary_directory("cycle-presentation-bound");
+        let mut persistence = Persistence::new(&directory).expect("create persistence");
+        persistence
+            .begin_cycle("cycle-bounded".to_owned())
+            .expect("begin cycle");
+        let samples: Vec<_> = (0..100)
+            .map(|sequence| numbered_cycle_sample("cycle-bounded", sequence))
+            .collect();
+        for sample in &samples {
+            persistence
+                .append_cycle_sample(sample)
+                .expect("append cycle sample");
+        }
+        persistence
+            .flush_cycle_samples()
+            .expect("flush cycle samples");
+        assert!(cycle_presentation_history(&samples, 20).len() <= 20);
+        assert_eq!(
+            persistence
+                .load_cycle_samples("cycle-bounded")
+                .expect("load raw cycle samples")
+                .len(),
+            100
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn cycle_csv_rejects_non_increasing_sequences() {
+        let directory = temporary_directory("cycle-sequence-order");
+        let mut persistence = Persistence::new(&directory).expect("create persistence");
+        persistence
+            .begin_cycle("cycle-sequences".to_owned())
+            .expect("begin cycle");
+        persistence
+            .append_cycle_sample(&numbered_cycle_sample("cycle-sequences", 1))
+            .expect("append first sample");
+        persistence
+            .append_cycle_sample(&numbered_cycle_sample("cycle-sequences", 1))
+            .expect("append duplicate sample");
+        persistence
+            .flush_cycle_samples()
+            .expect("flush cycle samples");
+
+        assert_eq!(
+            persistence.load_cycle_samples("cycle-sequences"),
+            Err("cycle telemetry sequence is not strictly increasing".to_owned())
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn live_export_is_a_durable_prefix_and_does_not_hold_actor() {
         let (actor, directory) = mock_actor("streaming-export");
         let (actor_tx, actor_rx) = std_mpsc::channel();
@@ -3304,6 +3850,16 @@ mod tests {
 
             if run.is_multiple_of(2) {
                 assert_eq!(actor.cycle.status().state, CycleState::Resting);
+                actor.record_report(
+                    device::DeviceMode::DischargeConstantCurrent,
+                    3950 + run,
+                    0,
+                    base + 2,
+                    ReportState::Idle,
+                    "EBC-MOCK",
+                    None,
+                );
+                assert_eq!(actor.cycle.status().state, CycleState::Resting);
                 let action = actor
                     .cycle
                     .tick(Instant::now() + Duration::from_secs(1))
@@ -3340,6 +3896,130 @@ mod tests {
             })
             .collect();
         assert_eq!(contexts, BTreeSet::from([(0, 0), (0, 2), (1, 0), (1, 2)]));
+        assert!(
+            actor
+                .persistence
+                .run_summaries()
+                .iter()
+                .all(|summary| summary.sample_count == 1)
+        );
+
+        let execution_id = actor
+            .cycle
+            .status()
+            .execution_id
+            .clone()
+            .expect("execution id");
+        let history = actor.snapshot.cycle_history.clone();
+        assert_eq!(history.len(), 18);
+        assert_eq!(
+            history
+                .iter()
+                .map(|sample| sample.sequence)
+                .collect::<Vec<_>>(),
+            (0..18).collect::<Vec<_>>()
+        );
+        assert!(
+            history.windows(2).all(|samples| {
+                samples[1].elapsed_milliseconds >= samples[0].elapsed_milliseconds
+            })
+        );
+        assert!(history.iter().any(|sample| {
+            sample.cycle_state == CycleState::Resting
+                && sample.step_index == 1
+                && sample.voltage_mv >= 3950
+                && sample.current_ma == 0
+        }));
+        assert!(history.iter().any(|sample| {
+            sample.cycle_state == CycleState::Settling
+                && !sample.active
+                && sample.current_ma == 1000
+        }));
+        assert!(history.iter().any(|sample| {
+            sample.cycle_state == CycleState::Settling && !sample.active && sample.current_ma == 0
+        }));
+        let boundary = history
+            .iter()
+            .find(|sample| {
+                sample.repeat_index == 0
+                    && sample.step_index == 2
+                    && sample.cycle_state == CycleState::Settling
+                    && sample.current_ma == 0
+            })
+            .expect("repeat boundary sample");
+        let next = history
+            .iter()
+            .find(|sample| sample.sequence == boundary.sequence + 1)
+            .expect("next repeat sample");
+        assert_eq!((next.repeat_index, next.step_index), (1, 0));
+        assert_eq!(next.cycle_state, CycleState::StartingStep);
+        let exported = read_export(
+            actor
+                .persistence
+                .cycle_export(None)
+                .expect("export complete cycle"),
+        );
+        assert_eq!(exported.lines().count(), 19);
+        assert!(actor.persistence.cycle_path(&execution_id).is_file());
+
+        actor.shutdown().expect("flush cycle telemetry");
+        drop(actor);
+        let (snapshot_tx, _) = broadcast::channel(4);
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/null".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        let mut restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
+        assert_eq!(restarted.cycle.status().state, CycleState::Completed);
+        assert_eq!(restarted.snapshot.cycle_history, history);
+        confirm_inactive(&mut restarted);
+        restarted
+            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .expect("start later cycle");
+        assert!(restarted.persistence.cycle_path(&execution_id).is_file());
+        assert_eq!(
+            fs::read_dir(directory.join("cycles"))
+                .expect("read cycles directory")
+                .count(),
+            2
+        );
+        drop(restarted);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn firmware_reports_do_not_create_cycle_samples() {
+        let (mut actor, directory) = mock_actor("cycle-firmware-filter");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .expect("start cycle");
+
+        actor.record_report_with_source(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            false,
+            "EBC-MOCK",
+            Some("3.0.2".to_owned()),
+        );
+        assert!(actor.snapshot.cycle_history.is_empty());
+        actor.record_report_with_source(
+            device::DeviceMode::DischargeConstantCurrent,
+            3990,
+            1000,
+            2,
+            ReportState::Active,
+            true,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.snapshot.cycle_history.len(), 1);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -3543,6 +4223,12 @@ mod tests {
             restarted.controller.test().state,
             TestState::RecoveredUncertain
         );
+        assert_eq!(restarted.snapshot.cycle_history.len(), 1);
+        assert_eq!(
+            restarted.snapshot.cycle_history[0].execution_id,
+            execution_id
+        );
+        assert!(restarted.persistence.cycle_path(&execution_id).is_file());
         assert!(restarted.sent_frames.is_empty());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
@@ -3550,10 +4236,8 @@ mod tests {
     #[test]
     fn mutation_header_and_origin_policy_is_strict() {
         let (actor_tx, _actor_rx) = std_mpsc::channel();
-        let (snapshot_tx, _) = broadcast::channel(1);
         let mut state = AppState {
             actor_tx,
-            snapshot_tx,
             allowed_origin: None,
         };
         let mut headers = HeaderMap::new();

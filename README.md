@@ -133,6 +133,12 @@ UTC start timestamps with collision suffixes. `GET /api/runs` lists archived
 runs and `GET /api/runs/<run-id>.csv` downloads one archive. Current history
 remains available from `GET /api/history.csv`.
 
+Cycle executions also retain an independent continuous telemetry stream under
+`/data/cycles/<execution-id>.csv`. It includes normal mode reports from device
+steps, settling, rests, and repeat boundaries without changing the per-run
+sample files or metrics. `GET /api/cycle/history.csv` exports the latest cycle,
+and `GET /api/cycles/<execution-id>/history.csv` exports a specific execution.
+
 The durable CSV retains the complete current run. Initial browser snapshots
 are limited to 5000 presentation samples, and the browser remains bounded to
 5000 points for the lifetime of the page. Incremental deterministic compaction
@@ -317,10 +323,13 @@ All endpoints are under `/api`:
 | `GET` | `/api/history.csv` | Measurement history as CSV |
 | `GET` | `/api/runs` | Archived run summaries |
 | `GET` | `/api/runs/{id}.csv` | Archived run CSV download |
-| `GET` | `/api/ws` | Snapshot/sample WebSocket stream |
+| `GET` | `/api/cycle/history.csv` | Current/latest full-resolution cycle telemetry |
+| `GET` | `/api/cycles/{id}/history.csv` | Cycle telemetry by execution ID |
+| `GET` | `/api/ws` | Snapshot/sample/cycle-sample WebSocket stream |
 | `POST` | `/api/connect`, `/api/disconnect` | Serial connection control |
 | `POST` | `/api/test/start`, `/api/test/adjust` | JSON test configuration |
 | `POST` | `/api/test/stop`, `/api/test/resume` | Test lifecycle |
+| `POST` | `/api/cycle/start`, `/api/cycle/stop` | Cycle lifecycle |
 | `POST` | `/api/calibration` | JSON calibration command |
 
 Every mutating `POST` requires `X-EBC-Command: 1`; the remote UI sends it and API
@@ -339,9 +348,9 @@ directly to the internet.
 ## Current limitations
 
 - One device per process.
-- No cycle-program configuration, internal-resistance test, plot image export,
-  imported CSV/`.dat` replay, firmware update, or support guarantee for models
-  other than EBC-A20.
+- No software capacity/percentage completion targets, nested cycle repeats,
+  internal-resistance test, plot image export, imported CSV/`.dat` replay,
+  firmware update, or support guarantee for models other than EBC-A20.
 - Server recovery is conservative and does not automatically restart a test.
 
 ## Protocol and firmware research

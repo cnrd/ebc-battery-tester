@@ -24,6 +24,7 @@ pub(crate) fn publish_websocket(event: WebSocketEvent, event_tx: &BackendEventSe
         WebSocketEvent::Snapshot(snapshot) => event_tx.send(BackendEvent::Snapshot(snapshot)),
         WebSocketEvent::Update(update) => publish_update(update, event_tx),
         WebSocketEvent::Sample(sample) => event_tx.send(BackendEvent::Sample(sample)),
+        WebSocketEvent::CycleSample(sample) => event_tx.send(BackendEvent::CycleSample(sample)),
     }
 }
 

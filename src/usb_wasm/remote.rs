@@ -74,8 +74,8 @@ pub(super) async fn remote_task(
                                 let _closed = writer.close().await;
                                 return;
                             }
-                            if let BackendCommand::StartCycle(ref recipe) = command {
-                                publish_cycle_result(send_start_cycle(&recipe).await, &event_tx);
+                            if let BackendCommand::StartCycle(recipe) = &command {
+                                publish_cycle_result(send_start_cycle(recipe).await, &event_tx);
                                 continue;
                             }
                             if matches!(command, BackendCommand::StopCycle) {

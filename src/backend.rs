@@ -5,7 +5,8 @@ use std::sync::Arc;
 use futures::channel::mpsc::UnboundedSender;
 
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CycleRecipe, Sample, SnapshotUpdate, TestConfiguration,
+    ApiCommand, AuthoritativeSnapshot, CycleRecipe, CycleSample, Sample, SnapshotUpdate,
+    TestConfiguration,
 };
 use crate::device::UsbDeviceInfo;
 
@@ -63,6 +64,7 @@ pub(crate) enum BackendEvent {
     Snapshot(AuthoritativeSnapshot),
     Update(BackendState),
     Sample(Sample),
+    CycleSample(CycleSample),
     CommandSucceeded,
     CommandError(String),
     Diagnostic(DiagnosticEvent),

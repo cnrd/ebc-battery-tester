@@ -24,6 +24,7 @@ struct RestClock {
 #[derive(Clone, Debug)]
 pub struct CycleEngine {
     status: CycleStatus,
+    cycle_started: Option<Instant>,
     pending_action: Option<CycleAction>,
     rest_clock: Option<RestClock>,
     start_committed: bool,
@@ -41,6 +42,7 @@ impl CycleEngine {
     pub fn new() -> Self {
         Self {
             status: CycleStatus::default(),
+            cycle_started: None,
             pending_action: None,
             rest_clock: None,
             start_committed: false,
@@ -59,6 +61,7 @@ impl CycleEngine {
         }
         Self {
             status,
+            cycle_started: None,
             pending_action: None,
             rest_clock: None,
             start_committed: false,
@@ -97,6 +100,13 @@ impl CycleEngine {
         self.is_executing()
     }
 
+    #[must_use]
+    pub fn elapsed(&self, now: Instant) -> Duration {
+        self.cycle_started.map_or(Duration::ZERO, |started| {
+            now.saturating_duration_since(started)
+        })
+    }
+
     /// Starts a validated recipe. A first device step produces a semantic
     /// action; a first rest step starts its monotonic timer without an action.
     ///
@@ -127,6 +137,7 @@ impl CycleEngine {
             result: None,
             rest_remaining_seconds: None,
         };
+        self.cycle_started = Some(now);
         self.pending_action = None;
         self.rest_clock = None;
         self.start_committed = false;
@@ -551,6 +562,62 @@ mod tests {
         assert_eq!(engine.status().state, CycleState::Settling);
         engine.on_physical_state(now, &settled_device(), &status(TestState::Completed), true);
         assert_eq!(engine.status().state, CycleState::Completed);
+    }
+
+    #[test]
+    fn cycle_elapsed_uses_one_monotonic_clock_across_steps_and_repeats() {
+        let now = Instant::now();
+        let mut engine = CycleEngine::new();
+        let action = start(
+            &mut engine,
+            recipe(
+                vec![
+                    device_step(100),
+                    CycleStep::Rest {
+                        duration_seconds: 2,
+                    },
+                ],
+                2,
+            ),
+            now,
+        );
+        engine.on_action_committed(
+            action.as_ref().expect("start action"),
+            &status(TestState::Running),
+        );
+
+        assert_eq!(engine.elapsed(now), Duration::ZERO);
+        assert_eq!(
+            engine
+                .elapsed(now + Duration::from_millis(1500))
+                .as_millis(),
+            1500
+        );
+        engine.on_physical_state(
+            now + Duration::from_secs(2),
+            &settled_device(),
+            &status(TestState::Completed),
+            true,
+        );
+        engine.on_physical_state(
+            now + Duration::from_secs(3),
+            &settled_device(),
+            &status(TestState::Completed),
+            true,
+        );
+        assert_eq!(engine.status().state, CycleState::Resting);
+        assert_eq!(engine.elapsed(now + Duration::from_secs(4)).as_secs(), 4);
+
+        engine.status.state = CycleState::Stopped;
+        start(
+            &mut engine,
+            recipe(vec![device_step(200)], 1),
+            now + Duration::from_secs(10),
+        );
+        assert_eq!(
+            engine.elapsed(now + Duration::from_secs(10)),
+            Duration::ZERO
+        );
     }
 
     #[test]

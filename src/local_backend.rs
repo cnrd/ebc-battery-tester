@@ -5,12 +5,25 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CycleRecipe, CycleState, Sample, ServerConnectionState,
-    SnapshotUpdate, TestConfiguration,
+    ApiCommand, AuthoritativeSnapshot, CycleRecipe, CycleSample, CycleState, Sample,
+    ServerConnectionState, SnapshotUpdate, TestConfiguration, cycle_presentation_history,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OutboundFrame};
 use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn timestamp_utc() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn timestamp_utc() -> String {
+    js_sys::Date::new_0()
+        .to_iso_string()
+        .as_string()
+        .unwrap_or_default()
+}
 
 #[derive(Default)]
 pub(crate) struct LocalOutput {
@@ -50,6 +63,8 @@ pub(crate) struct LocalBackend {
     last_published_elapsed: u64,
     shutdown_started: bool,
     next_cycle_execution_id: u64,
+    next_cycle_sequence: u64,
+    cycle_history: Vec<CycleSample>,
 }
 
 impl Default for LocalBackend {
@@ -63,6 +78,8 @@ impl Default for LocalBackend {
             last_published_elapsed: 0,
             shutdown_started: false,
             next_cycle_execution_id: 1,
+            next_cycle_sequence: 0,
+            cycle_history: Vec::new(),
         }
     }
 }
@@ -190,6 +207,8 @@ impl LocalBackend {
             Ok(action) => action,
             Err(error) => return Self::command_error(error.to_string()),
         };
+        self.next_cycle_sequence = 0;
+        self.cycle_history.clear();
         if let Some(action) = action {
             self.prepare_cycle_action(action, true)
         } else {
@@ -406,15 +425,55 @@ impl LocalBackend {
     }
 
     fn report(&mut self, report: DeviceReport, sample_report: bool) -> LocalOutput {
+        let now = Instant::now();
+        let mode = report.mode;
+        let voltage_mv = report.voltage_mv;
+        let current_ma = report.current_ma;
+        let device_capacity_mah = report.capacity_mah;
         let (_, measurement) = self.controller.report(report);
+        let cycle_sample = if sample_report && self.cycle.is_executing() {
+            let status = self.cycle.status();
+            status.execution_id.clone().map(|execution_id| CycleSample {
+                execution_id,
+                sequence: self.next_cycle_sequence,
+                timestamp_utc: timestamp_utc(),
+                elapsed_milliseconds: u64::try_from(self.cycle.elapsed(now).as_millis())
+                    .unwrap_or(u64::MAX),
+                repeat_index: status.repeat_index,
+                step_index: status.step_index,
+                cycle_state: status.state,
+                test_state: self.controller.test().state.clone(),
+                mode,
+                activity_known: self.controller.device().activity_known,
+                active: self.controller.device().active,
+                voltage_mv,
+                current_ma,
+                device_capacity_mah,
+                test_capacity_mah: self.controller.test().capacity_mah,
+                test_energy_wh: self.controller.test().energy_wh,
+            })
+        } else {
+            None
+        };
+        if let Some(sample) = &cycle_sample {
+            self.cycle_history.push(sample.clone());
+            if self.cycle_history.len() > 5_000 {
+                self.cycle_history = cycle_presentation_history(&self.cycle_history, 4_000);
+            }
+            self.next_cycle_sequence = self.next_cycle_sequence.saturating_add(1);
+        }
+        let mut output = LocalOutput::default();
+        if let Some(sample) = cycle_sample {
+            output.events.push(BackendEvent::CycleSample(sample));
+        }
         let cycle_action = self.cycle.on_physical_state(
-            Instant::now(),
+            now,
             self.controller.device(),
             self.controller.test(),
             true,
         );
         self.last_published_elapsed = self.controller.test().elapsed_seconds;
-        let mut output = self.state_output();
+        output.extend(self.state_output());
         if sample_report && let Some(measurement) = measurement {
             output.events.push(BackendEvent::Sample(Sample {
                 run_id: String::new(),
@@ -476,6 +535,7 @@ impl LocalBackend {
             cycle: state.update.cycle,
             capabilities: state.update.capabilities,
             history: Vec::new(),
+            cycle_history: self.cycle_history.clone(),
         }
     }
 
@@ -582,6 +642,23 @@ mod tests {
             } else {
                 0
             },
+            capacity_mah,
+            model: "EBC-A20".to_owned(),
+            firmware_version: None,
+        }
+    }
+
+    fn observed_report(
+        state: ReportState,
+        voltage_mv: u16,
+        current_ma: u16,
+        capacity_mah: u16,
+    ) -> DeviceReport {
+        DeviceReport {
+            mode: DeviceMode::DischargeConstantCurrent,
+            state,
+            voltage_mv,
+            current_ma,
             capacity_mah,
             model: "EBC-A20".to_owned(),
             firmware_version: None,
@@ -937,6 +1014,130 @@ mod tests {
             Some(BackendEvent::Snapshot(snapshot))
                 if snapshot.cycle.step_index == 1 && snapshot.test.elapsed_seconds == 0
         ));
+    }
+
+    #[test]
+    fn cycle_samples_span_settling_rest_and_the_next_physical_run() {
+        let mut backend = connected_backend();
+        let first = backend.start_cycle(recipe(vec![
+            device_step(1000),
+            CycleStep::Rest {
+                duration_seconds: 1,
+            },
+            device_step(1500),
+        ]));
+        finish_success(&mut backend, &first);
+
+        backend.report(observed_report(ReportState::Active, 4000, 1000, 1), true);
+        backend.report(observed_report(ReportState::Active, 3990, 1000, 2), true);
+        backend.report(observed_report(ReportState::Finished, 3940, 1000, 3), true);
+        backend.report(observed_report(ReportState::Idle, 3950, 1000, 3), true);
+        let zero = backend.report(observed_report(ReportState::Idle, 3970, 0, 3), true);
+        assert!(matches!(
+            zero.events.as_slice(),
+            [BackendEvent::CycleSample(_), BackendEvent::Update(_)]
+        ));
+        assert_eq!(state(&zero).update.cycle.state, CycleState::Resting);
+        let rest = backend.report(observed_report(ReportState::Idle, 3980, 0, 3), true);
+        assert!(rest.events.iter().any(|event| matches!(
+            event,
+            BackendEvent::CycleSample(sample)
+                if sample.cycle_state == CycleState::Resting
+                    && sample.step_index == 1
+                    && sample.voltage_mv == 3980
+                    && sample.current_ma == 0
+        )));
+        assert!(
+            !rest
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::Sample(_)))
+        );
+
+        let before_firmware = backend.cycle_history.len();
+        backend.report(
+            observed_report(ReportState::InactiveUnknown, 3980, 0, 3),
+            false,
+        );
+        assert_eq!(backend.cycle_history.len(), before_firmware);
+
+        let action = backend
+            .cycle
+            .tick(Instant::now() + std::time::Duration::from_secs(2))
+            .expect("rest advances");
+        let second = backend.prepare_cycle_action(action, false);
+        finish_success(&mut backend, &second);
+        backend.report(observed_report(ReportState::Active, 3980, 1500, 1), true);
+
+        assert_eq!(
+            backend
+                .cycle_history
+                .iter()
+                .map(|sample| sample.sequence)
+                .collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            &backend.cycle_history[2],
+            CycleSample {
+                cycle_state: CycleState::RunningStep,
+                test_state: TestState::Completed,
+                current_ma: 1000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &backend.cycle_history[3],
+            CycleSample {
+                cycle_state: CycleState::Settling,
+                active: false,
+                current_ma: 1000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &backend.cycle_history[4],
+            CycleSample {
+                cycle_state: CycleState::Settling,
+                active: false,
+                current_ma: 0,
+                step_index: 0,
+                ..
+            }
+        ));
+        assert_eq!(backend.cycle_history[6].step_index, 2);
+        assert_eq!(backend.next_sequence, 1);
+    }
+
+    #[test]
+    fn repeat_boundary_report_keeps_the_previous_cycle_context() {
+        let mut backend = connected_backend();
+        let first = backend.start_cycle(CycleRecipe {
+            steps: vec![device_step(1000)],
+            repeat_count: 2,
+        });
+        finish_success(&mut backend, &first);
+        backend.report(observed_report(ReportState::Active, 4000, 1000, 1), true);
+        backend.report(observed_report(ReportState::Finished, 3940, 1000, 2), true);
+        backend.report(observed_report(ReportState::Idle, 3960, 1000, 2), true);
+        let boundary = backend.report(observed_report(ReportState::Idle, 3980, 0, 2), true);
+        assert!(matches!(
+            send_frames(&boundary).as_slice(),
+            [OutboundFrame::StartConstantCurrentDischarge(1000, 3000, 0)]
+        ));
+        let boundary_sample = backend.cycle_history.last().expect("boundary sample");
+        assert_eq!(boundary_sample.repeat_index, 0);
+        assert_eq!(boundary_sample.step_index, 0);
+        assert_eq!(boundary_sample.cycle_state, CycleState::Settling);
+        assert_eq!(boundary_sample.current_ma, 0);
+        let boundary_sequence = boundary_sample.sequence;
+
+        finish_success(&mut backend, &boundary);
+        backend.report(observed_report(ReportState::Active, 3980, 1000, 1), true);
+        let next = backend.cycle_history.last().expect("next repeat sample");
+        assert_eq!(next.repeat_index, 1);
+        assert_eq!(next.step_index, 0);
+        assert_eq!(next.sequence, boundary_sequence + 1);
     }
 
     #[test]

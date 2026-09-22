@@ -7,8 +7,9 @@ use crate::backend_client::BackendClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend_client::BackendTarget;
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Capabilities, CycleRecipe, CycleState, CycleStatus, Sample,
-    ServerConnectionState, TestConfiguration, TestState,
+    ApiCommand, AuthoritativeSnapshot, Capabilities, CycleRecipe, CycleSample, CycleState,
+    CycleStatus, Sample, ServerConnectionState, TestConfiguration, TestState,
+    cycle_presentation_history,
 };
 use crate::device::{self, ConnectionStatus};
 use crate::export::{LogDirection, LogEntry};
@@ -114,6 +115,7 @@ pub(crate) struct DeviceSession {
     pub(crate) live_milli_ampere_hours: u64,
     pub(crate) live_energy_wh: f64,
     pub(crate) samples: Vec<Sample>,
+    pub(crate) cycle_samples: Vec<CycleSample>,
     pub(crate) current_device_mode: Option<device::DeviceMode>,
     pub(crate) activity_known: bool,
     pub(crate) mode_on: bool,
@@ -126,6 +128,8 @@ pub(crate) struct DeviceSession {
     elapsed_seconds: u64,
     remote_run_id: Option<String>,
     last_remote_sequence: Option<u64>,
+    cycle_execution_id: Option<String>,
+    last_cycle_sequence: Option<u64>,
 }
 
 impl Default for DeviceSession {
@@ -143,6 +147,7 @@ impl Default for DeviceSession {
             live_milli_ampere_hours: 0,
             live_energy_wh: 0.0,
             samples: Vec::new(),
+            cycle_samples: Vec::new(),
             current_device_mode: None,
             activity_known: false,
             mode_on: false,
@@ -155,6 +160,8 @@ impl Default for DeviceSession {
             elapsed_seconds: 0,
             remote_run_id: None,
             last_remote_sequence: None,
+            cycle_execution_id: None,
+            last_cycle_sequence: None,
         }
     }
 }
@@ -341,6 +348,26 @@ impl DeviceSession {
         compact_samples(&mut history, MAX_PRESENTATION_SAMPLES);
         self.last_remote_sequence = history.last().map(|sample| sample.sequence);
         self.samples = history;
+        let mut cycle_history = snapshot.cycle_history;
+        let cycle_execution_id = snapshot.cycle.execution_id.clone().or_else(|| {
+            cycle_history
+                .last()
+                .map(|sample| sample.execution_id.clone())
+        });
+        let mut last_sequence = None;
+        cycle_history.retain(|sample| {
+            if cycle_execution_id.as_deref() != Some(sample.execution_id.as_str())
+                || last_sequence.is_some_and(|sequence| sample.sequence <= sequence)
+            {
+                return false;
+            }
+            last_sequence = Some(sample.sequence);
+            true
+        });
+        cycle_history = cycle_presentation_history(&cycle_history, MAX_PRESENTATION_SAMPLES);
+        self.cycle_execution_id = cycle_execution_id;
+        self.last_cycle_sequence = cycle_history.last().map(|sample| sample.sequence);
+        self.cycle_samples = cycle_history;
         self.command_error = None;
     }
 
@@ -371,6 +398,13 @@ impl DeviceSession {
         self.activity_known = update.device.activity_known;
         self.mode_on = update.device.active;
         self.test_state = update.test.state;
+        if let Some(execution_id) = &update.cycle.execution_id
+            && self.cycle_execution_id.as_deref() != Some(execution_id)
+        {
+            self.cycle_samples.clear();
+            self.last_cycle_sequence = None;
+            self.cycle_execution_id = Some(execution_id.clone());
+        }
         self.cycle = update.cycle;
         self.elapsed_seconds = update.test.elapsed_seconds;
     }
@@ -400,6 +434,34 @@ impl DeviceSession {
         }
     }
 
+    fn apply_cycle_sample(&mut self, sample: CycleSample) {
+        if self
+            .cycle
+            .execution_id
+            .as_deref()
+            .is_some_and(|execution_id| execution_id != sample.execution_id)
+        {
+            return;
+        }
+        if self.cycle_execution_id.as_deref() != Some(sample.execution_id.as_str()) {
+            self.cycle_samples.clear();
+            self.last_cycle_sequence = None;
+            self.cycle_execution_id = Some(sample.execution_id.clone());
+        }
+        if self
+            .last_cycle_sequence
+            .is_some_and(|sequence| sample.sequence <= sequence)
+        {
+            return;
+        }
+        self.last_cycle_sequence = Some(sample.sequence);
+        self.cycle_samples.push(sample);
+        if self.cycle_samples.len() > MAX_PRESENTATION_SAMPLES {
+            self.cycle_samples =
+                cycle_presentation_history(&self.cycle_samples, COMPACTED_PRESENTATION_SAMPLES);
+        }
+    }
+
     pub(crate) fn consume_events(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.backend.try_event() {
             match event {
@@ -418,6 +480,7 @@ impl DeviceSession {
                 BackendEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
                 BackendEvent::Update(state) => self.apply_state(state),
                 BackendEvent::Sample(sample) => self.apply_sample(sample),
+                BackendEvent::CycleSample(sample) => self.apply_cycle_sample(sample),
                 BackendEvent::CommandSucceeded => self.command_error = None,
                 BackendEvent::CommandError(error) => self.command_error = Some(error),
                 BackendEvent::Diagnostic(event) => self.log_entries.push(LogEntry {
@@ -437,7 +500,7 @@ impl DeviceSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DeviceState, TestStatus};
+    use crate::core::{DeviceState, SnapshotUpdate, TestStatus};
 
     #[test]
     fn semantic_snapshot_reconstructs_view_state() {
@@ -512,6 +575,73 @@ mod tests {
     }
 
     #[test]
+    fn cycle_history_reconnects_deduplicates_and_resets_only_for_a_new_execution() {
+        let mut session = DeviceSession::default();
+        let first = cycle_sample("cycle-1", 0, 0, 0);
+        let second = cycle_sample("cycle-1", 1, 0, 2);
+        session.apply_snapshot(AuthoritativeSnapshot {
+            cycle: CycleStatus {
+                execution_id: Some("cycle-1".to_owned()),
+                state: CycleState::RunningStep,
+                ..CycleStatus::default()
+            },
+            cycle_history: vec![first.clone(), second.clone()],
+            ..AuthoritativeSnapshot::default()
+        });
+        assert_eq!(session.cycle_samples, vec![first.clone(), second.clone()]);
+
+        session.apply_cycle_sample(second);
+        session.apply_cycle_sample(cycle_sample("cycle-1", 2, 1, 0));
+        session.apply_sample(sample("new-physical-run", 0, 0));
+        assert_eq!(session.cycle_samples.len(), 3);
+
+        session.apply_state(BackendState {
+            update: SnapshotUpdate {
+                cycle: CycleStatus {
+                    execution_id: Some("cycle-2".to_owned()),
+                    state: CycleState::StartingStep,
+                    ..CycleStatus::default()
+                },
+                ..SnapshotUpdate::default()
+            },
+        });
+        assert!(session.cycle_samples.is_empty());
+        session.apply_cycle_sample(cycle_sample("cycle-1", 3, 1, 1));
+        assert!(session.cycle_samples.is_empty());
+        session.apply_cycle_sample(cycle_sample("cycle-2", 0, 0, 0));
+        assert_eq!(session.cycle_samples.len(), 1);
+    }
+
+    #[test]
+    fn cycle_snapshot_rejects_other_executions_and_non_increasing_sequences() {
+        let mut session = DeviceSession::default();
+        session.apply_snapshot(AuthoritativeSnapshot {
+            cycle: CycleStatus {
+                execution_id: Some("cycle-2".to_owned()),
+                state: CycleState::RunningStep,
+                ..CycleStatus::default()
+            },
+            cycle_history: vec![
+                cycle_sample("cycle-1", 8, 0, 0),
+                cycle_sample("cycle-2", 0, 0, 0),
+                cycle_sample("cycle-2", 0, 0, 0),
+                cycle_sample("cycle-2", 2, 0, 0),
+                cycle_sample("cycle-2", 1, 0, 0),
+            ],
+            ..AuthoritativeSnapshot::default()
+        });
+
+        assert_eq!(
+            session
+                .cycle_samples
+                .iter()
+                .map(|sample| sample.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
     fn incremental_history_stays_bounded_and_preserves_extrema() {
         let mut session = DeviceSession::default();
         for sequence in 0..20_000 {
@@ -567,6 +697,32 @@ mod tests {
             capacity_mah: 5,
             energy_wh: 0.005,
             mode: device::DeviceMode::DischargeConstantCurrent,
+        }
+    }
+
+    fn cycle_sample(
+        execution_id: &str,
+        sequence: u64,
+        repeat_index: u32,
+        step_index: usize,
+    ) -> CycleSample {
+        CycleSample {
+            execution_id: execution_id.to_owned(),
+            sequence,
+            timestamp_utc: String::new(),
+            elapsed_milliseconds: sequence * 250,
+            repeat_index,
+            step_index,
+            cycle_state: CycleState::RunningStep,
+            test_state: TestState::Running,
+            mode: device::DeviceMode::DischargeConstantCurrent,
+            activity_known: true,
+            active: true,
+            voltage_mv: 3900,
+            current_ma: 1000,
+            device_capacity_mah: 5,
+            test_capacity_mah: Some(5),
+            test_energy_wh: 0.005,
         }
     }
 }

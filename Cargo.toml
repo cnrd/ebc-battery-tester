@@ -14,6 +14,7 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 [features]
 default = ["gui"]
 gui = [
+    "dep:chrono",
     "dep:eframe",
     "dep:egui",
     "dep:egui_plot",

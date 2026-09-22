@@ -1,5 +1,7 @@
 //! GUI-independent data and API types shared by clients and the server.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::device::{
@@ -22,6 +24,79 @@ pub struct Sample {
     #[serde(default)]
     pub energy_wh: f64,
     pub mode: DeviceMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CycleSample {
+    pub execution_id: String,
+    pub sequence: u64,
+    pub timestamp_utc: String,
+    pub elapsed_milliseconds: u64,
+    pub repeat_index: u32,
+    pub step_index: usize,
+    pub cycle_state: CycleState,
+    pub test_state: TestState,
+    pub mode: DeviceMode,
+    pub activity_known: bool,
+    pub active: bool,
+    pub voltage_mv: u16,
+    pub current_ma: u16,
+    pub device_capacity_mah: u16,
+    pub test_capacity_mah: Option<u64>,
+    pub test_energy_wh: f64,
+}
+
+pub(crate) fn cycle_presentation_history(
+    samples: &[CycleSample],
+    limit: usize,
+) -> Vec<CycleSample> {
+    if samples.len() <= limit {
+        return samples.to_vec();
+    }
+    if limit < 2 {
+        return samples.last().cloned().into_iter().collect();
+    }
+    let bucket_count = (limit - 2) / 4;
+    if bucket_count == 0 {
+        return vec![samples[0].clone(), samples[samples.len() - 1].clone()];
+    }
+    let interior_len = samples.len() - 2;
+    let mut selected = BTreeSet::from([0, samples.len() - 1]);
+    for bucket in 0..bucket_count {
+        let start = 1 + interior_len * bucket / bucket_count;
+        let end = 1 + interior_len * (bucket + 1) / bucket_count;
+        if start >= end {
+            continue;
+        }
+        let indices = start..end;
+        selected.insert(
+            indices
+                .clone()
+                .min_by_key(|index| samples[*index].voltage_mv)
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .clone()
+                .max_by_key(|index| samples[*index].voltage_mv)
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .clone()
+                .min_by_key(|index| samples[*index].current_ma)
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .max_by_key(|index| samples[*index].current_ma)
+                .unwrap_or(start),
+        );
+    }
+    selected
+        .into_iter()
+        .map(|index| samples[index].clone())
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +178,8 @@ pub struct AuthoritativeSnapshot {
     #[serde(default)]
     pub capabilities: Capabilities,
     pub history: Vec<Sample>,
+    #[serde(default)]
+    pub cycle_history: Vec<CycleSample>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -136,6 +213,7 @@ pub enum WebSocketEvent {
     Snapshot(AuthoritativeSnapshot),
     Update(SnapshotUpdate),
     Sample(Sample),
+    CycleSample(CycleSample),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -551,6 +629,44 @@ mod tests {
             serde_json::from_value(value).expect("deserialize legacy update");
 
         assert_eq!(update.cycle, CycleStatus::default());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn missing_cycle_history_defaults_empty_and_cycle_sample_round_trips() {
+        let mut value =
+            serde_json::to_value(AuthoritativeSnapshot::default()).expect("serialize snapshot");
+        value
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("cycle_history");
+        let snapshot: AuthoritativeSnapshot =
+            serde_json::from_value(value).expect("deserialize legacy snapshot");
+        assert!(snapshot.cycle_history.is_empty());
+
+        let sample = CycleSample {
+            execution_id: "cycle-1".to_owned(),
+            sequence: 7,
+            timestamp_utc: "2026-01-01T00:00:00Z".to_owned(),
+            elapsed_milliseconds: 1234,
+            repeat_index: 1,
+            step_index: 2,
+            cycle_state: CycleState::Settling,
+            test_state: TestState::Completed,
+            mode: DeviceMode::ChargeConstantVoltage,
+            activity_known: true,
+            active: false,
+            voltage_mv: 4020,
+            current_ma: 450,
+            device_capacity_mah: 4,
+            test_capacity_mah: Some(4),
+            test_energy_wh: 0.014,
+        };
+        let json = serde_json::to_string(&sample).expect("serialize cycle sample");
+        assert_eq!(
+            serde_json::from_str::<CycleSample>(&json).expect("deserialize cycle sample"),
+            sample
+        );
     }
 
     #[cfg(feature = "server")]
