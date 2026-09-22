@@ -2,7 +2,7 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
     DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, CycleRecipe, WebSocketEvent};
+use crate::core::{ApiCommand, AuthoritativeSnapshot, WebSocketEvent};
 use crate::remote_backend::{
     COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, command_endpoint,
     publish_websocket,
@@ -74,13 +74,43 @@ pub(super) async fn remote_task(
                                 let _closed = writer.close().await;
                                 return;
                             }
-                            if let BackendCommand::StartCycle(recipe) = &command {
-                                publish_cycle_result(send_start_cycle(recipe).await, &event_tx);
-                                continue;
-                            }
-                            if matches!(command, BackendCommand::StopCycle) {
-                                publish_cycle_result(send_stop_cycle().await, &event_tx);
-                                continue;
+                            match &command {
+                                BackendCommand::StartTest(request) => {
+                                    publish_cycle_result(
+                                        send_json("/api/test/start", request).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::StartCycle(request) => {
+                                    publish_cycle_result(
+                                        send_json("/api/cycle/start", request).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::RenameRun { run_id, request } => {
+                                    publish_cycle_result(
+                                        send_json(&format!("/api/runs/{run_id}/name"), request).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::RenameCycle { execution_id, request } => {
+                                    publish_cycle_result(
+                                        send_json(
+                                            &format!("/api/cycles/{execution_id}/name"),
+                                            request,
+                                        ).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::StopCycle => {
+                                    publish_cycle_result(send_stop_cycle().await, &event_tx);
+                                    continue;
+                                }
+                                _ => {}
                             }
                             for command in remote_api_commands(command) {
                                 event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
@@ -143,10 +173,13 @@ fn publish_cycle_result(
     }
 }
 
-async fn send_start_cycle(recipe: &CycleRecipe) -> Result<AuthoritativeSnapshot, String> {
-    let response = Request::post("/api/cycle/start")
+async fn send_json<T: serde::Serialize>(
+    endpoint: &str,
+    body: &T,
+) -> Result<AuthoritativeSnapshot, String> {
+    let response = Request::post(endpoint)
         .header(COMMAND_HEADER, "1")
-        .json(recipe)
+        .json(body)
         .map_err(|error| error.to_string())?
         .send()
         .await
@@ -192,23 +225,20 @@ fn websocket_url() -> Result<String, String> {
 }
 
 async fn send_command(command: ApiCommand) -> Result<AuthoritativeSnapshot, String> {
+    if matches!(command, ApiCommand::Start(_)) {
+        return Err(
+            "ApiCommand::Start cannot be sent remotely; use BackendCommand::StartTest".to_owned(),
+        );
+    }
     let response = match command {
         ApiCommand::Connect | ApiCommand::Disconnect | ApiCommand::Stop | ApiCommand::Resume => {
-            Request::post(command_endpoint(command))
+            Request::post(command_endpoint(command)?)
                 .header(COMMAND_HEADER, "1")
-                .send()
-                .await
-        }
-        ApiCommand::Start(config) => {
-            Request::post(command_endpoint(command))
-                .header(COMMAND_HEADER, "1")
-                .json(&config)
-                .map_err(|error| error.to_string())?
                 .send()
                 .await
         }
         ApiCommand::Adjust(config) => {
-            Request::post(command_endpoint(command))
+            Request::post(command_endpoint(command)?)
                 .header(COMMAND_HEADER, "1")
                 .json(&config)
                 .map_err(|error| error.to_string())?
@@ -216,13 +246,14 @@ async fn send_command(command: ApiCommand) -> Result<AuthoritativeSnapshot, Stri
                 .await
         }
         ApiCommand::Calibration(calibration) => {
-            Request::post(command_endpoint(command))
+            Request::post(command_endpoint(command)?)
                 .header(COMMAND_HEADER, "1")
                 .json(&calibration)
                 .map_err(|error| error.to_string())?
                 .send()
                 .await
         }
+        ApiCommand::Start(_) => unreachable!("start was rejected above"),
     }
     .map_err(|error| error.to_string())?;
     if !response.ok() {

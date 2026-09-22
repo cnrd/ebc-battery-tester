@@ -10,6 +10,32 @@ use crate::device::{
     MIN_CHARGE_CUTOFF_CURRENT_MA, MIN_DISCHARGE_CURRENT_MA, MIN_POWER_W, MIN_VOLTAGE_MV,
 };
 
+pub const MAX_EXECUTION_NAME_CHARS: usize = 120;
+
+/// Trims and validates an optional user-facing execution name.
+///
+/// # Errors
+/// Returns an error when the name contains a control character or exceeds the
+/// maximum number of Unicode scalar values.
+pub fn normalize_execution_name(input: Option<&str>) -> Result<Option<String>, ValidationError> {
+    if input.is_some_and(|name| name.chars().any(char::is_control)) {
+        return Err(ValidationError {
+            field: "name".to_owned(),
+            message: "must not contain control characters".to_owned(),
+        });
+    }
+    let Some(name) = input.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    if name.chars().count() > MAX_EXECUTION_NAME_CHARS {
+        return Err(ValidationError {
+            field: "name".to_owned(),
+            message: format!("must be at most {MAX_EXECUTION_NAME_CHARS} characters"),
+        });
+    }
+    Ok(Some(name.to_owned()))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     #[serde(default)]
@@ -177,6 +203,8 @@ pub struct AuthoritativeSnapshot {
     pub cycle: CycleStatus,
     #[serde(default)]
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub current_run: CurrentRunMetadata,
     pub history: Vec<Sample>,
     #[serde(default)]
     pub cycle_history: Vec<CycleSample>,
@@ -192,6 +220,8 @@ pub struct SnapshotUpdate {
     pub cycle: CycleStatus,
     #[serde(default)]
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub current_run: CurrentRunMetadata,
 }
 
 impl From<&AuthoritativeSnapshot> for SnapshotUpdate {
@@ -203,8 +233,19 @@ impl From<&AuthoritativeSnapshot> for SnapshotUpdate {
             test: snapshot.test.clone(),
             cycle: snapshot.cycle.clone(),
             capabilities: snapshot.capabilities,
+            current_run: snapshot.current_run.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentRunMetadata {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub cycle: Option<CycleRunContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -219,6 +260,8 @@ pub enum WebSocketEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
     pub started_at_utc: Option<String>,
     pub archived_at_utc: String,
     pub state: TestState,
@@ -253,6 +296,13 @@ pub enum TestConfiguration {
         voltage_mv: u16,
         cutoff_current_ma: u16,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartTestRequest {
+    pub config: TestConfiguration,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl TestConfiguration {
@@ -324,6 +374,19 @@ impl TestConfiguration {
 pub struct CycleRecipe {
     pub steps: Vec<CycleStep>,
     pub repeat_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartCycleRequest {
+    pub recipe: CycleRecipe,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameRequest {
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl CycleRecipe {
@@ -409,6 +472,8 @@ pub struct CycleStatus {
     pub state: CycleState,
     pub recipe: Option<CycleRecipe>,
     pub execution_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     pub repeat_index: u32,
     pub step_index: usize,
     pub started_at_utc: Option<String>,
@@ -517,6 +582,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalizes_optional_execution_names() {
+        assert_eq!(normalize_execution_name(None), Ok(None));
+        assert_eq!(normalize_execution_name(Some("")), Ok(None));
+        assert_eq!(normalize_execution_name(Some("   ")), Ok(None));
+        assert_eq!(
+            normalize_execution_name(Some("  Cell α  ")),
+            Ok(Some("Cell α".to_owned()))
+        );
+
+        let maximum = "🪫".repeat(MAX_EXECUTION_NAME_CHARS);
+        assert_eq!(
+            normalize_execution_name(Some(&maximum)),
+            Ok(Some(maximum.clone()))
+        );
+        let too_long = "界".repeat(MAX_EXECUTION_NAME_CHARS + 1);
+        let error = normalize_execution_name(Some(&too_long)).expect_err("name is too long");
+        assert_eq!(error.field, "name");
+        assert!(error.message.contains("120"));
+    }
+
+    #[test]
+    fn rejects_control_characters_but_not_duplicate_names() {
+        for name in ["line\nbreak", "column\tbreak", "nul\0byte"] {
+            let error = normalize_execution_name(Some(name)).expect_err("control character");
+            assert_eq!(error.field, "name");
+            assert!(error.message.contains("control"));
+        }
+
+        assert_eq!(
+            normalize_execution_name(Some("Repeated")),
+            Ok(Some("Repeated".to_owned()))
+        );
+        assert_eq!(
+            normalize_execution_name(Some("Repeated")),
+            Ok(Some("Repeated".to_owned()))
+        );
+    }
+
+    #[test]
     fn validates_limits_and_protocol_resolution() {
         let valid = TestConfiguration::DischargeConstantCurrent {
             current_ma: MIN_DISCHARGE_CURRENT_MA,
@@ -605,6 +709,67 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
+    fn naming_requests_use_canonical_json_shapes() {
+        let config = TestConfiguration::DischargeConstantPower {
+            power_w: 20,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 45,
+        };
+        let test = StartTestRequest {
+            config,
+            name: Some("Capacity check".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(test).expect("serialize test request"),
+            serde_json::json!({
+                "config": {
+                    "mode": "discharge_constant_power",
+                    "power_w": 20,
+                    "cutoff_voltage_mv": 3000,
+                    "cutoff_time_min": 45
+                },
+                "name": "Capacity check"
+            })
+        );
+
+        let cycle = StartCycleRequest {
+            recipe: CycleRecipe {
+                steps: vec![CycleStep::Rest {
+                    duration_seconds: 5,
+                }],
+                repeat_count: 2,
+            },
+            name: None,
+        };
+        assert_eq!(
+            serde_json::to_value(cycle).expect("serialize cycle request"),
+            serde_json::json!({
+                "recipe": {
+                    "steps": [{"type": "rest", "duration_seconds": 5}],
+                    "repeat_count": 2
+                },
+                "name": null
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(RenameRequest::default()).expect("serialize rename request"),
+            serde_json::json!({"name": null})
+        );
+
+        let legacy: StartTestRequest = serde_json::from_value(serde_json::json!({
+            "config": {
+                "mode": "discharge_constant_power",
+                "power_w": 20,
+                "cutoff_voltage_mv": 3000,
+                "cutoff_time_min": 45
+            }
+        }))
+        .expect("deserialize legacy test request");
+        assert_eq!(legacy.name, None);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
     fn missing_wire_capabilities_default_to_denied() {
         let mut value = serde_json::to_value(SnapshotUpdate::default()).expect("serialize update");
         value
@@ -615,6 +780,58 @@ mod tests {
             serde_json::from_value(value).expect("deserialize legacy update");
 
         assert_eq!(update.capabilities, Capabilities::default());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn missing_current_run_and_cycle_name_default_to_none() {
+        let mut snapshot_value =
+            serde_json::to_value(AuthoritativeSnapshot::default()).expect("serialize snapshot");
+        snapshot_value
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("current_run");
+        let snapshot: AuthoritativeSnapshot =
+            serde_json::from_value(snapshot_value).expect("deserialize legacy snapshot");
+        assert_eq!(snapshot.current_run, CurrentRunMetadata::default());
+
+        let mut update_value =
+            serde_json::to_value(SnapshotUpdate::default()).expect("serialize update");
+        update_value
+            .as_object_mut()
+            .expect("update object")
+            .remove("current_run");
+        let update: SnapshotUpdate =
+            serde_json::from_value(update_value).expect("deserialize legacy update");
+        assert_eq!(update.current_run, CurrentRunMetadata::default());
+
+        let status: CycleStatus = serde_json::from_str(
+            r#"{"state":"completed","recipe":null,"execution_id":"cycle-1","repeat_index":0,"step_index":0,"started_at_utc":null,"result":null,"rest_remaining_seconds":null}"#,
+        )
+        .expect("deserialize legacy cycle status");
+        assert_eq!(status.name, None);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn old_run_summary_without_name_defaults_to_none() {
+        let summary: RunSummary = serde_json::from_value(serde_json::json!({
+            "id": "run-1",
+            "started_at_utc": null,
+            "archived_at_utc": "2026-01-01T00:00:00Z",
+            "state": "completed",
+            "config": null,
+            "elapsed_seconds": 10,
+            "result": null,
+            "capacity_mah": 1,
+            "energy_wh": 0.01,
+            "model": null,
+            "firmware_version": null,
+            "sample_count": 1,
+            "cycle": null
+        }))
+        .expect("deserialize legacy run summary");
+        assert_eq!(summary.name, None);
     }
 
     #[cfg(feature = "server")]

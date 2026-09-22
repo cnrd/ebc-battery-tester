@@ -5,8 +5,9 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CycleRecipe, CycleSample, CycleState, Sample,
-    ServerConnectionState, SnapshotUpdate, TestConfiguration, cycle_presentation_history,
+    ApiCommand, AuthoritativeSnapshot, CurrentRunMetadata, CycleRunContext, CycleSample,
+    CycleState, RenameRequest, Sample, ServerConnectionState, SnapshotUpdate, StartCycleRequest,
+    StartTestRequest, TestConfiguration, cycle_presentation_history, normalize_execution_name,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OutboundFrame};
@@ -49,6 +50,7 @@ enum SendCompletion {
         prepared: PreparedCommand,
         cycle_action: Option<CycleAction>,
         notify_command: bool,
+        reset_history: bool,
     },
     TimerSync,
     BestEffort,
@@ -65,6 +67,9 @@ pub(crate) struct LocalBackend {
     next_cycle_execution_id: u64,
     next_cycle_sequence: u64,
     cycle_history: Vec<CycleSample>,
+    next_run_id: u64,
+    current_run: CurrentRunMetadata,
+    cycle_name: Option<String>,
 }
 
 impl Default for LocalBackend {
@@ -80,6 +85,9 @@ impl Default for LocalBackend {
             next_cycle_execution_id: 1,
             next_cycle_sequence: 0,
             cycle_history: Vec::new(),
+            next_run_id: 1,
+            current_run: CurrentRunMetadata::default(),
+            cycle_name: None,
         }
     }
 }
@@ -120,6 +128,12 @@ impl LocalBackend {
     }
 
     pub(crate) fn command(&mut self, command: ApiCommand) -> LocalOutput {
+        let command = match command {
+            ApiCommand::Start(config) => {
+                return self.start_test(StartTestRequest { config, name: None });
+            }
+            command => command,
+        };
         if command == ApiCommand::Stop
             && (self.cycle.owns_orchestration()
                 || self.cycle.status().state == CycleState::Interrupted)
@@ -129,10 +143,7 @@ impl LocalBackend {
         if self.cycle.owns_orchestration()
             && matches!(
                 command,
-                ApiCommand::Start(_)
-                    | ApiCommand::Resume
-                    | ApiCommand::Adjust(_)
-                    | ApiCommand::Calibration(_)
+                ApiCommand::Resume | ApiCommand::Adjust(_) | ApiCommand::Calibration(_)
             )
         {
             return Self::command_error("the active cycle owns test orchestration".to_owned());
@@ -149,12 +160,50 @@ impl LocalBackend {
                         prepared,
                         cycle_action: None,
                         notify_command: true,
+                        reset_history: false,
                     },
                 }],
                 ..LocalOutput::default()
             };
         }
         self.command_succeeded(prepared, None, true)
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "backend command dispatch transfers request ownership"
+    )]
+    pub(crate) fn start_test(&mut self, request: StartTestRequest) -> LocalOutput {
+        if self.cycle.owns_orchestration() {
+            return Self::command_error("the active cycle owns test orchestration".to_owned());
+        }
+        let name = match normalize_execution_name(request.name.as_deref()) {
+            Ok(name) => name,
+            Err(error) => return Self::command_error(error.to_string()),
+        };
+        let prepared = match self
+            .controller
+            .prepare_command(ApiCommand::Start(request.config))
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return Self::command_error(error),
+        };
+        self.begin_physical_run(name, None);
+        let Some(frame) = prepared.frame() else {
+            return self.command_succeeded(prepared, None, true);
+        };
+        LocalOutput {
+            sends: vec![LocalSend {
+                frame,
+                completion: SendCompletion::Command {
+                    prepared,
+                    cycle_action: None,
+                    notify_command: true,
+                    reset_history: true,
+                },
+            }],
+            ..LocalOutput::default()
+        }
     }
 
     pub(crate) fn resume(&self, config: TestConfiguration) -> LocalOutput {
@@ -175,16 +224,21 @@ impl LocalBackend {
                     prepared,
                     cycle_action: None,
                     notify_command: true,
+                    reset_history: false,
                 },
             }],
             ..LocalOutput::default()
         }
     }
 
-    pub(crate) fn start_cycle(&mut self, recipe: CycleRecipe) -> LocalOutput {
-        if let Err(error) = recipe.validate() {
+    pub(crate) fn start_cycle(&mut self, request: StartCycleRequest) -> LocalOutput {
+        if let Err(error) = request.recipe.validate() {
             return Self::command_error(error.to_string());
         }
+        let name = match normalize_execution_name(request.name.as_deref()) {
+            Ok(name) => name,
+            Err(error) => return Self::command_error(error.to_string()),
+        };
         if self.cycle.is_executing() {
             return Self::command_error("a cycle is already active".to_owned());
         }
@@ -203,10 +257,17 @@ impl LocalBackend {
         };
         let execution_id = format!("local-cycle-{}", self.next_cycle_execution_id);
         self.next_cycle_execution_id = next_id;
-        let action = match self.cycle.start(recipe, execution_id, None, Instant::now()) {
+        let action = match self.cycle.start(
+            request.recipe,
+            execution_id,
+            name.clone(),
+            Some(timestamp_utc()),
+            Instant::now(),
+        ) {
             Ok(action) => action,
             Err(error) => return Self::command_error(error.to_string()),
         };
+        self.cycle_name = name;
         self.next_cycle_sequence = 0;
         self.cycle_history.clear();
         if let Some(action) = action {
@@ -228,6 +289,62 @@ impl LocalBackend {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "backend command dispatch transfers request ownership"
+    )]
+    pub(crate) fn rename_run(&mut self, run_id: &str, request: RenameRequest) -> LocalOutput {
+        if self.current_run.id.as_deref() != Some(run_id) {
+            return Self::command_error("the requested run is not current".to_owned());
+        }
+        if self.current_run.cycle.is_some() {
+            return Self::command_error(
+                "cycle child runs cannot be renamed; rename the cycle instead".to_owned(),
+            );
+        }
+        let name = match normalize_execution_name(request.name.as_deref()) {
+            Ok(name) => name,
+            Err(error) => return Self::command_error(error.to_string()),
+        };
+        self.current_run.name = name;
+        self.success_without_frame()
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "backend command dispatch transfers request ownership"
+    )]
+    pub(crate) fn rename_cycle(
+        &mut self,
+        execution_id: &str,
+        request: RenameRequest,
+    ) -> LocalOutput {
+        if self.cycle.status().execution_id.as_deref() != Some(execution_id) {
+            return Self::command_error("the requested cycle is not current".to_owned());
+        }
+        self.cycle_name = match normalize_execution_name(request.name.as_deref()) {
+            Ok(name) => name,
+            Err(error) => return Self::command_error(error.to_string()),
+        };
+        self.success_without_frame()
+    }
+
+    fn success_without_frame(&self) -> LocalOutput {
+        let mut output = self.state_output();
+        output.events.push(BackendEvent::CommandSucceeded);
+        output
+    }
+
+    fn begin_physical_run(&mut self, name: Option<String>, cycle: Option<CycleRunContext>) {
+        let id = format!("local-run-{}", self.next_run_id);
+        self.next_run_id = self.next_run_id.saturating_add(1);
+        self.current_run = CurrentRunMetadata {
+            id: Some(id),
+            name,
+            cycle,
+        };
+    }
+
     pub(crate) fn finish_send(
         &mut self,
         send: LocalSend,
@@ -239,6 +356,7 @@ impl LocalBackend {
                     prepared,
                     cycle_action,
                     notify_command,
+                    ..
                 } => self.command_succeeded(prepared, cycle_action, notify_command),
                 SendCompletion::TimerSync | SendCompletion::BestEffort => LocalOutput::default(),
             },
@@ -271,6 +389,7 @@ impl LocalBackend {
     }
 
     fn prepare_cycle_action(&mut self, action: CycleAction, notify_command: bool) -> LocalOutput {
+        let reset_history = matches!(action, CycleAction::Start(_));
         let command = match action {
             CycleAction::Start(config) => ApiCommand::Start(config),
             CycleAction::Stop => ApiCommand::Stop,
@@ -284,6 +403,18 @@ impl LocalBackend {
                 return output;
             }
         };
+        if matches!(action, CycleAction::Start(_)) {
+            let status = self.cycle.status();
+            let cycle = status
+                .execution_id
+                .clone()
+                .map(|execution_id| CycleRunContext {
+                    execution_id,
+                    repeat_index: status.repeat_index,
+                    step_index: status.step_index,
+                });
+            self.begin_physical_run(None, cycle);
+        }
         if let Some(frame) = prepared.frame() {
             return LocalOutput {
                 sends: vec![LocalSend {
@@ -292,9 +423,14 @@ impl LocalBackend {
                         prepared,
                         cycle_action: Some(action),
                         notify_command,
+                        reset_history,
                     },
                 }],
-                events: vec![BackendEvent::Update(self.state())],
+                events: vec![if reset_history {
+                    BackendEvent::Snapshot(self.snapshot())
+                } else {
+                    BackendEvent::Update(self.state())
+                }],
             };
         }
         self.command_succeeded(prepared, Some(action), notify_command)
@@ -476,7 +612,7 @@ impl LocalBackend {
         output.extend(self.state_output());
         if sample_report && let Some(measurement) = measurement {
             output.events.push(BackendEvent::Sample(Sample {
-                run_id: String::new(),
+                run_id: self.current_run.id.clone().unwrap_or_default(),
                 sequence: self.next_sequence,
                 timestamp_utc: String::new(),
                 elapsed_seconds: measurement.elapsed_seconds,
@@ -513,14 +649,17 @@ impl LocalBackend {
             capabilities.calibrate_current = false;
             capabilities.confirm_calibration = false;
         }
+        let mut cycle = self.cycle.status().clone();
+        cycle.name.clone_from(&self.cycle_name);
         BackendState {
             update: SnapshotUpdate {
                 connection: self.connection.clone(),
                 connection_error: self.connection_error.clone(),
                 device: self.controller.device().clone(),
                 test: self.controller.test().clone(),
-                cycle: self.cycle.status().clone(),
+                cycle,
                 capabilities,
+                current_run: self.current_run.clone(),
             },
         }
     }
@@ -534,6 +673,7 @@ impl LocalBackend {
             test: state.update.test,
             cycle: state.update.cycle,
             capabilities: state.update.capabilities,
+            current_run: state.update.current_run,
             history: Vec::new(),
             cycle_history: self.cycle_history.clone(),
         }
@@ -549,12 +689,15 @@ impl LocalBackend {
     fn send_failed(&mut self, send: LocalSend, error: &str) -> LocalOutput {
         let message = format!("failed to send {:?}: {error}", send.frame);
         if !matches!(send.completion, SendCompletion::BestEffort) {
+            let mut reset_history = false;
             match send.completion {
                 SendCompletion::Command {
                     prepared,
                     cycle_action,
+                    reset_history: command_resets_history,
                     ..
                 } => {
+                    reset_history = command_resets_history;
                     self.controller
                         .command_write_failed(prepared.kind(), &message);
                     if cycle_action.is_some() {
@@ -571,11 +714,13 @@ impl LocalBackend {
             }
             self.connection = ServerConnectionState::Error;
             self.connection_error = Some(message.clone());
+            let state = if reset_history {
+                BackendEvent::Snapshot(self.snapshot())
+            } else {
+                BackendEvent::Update(self.state())
+            };
             return LocalOutput {
-                events: vec![
-                    BackendEvent::Update(self.state()),
-                    BackendEvent::CommandError(message),
-                ],
+                events: vec![state, BackendEvent::CommandError(message)],
                 ..LocalOutput::default()
             };
         }
@@ -599,7 +744,7 @@ impl LocalOutput {
 #[expect(clippy::expect_used, reason = "backend tests should fail fast")]
 mod tests {
     use super::*;
-    use crate::core::{CycleState, CycleStep, CycleStepCompletion, TestState};
+    use crate::core::{CycleRecipe, CycleState, CycleStep, CycleStepCompletion, TestState};
     use crate::device::DeviceMode;
 
     fn config() -> TestConfiguration {
@@ -630,6 +775,10 @@ mod tests {
             steps,
             repeat_count: 1,
         }
+    }
+
+    fn cycle_request(recipe: CycleRecipe) -> StartCycleRequest {
+        StartCycleRequest { recipe, name: None }
     }
 
     fn report(state: ReportState, capacity_mah: u16) -> DeviceReport {
@@ -687,6 +836,17 @@ mod tests {
             .expect("semantic state event")
     }
 
+    fn snapshot(output: &LocalOutput) -> &AuthoritativeSnapshot {
+        output
+            .events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::Snapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .expect("authoritative snapshot event")
+    }
+
     fn send_frames(output: &LocalOutput) -> Vec<OutboundFrame> {
         output.sends.iter().copied().map(LocalSend::frame).collect()
     }
@@ -699,6 +859,156 @@ mod tests {
     fn finish_failure(backend: &mut LocalBackend, output: &LocalOutput) -> LocalOutput {
         assert_eq!(output.sends.len(), 1);
         backend.finish_send(output.sends[0], Err("injected write failure".to_owned()))
+    }
+
+    fn start_request(name: Option<&str>) -> StartTestRequest {
+        StartTestRequest {
+            config: config(),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn named_manual_start_and_rename_manage_metadata_without_extra_frames() {
+        let mut backend = connected_backend();
+        let request = backend.start_test(start_request(Some("  first run  ")));
+        assert_eq!(request.sends.len(), 1);
+        let started = finish_success(&mut backend, &request);
+        let snapshot = started
+            .events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::Snapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .expect("start snapshot");
+        assert_eq!(snapshot.current_run.id.as_deref(), Some("local-run-1"));
+        assert_eq!(snapshot.current_run.name.as_deref(), Some("first run"));
+        assert!(snapshot.current_run.cycle.is_none());
+
+        let renamed = backend.rename_run(
+            "local-run-1",
+            RenameRequest {
+                name: Some("  renamed  ".to_owned()),
+            },
+        );
+        assert!(renamed.sends.is_empty());
+        assert_eq!(
+            state(&renamed).update.current_run.name.as_deref(),
+            Some("renamed")
+        );
+        assert!(matches!(
+            renamed.events.last(),
+            Some(BackendEvent::CommandSucceeded)
+        ));
+
+        let cleared = backend.rename_run("local-run-1", RenameRequest::default());
+        assert!(cleared.sends.is_empty());
+        assert_eq!(state(&cleared).update.current_run.name, None);
+    }
+
+    #[test]
+    fn named_cycle_has_unnamed_contextual_child_and_rename_has_no_frame() {
+        let mut backend = connected_backend();
+        let started = backend.start_cycle(StartCycleRequest {
+            recipe: recipe(vec![device_step(1000)]),
+            name: Some("  capacity cycle  ".to_owned()),
+        });
+        assert_eq!(started.sends.len(), 1);
+        let snapshot = snapshot(&started);
+        assert_eq!(snapshot.cycle.name.as_deref(), Some("capacity cycle"));
+        assert_eq!(snapshot.current_run.id.as_deref(), Some("local-run-1"));
+        assert_eq!(snapshot.current_run.name, None);
+        let context = snapshot
+            .current_run
+            .cycle
+            .as_ref()
+            .expect("cycle child context");
+        assert_eq!(context.execution_id, "local-cycle-1");
+        assert_eq!(context.repeat_index, 0);
+        assert_eq!(context.step_index, 0);
+
+        let renamed = backend.rename_cycle(
+            "local-cycle-1",
+            RenameRequest {
+                name: Some("second name".to_owned()),
+            },
+        );
+        assert!(renamed.sends.is_empty());
+        assert_eq!(
+            state(&renamed).update.cycle.name.as_deref(),
+            Some("second name")
+        );
+        let rejected = backend.rename_run("local-run-1", RenameRequest::default());
+        assert!(rejected.sends.is_empty());
+        assert!(matches!(
+            rejected.events.as_slice(),
+            [BackendEvent::CommandError(error)] if error.contains("cycle child")
+        ));
+    }
+
+    #[test]
+    fn naming_does_not_change_ordinary_command_frames_or_metadata() {
+        let mut backend = connected_backend();
+        let start = backend.start_test(start_request(Some("stable")));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        let before = backend.current_run.clone();
+
+        let adjust = backend.command(ApiCommand::Adjust(config_with_current(1500)));
+        assert!(matches!(
+            send_frames(&adjust).as_slice(),
+            [OutboundFrame::AdjustConstantCurrentDischarge(1500, 3000, 0)]
+        ));
+        let adjusted = finish_success(&mut backend, &adjust);
+        assert_eq!(state(&adjusted).update.current_run, before);
+
+        let stop = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        let stopped = finish_success(&mut backend, &stop);
+        assert_eq!(state(&stopped).update.current_run, before);
+        backend.report(report(ReportState::Idle, 1), true);
+
+        let resume = backend.resume(config_with_current(1500));
+        assert!(matches!(
+            send_frames(&resume).as_slice(),
+            [OutboundFrame::ContinueConstantCurrentDischarge(
+                1500, 3000, 0
+            )]
+        ));
+        let resumed = finish_success(&mut backend, &resume);
+        assert_eq!(state(&resumed).update.current_run, before);
+    }
+
+    #[test]
+    fn failed_new_start_never_attaches_its_name_to_the_previous_run() {
+        let mut backend = connected_backend();
+        let first = backend.start_test(start_request(Some("first")));
+        finish_success(&mut backend, &first);
+        backend.report(report(ReportState::Active, 1), true);
+        backend.report(report(ReportState::Finished, 1), true);
+        backend.report(report(ReportState::Idle, 1), true);
+
+        let second = backend.start_test(start_request(Some("attempted second")));
+        assert_eq!(second.sends.len(), 1);
+        let failed = finish_failure(&mut backend, &second);
+        let snapshot = failed
+            .events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::Snapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .expect("failed named start snapshot");
+        assert_eq!(snapshot.current_run.id.as_deref(), Some("local-run-2"));
+        assert_eq!(
+            snapshot.current_run.name.as_deref(),
+            Some("attempted second")
+        );
+        assert!(snapshot.history.is_empty());
     }
 
     #[test]
@@ -814,19 +1124,16 @@ mod tests {
         assert!(request.events.is_empty());
 
         let failed = finish_failure(&mut backend, &request);
-        assert_eq!(
-            state(&failed).update.test.state,
-            TestState::RecoveredUncertain
-        );
+        let snapshot = snapshot(&failed);
+        assert_eq!(snapshot.test.state, TestState::RecoveredUncertain);
         assert!(
-            state(&failed)
-                .update
+            snapshot
                 .test
                 .result
                 .as_deref()
                 .is_some_and(|reason| reason.contains("start outcome is unknown"))
         );
-        assert!(!state(&failed).update.device.activity_known);
+        assert!(!snapshot.device.activity_known);
         assert!(matches!(
             failed.events.last(),
             Some(BackendEvent::CommandError(error)) if error.contains("injected write failure")
@@ -991,7 +1298,10 @@ mod tests {
     #[test]
     fn cycle_progresses_between_device_steps_without_gui_commands() {
         let mut backend = connected_backend();
-        let first = backend.start_cycle(recipe(vec![device_step(1000), device_step(1500)]));
+        let first = backend.start_cycle(cycle_request(recipe(vec![
+            device_step(1000),
+            device_step(1500),
+        ])));
         assert!(matches!(
             send_frames(&first).as_slice(),
             [OutboundFrame::StartConstantCurrentDischarge(1000, 3000, 0)]
@@ -1019,13 +1329,13 @@ mod tests {
     #[test]
     fn cycle_samples_span_settling_rest_and_the_next_physical_run() {
         let mut backend = connected_backend();
-        let first = backend.start_cycle(recipe(vec![
+        let first = backend.start_cycle(cycle_request(recipe(vec![
             device_step(1000),
             CycleStep::Rest {
                 duration_seconds: 1,
             },
             device_step(1500),
-        ]));
+        ])));
         finish_success(&mut backend, &first);
 
         backend.report(observed_report(ReportState::Active, 4000, 1000, 1), true);
@@ -1112,10 +1422,10 @@ mod tests {
     #[test]
     fn repeat_boundary_report_keeps_the_previous_cycle_context() {
         let mut backend = connected_backend();
-        let first = backend.start_cycle(CycleRecipe {
+        let first = backend.start_cycle(cycle_request(CycleRecipe {
             steps: vec![device_step(1000)],
             repeat_count: 2,
-        });
+        }));
         finish_success(&mut backend, &first);
         backend.report(observed_report(ReportState::Active, 4000, 1000, 1), true);
         backend.report(observed_report(ReportState::Finished, 3940, 1000, 2), true);
@@ -1143,9 +1453,9 @@ mod tests {
     #[test]
     fn cycle_rejects_zero_duration_rest() {
         let mut backend = connected_backend();
-        let started = backend.start_cycle(recipe(vec![CycleStep::Rest {
+        let started = backend.start_cycle(cycle_request(recipe(vec![CycleStep::Rest {
             duration_seconds: 0,
-        }]));
+        }])));
         assert!(started.sends.is_empty());
         assert!(matches!(
             started.events.as_slice(),
@@ -1157,7 +1467,7 @@ mod tests {
     #[test]
     fn connection_gap_interrupts_active_cycle() {
         let mut backend = connected_backend();
-        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(1000)])));
         finish_success(&mut backend, &start);
         backend.report(report(ReportState::Active, 1), true);
 
@@ -1176,9 +1486,9 @@ mod tests {
     #[test]
     fn cycle_rejects_manual_orchestration_commands() {
         let mut backend = connected_backend();
-        let started = backend.start_cycle(recipe(vec![CycleStep::Rest {
+        let started = backend.start_cycle(cycle_request(recipe(vec![CycleStep::Rest {
             duration_seconds: 60,
-        }]));
+        }])));
         assert!(started.sends.is_empty());
 
         for command in [
@@ -1199,7 +1509,7 @@ mod tests {
     #[test]
     fn stopping_active_cycle_waits_for_inactive_report() {
         let mut backend = connected_backend();
-        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(1000)])));
         finish_success(&mut backend, &start);
         backend.report(report(ReportState::Active, 1), true);
 
@@ -1217,14 +1527,24 @@ mod tests {
     #[test]
     fn cycle_start_write_failure_interrupts_without_commit() {
         let mut backend = connected_backend();
-        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(1000)])));
+        assert!(matches!(
+            start.events.as_slice(),
+            [BackendEvent::Snapshot(snapshot)] if snapshot.history.is_empty()
+        ));
 
         let failed = finish_failure(&mut backend, &start);
-        assert_eq!(state(&failed).update.cycle.state, CycleState::Interrupted);
-        assert_eq!(
-            state(&failed).update.test.state,
-            TestState::RecoveredUncertain
-        );
+        let snapshot = failed
+            .events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::Snapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .expect("failed cycle child start snapshot");
+        assert_eq!(snapshot.cycle.state, CycleState::Interrupted);
+        assert_eq!(snapshot.test.state, TestState::RecoveredUncertain);
+        assert!(snapshot.history.is_empty());
         assert!(matches!(
             failed.events.last(),
             Some(BackendEvent::CommandError(error)) if error.contains("write failure")
@@ -1234,7 +1554,7 @@ mod tests {
     #[test]
     fn interrupted_safety_stop_retries_after_reconnect() {
         let mut backend = connected_backend();
-        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(1000)])));
         finish_success(&mut backend, &start);
         backend.report(report(ReportState::Active, 1), true);
         backend.connection_failed("serial gap".to_owned());
@@ -1272,6 +1592,7 @@ mod tests {
             .start(
                 recipe(vec![device_step(1000)]),
                 "test-cycle".to_owned(),
+                None,
                 None,
                 Instant::now(),
             )

@@ -7,9 +7,9 @@ use crate::backend_client::BackendClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend_client::BackendTarget;
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Capabilities, CycleRecipe, CycleSample, CycleState,
-    CycleStatus, Sample, ServerConnectionState, TestConfiguration, TestState,
-    cycle_presentation_history,
+    ApiCommand, AuthoritativeSnapshot, Capabilities, CurrentRunMetadata, CycleSample, CycleState,
+    CycleStatus, RenameRequest, Sample, ServerConnectionState, StartCycleRequest, StartTestRequest,
+    TestConfiguration, TestState, cycle_presentation_history,
 };
 use crate::device::{self, ConnectionStatus};
 use crate::export::{LogDirection, LogEntry};
@@ -121,6 +121,7 @@ pub(crate) struct DeviceSession {
     pub(crate) mode_on: bool,
     pub(crate) test_state: TestState,
     pub(crate) cycle: CycleStatus,
+    pub(crate) current_run: CurrentRunMetadata,
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) command_error: Option<String>,
     transport_mode: TransportMode,
@@ -153,6 +154,7 @@ impl Default for DeviceSession {
             mode_on: false,
             test_state: TestState::Idle,
             cycle: CycleStatus::default(),
+            current_run: CurrentRunMetadata::default(),
             log_entries: Vec::new(),
             command_error: None,
             transport_mode: TransportMode::Direct,
@@ -271,13 +273,56 @@ impl DeviceSession {
         )
     }
 
-    pub(crate) fn start_cycle(&mut self, recipe: CycleRecipe) {
+    pub(crate) fn start_test(&mut self, request: StartTestRequest) {
+        if !self.remote_command_available("test start") {
+            return;
+        }
+        self.backend.command(BackendCommand::StartTest(request));
+    }
+
+    pub(crate) fn start_cycle(&mut self, request: StartCycleRequest) {
         if self.is_remote() && self.remote_status != BackendConnectionStatus::Connected {
             self.command_error =
                 Some("browser is disconnected; cycle command was not sent".to_owned());
             return;
         }
-        self.backend.command(BackendCommand::StartCycle(recipe));
+        self.backend.command(BackendCommand::StartCycle(request));
+    }
+
+    pub(crate) fn rename_current_run(&mut self, request: RenameRequest) {
+        if !self.remote_command_available("run rename") {
+            return;
+        }
+        let Some(run_id) = self.current_run.id.clone() else {
+            self.command_error = Some("there is no current run to rename".to_owned());
+            return;
+        };
+        self.backend
+            .command(BackendCommand::RenameRun { run_id, request });
+    }
+
+    pub(crate) fn rename_current_cycle(&mut self, request: RenameRequest) {
+        if !self.remote_command_available("cycle rename") {
+            return;
+        }
+        let Some(execution_id) = self.cycle.execution_id.clone() else {
+            self.command_error = Some("there is no current cycle to rename".to_owned());
+            return;
+        };
+        self.backend.command(BackendCommand::RenameCycle {
+            execution_id,
+            request,
+        });
+    }
+
+    fn remote_command_available(&mut self, description: &str) -> bool {
+        if self.is_remote() && self.remote_status != BackendConnectionStatus::Connected {
+            self.command_error = Some(format!(
+                "browser is disconnected; {description} command was not sent"
+            ));
+            return false;
+        }
+        true
     }
 
     pub(crate) fn stop_cycle(&mut self) {
@@ -398,6 +443,7 @@ impl DeviceSession {
         self.activity_known = update.device.activity_known;
         self.mode_on = update.device.active;
         self.test_state = update.test.state;
+        self.current_run = update.current_run;
         if let Some(execution_id) = &update.cycle.execution_id
             && self.cycle_execution_id.as_deref() != Some(execution_id)
         {
@@ -500,7 +546,7 @@ impl DeviceSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DeviceState, SnapshotUpdate, TestStatus};
+    use crate::core::{CurrentRunMetadata, DeviceState, SnapshotUpdate, TestStatus};
 
     #[test]
     fn semantic_snapshot_reconstructs_view_state() {
@@ -572,6 +618,50 @@ mod tests {
         assert_eq!(session.samples.len(), 1);
         session.apply_sample(sample("new", 0, 2));
         assert_eq!(session.samples, vec![sample("new", 0, 2)]);
+    }
+
+    #[test]
+    fn snapshot_and_rename_update_metadata_without_resetting_histories() {
+        let mut session = DeviceSession::default();
+        let run_sample = sample("run-1", 0, 1);
+        let cycle_sample = cycle_sample("cycle-1", 0, 0, 0);
+        session.apply_snapshot(AuthoritativeSnapshot {
+            current_run: CurrentRunMetadata {
+                id: Some("run-1".to_owned()),
+                name: Some("initial run".to_owned()),
+                cycle: None,
+            },
+            cycle: CycleStatus {
+                execution_id: Some("cycle-1".to_owned()),
+                name: Some("initial cycle".to_owned()),
+                ..CycleStatus::default()
+            },
+            history: vec![run_sample.clone()],
+            cycle_history: vec![cycle_sample.clone()],
+            ..AuthoritativeSnapshot::default()
+        });
+        assert_eq!(session.current_run.name.as_deref(), Some("initial run"));
+
+        session.apply_state(BackendState {
+            update: SnapshotUpdate {
+                current_run: CurrentRunMetadata {
+                    id: Some("run-1".to_owned()),
+                    name: Some("renamed run".to_owned()),
+                    cycle: None,
+                },
+                cycle: CycleStatus {
+                    execution_id: Some("cycle-1".to_owned()),
+                    name: Some("renamed cycle".to_owned()),
+                    ..CycleStatus::default()
+                },
+                ..SnapshotUpdate::default()
+            },
+        });
+
+        assert_eq!(session.current_run.name.as_deref(), Some("renamed run"));
+        assert_eq!(session.cycle.name.as_deref(), Some("renamed cycle"));
+        assert_eq!(session.samples, vec![run_sample]);
+        assert_eq!(session.cycle_samples, vec![cycle_sample]);
     }
 
     #[test]

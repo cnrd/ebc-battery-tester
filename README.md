@@ -125,8 +125,9 @@ The server accepts these environment variables:
 | `EBC_ALLOWED_ORIGIN` | unset | Exact browser `Origin` accepted behind a reverse proxy |
 | `RUST_LOG` | `info` in Docker | Rust log filter |
 
-Persist `/data`. `session.json` stores the current device/test metadata and
-`samples.csv` stores current-run measurements. Before a fresh test replaces a
+Persist `/data`. `session.json` stores the current device/test metadata,
+including the current run name, and `samples.csv` stores current-run
+measurements. Before a fresh test replaces a
 meaningful current run, the server archives its metadata and CSV under
 `/data/runs/<run-id>.json` and `/data/runs/<run-id>.csv`. Run IDs are sanitized
 UTC start timestamps with collision suffixes. `GET /api/runs` lists archived
@@ -134,10 +135,12 @@ runs and `GET /api/runs/<run-id>.csv` downloads one archive. Current history
 remains available from `GET /api/history.csv`.
 
 Cycle executions also retain an independent continuous telemetry stream under
-`/data/cycles/<execution-id>.csv`. It includes normal mode reports from device
-steps, settling, rests, and repeat boundaries without changing the per-run
-sample files or metrics. `GET /api/cycle/history.csv` exports the latest cycle,
-and `GET /api/cycles/<execution-id>/history.csv` exports a specific execution.
+`/data/cycles/<execution-id>.csv`; `/data/cycles/<execution-id>.json` is its
+metadata sidecar and stores the optional execution name. The telemetry includes
+normal mode reports from device steps, settling, rests, and repeat boundaries
+without changing the per-run sample files or metrics. The latest cycle is
+exported by `GET /api/cycle/history.csv`; a specific execution is exported by
+`GET /api/cycles/<execution-id>/history.csv`.
 
 The durable CSV retains the complete current run. Initial browser snapshots
 are limited to 5000 presentation samples, and the browser remains bounded to
@@ -314,6 +317,48 @@ does not change protocol behavior.
 
 ## API outline
 
+Manual runs have an immutable, server-assigned `run_id`; cycle executions have
+an immutable, server-assigned `execution_id`. Their optional names are editable,
+need not be unique, and may be cleared without changing either ID. A cycle's
+device-step child runs are linked to their parent by `CycleRunContext` and always
+have `name: null`; naming saved recipes is a separate future concept and names
+are not part of `CycleRecipe`.
+
+The canonical manual start body wraps the test configuration and optional name:
+
+```json
+{
+  "config": {
+    "mode": "discharge_constant_current",
+    "current_ma": 1000,
+    "cutoff_voltage_mv": 3000,
+    "cutoff_time_min": 0
+  },
+  "name": "Cell A capacity"
+}
+```
+
+The canonical cycle start body similarly wraps the recipe and execution name:
+
+```json
+{
+  "recipe": {
+    "steps": [
+      {
+        "type": "rest",
+        "duration_seconds": 60
+      }
+    ],
+    "repeat_count": 1
+  },
+  "name": "Formation pass"
+}
+```
+
+Rename a manual run with `POST /api/runs/{run_id}/name` or a cycle execution
+with `POST /api/cycles/{execution_id}/name`. Both accept `{"name":"New name"}`;
+send `{"name":null}` or an empty/whitespace-only string to clear the name.
+
 All endpoints are under `/api`:
 
 | Method | Path | Purpose |
@@ -327,9 +372,13 @@ All endpoints are under `/api`:
 | `GET` | `/api/cycles/{id}/history.csv` | Cycle telemetry by execution ID |
 | `GET` | `/api/ws` | Snapshot/sample/cycle-sample WebSocket stream |
 | `POST` | `/api/connect`, `/api/disconnect` | Serial connection control |
-| `POST` | `/api/test/start`, `/api/test/adjust` | JSON test configuration |
+| `POST` | `/api/test/start` | `StartTestRequest` JSON envelope (`config` and optional `name`) |
+| `POST` | `/api/test/adjust` | Raw test configuration JSON |
 | `POST` | `/api/test/stop`, `/api/test/resume` | Test lifecycle |
-| `POST` | `/api/cycle/start`, `/api/cycle/stop` | Cycle lifecycle |
+| `POST` | `/api/cycle/start` | `StartCycleRequest` JSON envelope (`recipe` and optional `name`) |
+| `POST` | `/api/cycle/stop` | Stop the active cycle execution |
+| `POST` | `/api/runs/{run_id}/name` | Rename or clear a manual run name |
+| `POST` | `/api/cycles/{execution_id}/name` | Rename or clear any persisted cycle execution name |
 | `POST` | `/api/calibration` | JSON calibration command |
 
 Every mutating `POST` requires `X-EBC-Command: 1`; the remote UI sends it and API
@@ -348,8 +397,8 @@ directly to the internet.
 ## Current limitations
 
 - One device per process.
-- No software capacity/percentage completion targets, nested cycle repeats,
-  internal-resistance test, plot image export, imported CSV/`.dat` replay,
+- No software capacity/percentage completion targets, internal-resistance test,
+  plot image export, imported CSV/`.dat` replay,
   firmware update, or support guarantee for models other than EBC-A20.
 - Server recovery is conservative and does not automatically restart a test.
 

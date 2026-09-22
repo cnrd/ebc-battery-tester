@@ -27,9 +27,10 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CycleRecipe, CycleRunContext,
-    CycleSample, CycleState, CycleStatus, RunSummary, Sample, ServerConnectionState,
-    SnapshotUpdate, TestConfiguration, TestState, WebSocketEvent, cycle_presentation_history,
+    ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CurrentRunMetadata, CycleRunContext,
+    CycleSample, CycleState, CycleStatus, RenameRequest, RunSummary, Sample, ServerConnectionState,
+    SnapshotUpdate, StartCycleRequest, StartTestRequest, TestConfiguration, TestState,
+    WebSocketEvent, cycle_presentation_history, normalize_execution_name,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
@@ -91,7 +92,16 @@ enum ActorRequest {
     Runs,
     RunCsv(String),
     Command(ApiCommand),
-    StartCycle(CycleRecipe),
+    StartTest(StartTestRequest),
+    StartCycle(StartCycleRequest),
+    RenameRun {
+        id: String,
+        request: RenameRequest,
+    },
+    RenameCycle {
+        execution_id: String,
+        request: RenameRequest,
+    },
     StopCycle,
     Shutdown,
 }
@@ -102,6 +112,29 @@ enum ActorResponse {
     History(Vec<Sample>),
     Runs(Vec<RunSummary>),
     Export(ExportDescriptor),
+    Start(Result<AuthoritativeSnapshot, StartError>),
+    Rename(Result<AuthoritativeSnapshot, RenameError>),
+}
+
+#[derive(Debug)]
+enum StartError {
+    BadRequest(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadRequest(message) | Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RenameError {
+    BadRequest(String),
+    NotFound(String),
+    Internal(String),
 }
 
 struct ExportDescriptor {
@@ -122,6 +155,7 @@ struct Persistence {
     runs: Vec<RunSummary>,
     archived_run_id: Option<String>,
     current_run_id: String,
+    current_run_name: Option<String>,
     current_run_cycle: Option<CycleRunContext>,
     next_sequence: u64,
     raw_sample_count: usize,
@@ -129,6 +163,7 @@ struct Persistence {
     last_sample_sync: Instant,
     cycles_dir: PathBuf,
     current_cycle_id: Option<String>,
+    current_cycle_name: Option<String>,
     next_cycle_sequence: u64,
     cycle_writer: Option<BufWriter<File>>,
     last_cycle_sync: Instant,
@@ -147,9 +182,18 @@ struct Metadata {
     #[serde(default)]
     current_run_id: String,
     #[serde(default)]
+    current_run_name: Option<String>,
+    #[serde(default)]
     current_run_cycle: Option<CycleRunContext>,
     #[serde(default)]
     next_sequence: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct CycleExecutionMetadata {
+    execution_id: String,
+    name: Option<String>,
 }
 
 impl Persistence {
@@ -181,6 +225,7 @@ impl Persistence {
             runs: Vec::new(),
             archived_run_id: None,
             current_run_id: String::new(),
+            current_run_name: None,
             current_run_cycle: None,
             next_sequence: 0,
             raw_sample_count: 0,
@@ -188,6 +233,7 @@ impl Persistence {
             last_sample_sync: Instant::now(),
             cycles_dir,
             current_cycle_id: None,
+            current_cycle_name: None,
             next_cycle_sequence: 0,
             cycle_writer: None,
             last_cycle_sync: Instant::now(),
@@ -204,6 +250,7 @@ impl Persistence {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             self.archived_run_id = metadata.archived_run_id;
             self.current_run_id = metadata.current_run_id;
+            self.current_run_name = metadata.current_run_name;
             self.current_run_cycle = metadata.current_run_cycle;
             self.next_sequence = metadata.next_sequence;
             AuthoritativeSnapshot {
@@ -213,6 +260,7 @@ impl Persistence {
                 test: metadata.test,
                 cycle: metadata.cycle,
                 capabilities: Default::default(),
+                current_run: CurrentRunMetadata::default(),
                 history: Vec::new(),
                 cycle_history: Vec::new(),
             }
@@ -278,12 +326,17 @@ impl Persistence {
         }
         if let Some(execution_id) = snapshot.cycle.execution_id.clone() {
             let cycle_history = self.load_cycle_samples(&execution_id)?;
+            self.current_cycle_name = self
+                .load_cycle_metadata(&execution_id)?
+                .and_then(|metadata| metadata.name);
+            snapshot.cycle.name.clone_from(&self.current_cycle_name);
             self.current_cycle_id = Some(execution_id);
             self.next_cycle_sequence = cycle_history
                 .last()
                 .map_or(0, |sample| sample.sequence.saturating_add(1));
             snapshot.cycle_history = cycle_history;
         }
+        self.sync_snapshot_metadata(&mut snapshot);
         Ok(snapshot)
     }
 
@@ -296,16 +349,11 @@ impl Persistence {
             cycle: snapshot.cycle.clone(),
             archived_run_id: self.archived_run_id.clone(),
             current_run_id: self.current_run_id.clone(),
+            current_run_name: self.current_run_name.clone(),
             current_run_cycle: self.current_run_cycle.clone(),
             next_sequence: self.next_sequence,
         };
-        let temporary = self.metadata_path.with_extension("json.tmp");
-        let mut file = File::create(&temporary).map_err(|error| error.to_string())?;
-        serde_json::to_writer_pretty(&mut file, &metadata).map_err(|error| error.to_string())?;
-        file.write_all(b"\n").map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        fs::rename(temporary, &self.metadata_path).map_err(|error| error.to_string())?;
-        sync_parent(&self.metadata_path)
+        atomic_write_json(&self.metadata_path, &metadata)
     }
 
     fn reset_samples(&mut self) -> Result<(), String> {
@@ -331,9 +379,15 @@ impl Persistence {
         sync_parent(&self.samples_path)
     }
 
-    fn begin_current_run(&mut self, run_id: String, cycle: Option<CycleRunContext>) {
+    fn begin_current_run(
+        &mut self,
+        run_id: String,
+        name: Option<String>,
+        cycle: Option<CycleRunContext>,
+    ) {
         self.archived_run_id = None;
         self.current_run_id = run_id;
+        self.current_run_name = name;
         self.current_run_cycle = cycle;
         self.next_sequence = 0;
     }
@@ -374,7 +428,11 @@ impl Persistence {
         }
 
         self.flush_samples()?;
-        let id = self.next_run_id(snapshot.test.started_at_utc.as_deref());
+        let id = if valid_run_id(&self.current_run_id) {
+            self.current_run_id.clone()
+        } else {
+            self.next_run_id(snapshot.test.started_at_utc.as_deref())
+        };
         let csv_path = self.runs_dir.join(format!("{id}.csv"));
         let csv_temporary = self.runs_dir.join(format!("{id}.csv.tmp"));
         if self.samples_path.exists() {
@@ -389,6 +447,11 @@ impl Persistence {
             .map_err(|error| error.to_string())?;
         let summary = RunSummary {
             id: id.clone(),
+            name: if self.current_run_cycle.is_none() {
+                self.current_run_name.clone()
+            } else {
+                None
+            },
             started_at_utc: snapshot.test.started_at_utc.clone(),
             archived_at_utc: Utc::now().to_rfc3339(),
             state: snapshot.test.state.clone(),
@@ -487,6 +550,11 @@ impl Persistence {
         self.runs.clone()
     }
 
+    fn rewrite_run_summary(&self, summary: &RunSummary) -> Result<(), String> {
+        let path = self.runs_dir.join(format!("{}.json", summary.id));
+        atomic_write_json(&path, summary)
+    }
+
     fn live_export(&mut self) -> Result<ExportDescriptor, String> {
         self.flush_samples()?;
         if !self.samples_path.exists() {
@@ -508,7 +576,7 @@ impl Persistence {
         )
     }
 
-    fn begin_cycle(&mut self, execution_id: String) -> Result<(), String> {
+    fn begin_cycle(&mut self, execution_id: String, name: Option<String>) -> Result<(), String> {
         if !valid_run_id(&execution_id) {
             return Err("invalid cycle execution id".to_owned());
         }
@@ -523,8 +591,22 @@ impl Persistence {
         file.write_all(cycle_csv_header().as_bytes())
             .map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
+        let metadata = CycleExecutionMetadata {
+            execution_id: execution_id.clone(),
+            name: name.clone(),
+        };
+        if let Err(error) = self.write_cycle_metadata(&metadata) {
+            let cleanup = fs::remove_file(&path);
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup_error) => {
+                    format!("{error}; failed to remove incomplete cycle CSV: {cleanup_error}")
+                }
+            });
+        }
         sync_directory(&self.cycles_dir)?;
         self.current_cycle_id = Some(execution_id);
+        self.current_cycle_name = name;
         self.next_cycle_sequence = 0;
         self.last_cycle_sync = Instant::now();
         Ok(())
@@ -589,6 +671,42 @@ impl Persistence {
 
     fn cycle_path(&self, execution_id: &str) -> PathBuf {
         self.cycles_dir.join(format!("{execution_id}.csv"))
+    }
+
+    fn cycle_metadata_path(&self, execution_id: &str) -> PathBuf {
+        self.cycles_dir.join(format!("{execution_id}.json"))
+    }
+
+    fn load_cycle_metadata(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<CycleExecutionMetadata>, String> {
+        let path = self.cycle_metadata_path(execution_id);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let metadata: CycleExecutionMetadata =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if metadata.execution_id != execution_id {
+            return Err("cycle metadata execution id mismatch".to_owned());
+        }
+        Ok(Some(metadata))
+    }
+
+    fn write_cycle_metadata(&self, metadata: &CycleExecutionMetadata) -> Result<(), String> {
+        atomic_write_json(&self.cycle_metadata_path(&metadata.execution_id), metadata)
+    }
+
+    fn sync_snapshot_metadata(&self, snapshot: &mut AuthoritativeSnapshot) {
+        snapshot.current_run = CurrentRunMetadata {
+            id: (!self.current_run_id.is_empty()).then(|| self.current_run_id.clone()),
+            name: self.current_run_name.clone(),
+            cycle: self.current_run_cycle.clone(),
+        };
+        if snapshot.cycle.execution_id.as_deref() == self.current_cycle_id.as_deref() {
+            snapshot.cycle.name.clone_from(&self.current_cycle_name);
+        }
     }
 
     fn append_sample(&mut self, sample: &Sample) -> Result<(), String> {
@@ -1031,6 +1149,51 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to sync directory {}: {error}", path.display()))
 }
 
+fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    let original = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("json");
+    let temporary = path.with_extension(format!("{extension}.tmp"));
+    let mut file = File::create(&temporary).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(&mut file, value).map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    sync_parent(&temporary)?;
+    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    if let Err(error) = sync_parent(path) {
+        let rollback = if let Some(bytes) = original {
+            let rollback = path.with_extension(format!("{extension}.rollback"));
+            File::create(&rollback)
+                .and_then(|mut file| {
+                    file.write_all(&bytes)?;
+                    file.sync_all()
+                })
+                .map_err(|rollback_error| rollback_error.to_string())
+                .and_then(|()| {
+                    fs::rename(&rollback, path).map_err(|rollback_error| rollback_error.to_string())
+                })
+                .and_then(|()| sync_parent(path))
+        } else {
+            fs::remove_file(path)
+                .map_err(|rollback_error| rollback_error.to_string())
+                .and_then(|()| sync_parent(path))
+        };
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}; failed to roll back replacement: {rollback_error}")
+            }
+        });
+    }
+    Ok(())
+}
+
 struct DeviceActor {
     config: ServerConfig,
     snapshot: AuthoritativeSnapshot,
@@ -1058,6 +1221,7 @@ struct StartPreparationRollback {
     history: Vec<Sample>,
     archived_run_id: Option<String>,
     current_run_id: String,
+    current_run_name: Option<String>,
     current_run_cycle: Option<CycleRunContext>,
     next_sequence: u64,
     raw_sample_count: usize,
@@ -1175,10 +1339,27 @@ impl DeviceActor {
             ActorRequest::Command(command) => self
                 .handle_command(command)
                 .map(|()| ActorResponse::Snapshot(self.current_snapshot())),
-            ActorRequest::StartCycle(recipe) => self
-                .start_cycle(recipe)
-                .and_then(|()| self.persist_and_publish())
-                .map(|()| ActorResponse::Snapshot(self.current_snapshot())),
+            ActorRequest::StartTest(request) => Ok(ActorResponse::Start(
+                self.start_test(request.config, request.name, None)
+                    .and_then(|()| self.persist_and_publish().map_err(StartError::Internal))
+                    .map(|()| self.current_snapshot()),
+            )),
+            ActorRequest::StartCycle(request) => Ok(ActorResponse::Start(
+                self.start_cycle(request)
+                    .and_then(|()| self.persist_and_publish().map_err(StartError::Internal))
+                    .map(|()| self.current_snapshot()),
+            )),
+            ActorRequest::RenameRun { id, request } => Ok(ActorResponse::Rename(
+                self.rename_run(&id, request)
+                    .map(|()| self.current_snapshot()),
+            )),
+            ActorRequest::RenameCycle {
+                execution_id,
+                request,
+            } => Ok(ActorResponse::Rename(
+                self.rename_cycle(&execution_id, request)
+                    .map(|()| self.current_snapshot()),
+            )),
             ActorRequest::StopCycle => self
                 .stop_cycle()
                 .and_then(|()| self.persist_and_publish())
@@ -1220,7 +1401,9 @@ impl DeviceActor {
                     .interrupt("cycle interrupted by explicit device disconnect");
                 self.disconnect()?;
             }
-            ApiCommand::Start(config) => self.start_test(config, None)?,
+            ApiCommand::Start(config) => self
+                .start_test(config, None, None)
+                .map_err(|error| error.to_string())?,
             ApiCommand::Adjust(config) => self.adjust_test(config)?,
             ApiCommand::Stop => self.stop_test()?,
             ApiCommand::Resume => self.resume_test()?,
@@ -1285,33 +1468,52 @@ impl DeviceActor {
         Ok(())
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "start preparation takes ownership of application metadata"
+    )]
     fn start_test(
         &mut self,
         config: TestConfiguration,
+        name: Option<String>,
         cycle: Option<CycleRunContext>,
-    ) -> Result<(), String> {
-        let prepared = self.controller.prepare_command(ApiCommand::Start(config))?;
+    ) -> Result<(), StartError> {
+        let name = normalize_execution_name(name.as_deref())
+            .map_err(|error| StartError::BadRequest(error.to_string()))?;
+        let name = if cycle.is_some() { None } else { name };
+        let prepared = self
+            .controller
+            .prepare_command(ApiCommand::Start(config))
+            .map_err(StartError::BadRequest)?;
         self.sync_controller_state();
-        self.persistence.archive_current(&self.snapshot)?;
+        self.persistence
+            .archive_current(&self.snapshot)
+            .map_err(StartError::Internal)?;
         let rollback = StartPreparationRollback {
             history: self.snapshot.history.clone(),
             archived_run_id: self.persistence.archived_run_id.clone(),
             current_run_id: self.persistence.current_run_id.clone(),
+            current_run_name: self.persistence.current_run_name.clone(),
             current_run_cycle: self.persistence.current_run_cycle.clone(),
             next_sequence: self.persistence.next_sequence,
             raw_sample_count: self.persistence.raw_sample_count,
         };
         if let Err(error) = self.persistence.reset_samples() {
-            return Err(self.restore_start_preparation(rollback, &error));
+            return Err(StartError::Internal(
+                self.restore_start_preparation(rollback, &error),
+            ));
         }
         self.snapshot.history.clear();
         let run_id = self.persistence.new_run_id();
-        self.persistence.begin_current_run(run_id, cycle);
+        self.persistence.begin_current_run(run_id, name, cycle);
         self.sync_controller_state();
         if let Err(error) = self.save_start_metadata() {
-            return Err(self.restore_start_preparation(rollback, &error));
+            return Err(StartError::Internal(
+                self.restore_start_preparation(rollback, &error),
+            ));
         }
-        self.send_command_frame(prepared)?;
+        self.send_command_frame(prepared)
+            .map_err(StartError::Internal)?;
         self.controller
             .commit_command(prepared, Some(Utc::now().to_rfc3339()));
         self.sync_controller_state();
@@ -1322,30 +1524,48 @@ impl DeviceActor {
         Ok(())
     }
 
-    fn start_cycle(&mut self, recipe: CycleRecipe) -> Result<(), String> {
-        recipe.validate().map_err(|error| error.to_string())?;
+    fn start_cycle(&mut self, request: StartCycleRequest) -> Result<(), StartError> {
+        request
+            .recipe
+            .validate()
+            .map_err(|error| StartError::BadRequest(error.to_string()))?;
+        let name = normalize_execution_name(request.name.as_deref())
+            .map_err(|error| StartError::BadRequest(error.to_string()))?;
         if self.cycle.is_executing() {
-            return Err("a cycle is already active".to_owned());
+            return Err(StartError::BadRequest(
+                "a cycle is already active".to_owned(),
+            ));
         }
         if !self.controller.capabilities().start {
-            return Err(
+            return Err(StartError::BadRequest(
                 "cycle start requires a fresh current-connection inactive report".to_owned(),
-            );
+            ));
         }
         if self.controller.device().current_ma != Some(0) {
-            return Err("cycle start requires confirmed zero device current".to_owned());
+            return Err(StartError::BadRequest(
+                "cycle start requires confirmed zero device current".to_owned(),
+            ));
         }
         let started_at = Utc::now().to_rfc3339();
         let execution_id = format!("cycle-{}", started_at.replace([':', '.', '+'], "-"));
-        self.persistence.begin_cycle(execution_id.clone())?;
+        self.persistence
+            .begin_cycle(execution_id.clone(), name.clone())
+            .map_err(StartError::Internal)?;
         let action = self
             .cycle
-            .start(recipe, execution_id, Some(started_at), Instant::now())
-            .map_err(|error| error.to_string())?;
+            .start(
+                request.recipe,
+                execution_id,
+                name,
+                Some(started_at),
+                Instant::now(),
+            )
+            .map_err(|error| StartError::BadRequest(error.to_string()))?;
         self.snapshot.cycle_history.clear();
         self.sync_controller_state();
         if let Some(action) = action {
-            self.execute_cycle_action(action)?;
+            self.execute_cycle_action(action)
+                .map_err(StartError::Internal)?;
         }
         Ok(())
     }
@@ -1358,13 +1578,157 @@ impl DeviceActor {
         Ok(())
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "actor requests transfer rename ownership"
+    )]
+    fn rename_run(&mut self, id: &str, request: RenameRequest) -> Result<(), RenameError> {
+        if !valid_run_id(id) {
+            return Err(RenameError::BadRequest("invalid run id".to_owned()));
+        }
+        let name = normalize_execution_name(request.name.as_deref())
+            .map_err(|error| RenameError::BadRequest(error.to_string()))?;
+
+        if self.persistence.current_run_id == id {
+            if self.persistence.current_run_cycle.is_some() {
+                return Err(RenameError::BadRequest(
+                    "cycle child runs cannot be named independently; rename the cycle instead"
+                        .to_owned(),
+                ));
+            }
+            let archived = self
+                .persistence
+                .runs
+                .iter()
+                .position(|summary| summary.id == id);
+            let previous_summary = archived.map(|index| self.persistence.runs[index].clone());
+            if let Some(previous) = &previous_summary {
+                if previous.cycle.is_some() {
+                    return Err(RenameError::BadRequest(
+                        "cycle child runs cannot be named independently; rename the cycle instead"
+                            .to_owned(),
+                    ));
+                }
+                let mut renamed = previous.clone();
+                renamed.name.clone_from(&name);
+                self.persistence
+                    .rewrite_run_summary(&renamed)
+                    .map_err(RenameError::Internal)?;
+            }
+
+            let previous_name = self.persistence.current_run_name.clone();
+            self.persistence.current_run_name.clone_from(&name);
+            self.persistence.sync_snapshot_metadata(&mut self.snapshot);
+            if let Err(error) = self.persistence.save_metadata(&self.snapshot) {
+                self.persistence.current_run_name = previous_name;
+                self.persistence.sync_snapshot_metadata(&mut self.snapshot);
+                if let Some(previous) = previous_summary
+                    && let Err(rollback_error) = self.persistence.rewrite_run_summary(&previous)
+                {
+                    return Err(RenameError::Internal(format!(
+                        "{error}; failed to restore archived run name: {rollback_error}"
+                    )));
+                }
+                return Err(RenameError::Internal(error));
+            }
+            if let Some(index) = archived {
+                self.persistence.runs[index].name = name;
+            }
+            self.publish();
+            return Ok(());
+        }
+
+        let Some(index) = self
+            .persistence
+            .runs
+            .iter()
+            .position(|summary| summary.id == id)
+        else {
+            return Err(RenameError::NotFound("run not found".to_owned()));
+        };
+        if self.persistence.runs[index].cycle.is_some() {
+            return Err(RenameError::BadRequest(
+                "cycle child runs cannot be named independently; rename the cycle instead"
+                    .to_owned(),
+            ));
+        }
+        let mut renamed = self.persistence.runs[index].clone();
+        renamed.name = name;
+        self.persistence
+            .rewrite_run_summary(&renamed)
+            .map_err(RenameError::Internal)?;
+        self.persistence.runs[index] = renamed;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "actor requests transfer rename ownership"
+    )]
+    fn rename_cycle(
+        &mut self,
+        execution_id: &str,
+        request: RenameRequest,
+    ) -> Result<(), RenameError> {
+        if !valid_run_id(execution_id) {
+            return Err(RenameError::BadRequest(
+                "invalid cycle execution id".to_owned(),
+            ));
+        }
+        let name = normalize_execution_name(request.name.as_deref())
+            .map_err(|error| RenameError::BadRequest(error.to_string()))?;
+        if !self.persistence.cycle_path(execution_id).is_file() {
+            return Err(RenameError::NotFound(
+                "cycle execution not found".to_owned(),
+            ));
+        }
+
+        let previous = self
+            .persistence
+            .load_cycle_metadata(execution_id)
+            .map_err(RenameError::Internal)?;
+        let renamed = CycleExecutionMetadata {
+            execution_id: execution_id.to_owned(),
+            name: name.clone(),
+        };
+        self.persistence
+            .write_cycle_metadata(&renamed)
+            .map_err(RenameError::Internal)?;
+
+        if self.snapshot.cycle.execution_id.as_deref() == Some(execution_id) {
+            let previous_name = self.persistence.current_cycle_name.clone();
+            self.persistence.current_cycle_id = Some(execution_id.to_owned());
+            self.persistence.current_cycle_name = name;
+            self.persistence.sync_snapshot_metadata(&mut self.snapshot);
+            if let Err(error) = self.persistence.save_metadata(&self.snapshot) {
+                self.persistence.current_cycle_name = previous_name;
+                self.persistence.sync_snapshot_metadata(&mut self.snapshot);
+                let rollback = match previous {
+                    Some(metadata) => self.persistence.write_cycle_metadata(&metadata),
+                    None => fs::remove_file(self.persistence.cycle_metadata_path(execution_id))
+                        .map_err(|rollback_error| rollback_error.to_string())
+                        .and_then(|()| sync_directory(&self.persistence.cycles_dir)),
+                };
+                return Err(RenameError::Internal(match rollback {
+                    Ok(()) => error,
+                    Err(rollback_error) => {
+                        format!("{error}; failed to restore cycle name: {rollback_error}")
+                    }
+                }));
+            }
+            self.publish();
+        }
+        Ok(())
+    }
+
     fn execute_cycle_action(&mut self, action: CycleAction) -> Result<(), String> {
         let result = match action {
             CycleAction::Start(config) => {
                 let context = self
                     .current_cycle_context()
                     .ok_or_else(|| "cycle device step is missing execution context".to_owned())?;
-                self.start_test(config, Some(context))
+                self.start_test(config, None, Some(context))
+                    .map_err(|error| error.to_string())
             }
             CycleAction::Stop => self.stop_test(),
         };
@@ -1411,6 +1775,7 @@ impl DeviceActor {
         self.snapshot.history = rollback.history;
         self.persistence.archived_run_id = rollback.archived_run_id.clone();
         self.persistence.current_run_id = rollback.current_run_id;
+        self.persistence.current_run_name = rollback.current_run_name;
         self.persistence.current_run_cycle = rollback.current_run_cycle;
         self.persistence.next_sequence = rollback.next_sequence;
         self.persistence.raw_sample_count = rollback.raw_sample_count;
@@ -1922,7 +2287,9 @@ impl DeviceActor {
     }
 
     fn publish(&self) {
-        let update = SnapshotUpdate::from(&self.snapshot);
+        let mut snapshot = self.snapshot.clone();
+        self.persistence.sync_snapshot_metadata(&mut snapshot);
+        let update = SnapshotUpdate::from(&snapshot);
         let _receivers = self.snapshot_tx.send(WebSocketEvent::Update(update));
     }
 
@@ -1931,6 +2298,7 @@ impl DeviceActor {
         self.snapshot.device = self.controller.device().clone();
         self.snapshot.test = self.controller.test().clone();
         self.snapshot.cycle = self.cycle.status().clone();
+        self.persistence.sync_snapshot_metadata(&mut self.snapshot);
         self.snapshot.capabilities = self.controller.capabilities();
         if self.cycle.owns_orchestration() {
             self.snapshot.capabilities.start = false;
@@ -1946,6 +2314,7 @@ impl DeviceActor {
 
     fn snapshot_for_clients(&self) -> AuthoritativeSnapshot {
         let mut snapshot = self.snapshot.clone();
+        self.persistence.sync_snapshot_metadata(&mut snapshot);
         snapshot.history = presentation_history(&snapshot.history, SNAPSHOT_SAMPLE_LIMIT);
         snapshot.cycle_history =
             cycle_presentation_history(&snapshot.cycle_history, SNAPSHOT_SAMPLE_LIMIT);
@@ -2025,6 +2394,8 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         .route("/cycles/{id}/history.csv", get(get_cycle_csv))
         .route("/runs", get(get_runs))
         .route("/runs/{file}", get(get_run_csv))
+        .route("/runs/{run_id}/name", post(rename_run))
+        .route("/cycles/{execution_id}/name", post(rename_cycle))
         .route("/connect", post(connect))
         .route("/disconnect", post(disconnect))
         .route("/test/start", post(start_test))
@@ -2127,6 +2498,22 @@ async fn cycle_command(
 ) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
     match request(state, request_kind).await? {
         ActorResponse::Snapshot(snapshot) => Ok(Json(snapshot)),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+async fn start_command(
+    state: &AppState,
+    request_kind: ActorRequest,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    match request(state, request_kind).await? {
+        ActorResponse::Start(Ok(snapshot)) => Ok(Json(snapshot)),
+        ActorResponse::Start(Err(StartError::BadRequest(message))) => {
+            Err(ApiError::bad_request(message))
+        }
+        ActorResponse::Start(Err(StartError::Internal(message))) => {
+            Err(ApiError::internal(message))
+        }
         _ => Err(ApiError::internal("unexpected actor response")),
     }
 }
@@ -2238,13 +2625,16 @@ async fn disconnect(
 async fn start_test(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(config): Json<TestConfiguration>,
+    Json(mut request_body): Json<StartTestRequest>,
 ) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
     validate_mutation(&headers, &state)?;
-    config
+    request_body
+        .config
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    command(&state, ApiCommand::Start(config)).await
+    request_body.name = normalize_execution_name(request_body.name.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    start_command(&state, ActorRequest::StartTest(request_body)).await
 }
 
 async fn stop_test(
@@ -2278,13 +2668,79 @@ async fn resume_test(
 async fn start_cycle(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(recipe): Json<CycleRecipe>,
+    Json(mut request_body): Json<StartCycleRequest>,
 ) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
     validate_mutation(&headers, &state)?;
-    recipe
+    request_body
+        .recipe
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    cycle_command(&state, ActorRequest::StartCycle(recipe)).await
+    request_body.name = normalize_execution_name(request_body.name.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    start_command(&state, ActorRequest::StartCycle(request_body)).await
+}
+
+async fn rename_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(run_id): AxumPath<String>,
+    Json(request_body): Json<RenameRequest>,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    if !valid_run_id(&run_id) {
+        return Err(ApiError::bad_request("invalid run id"));
+    }
+    normalize_execution_name(request_body.name.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    rename_command(
+        &state,
+        ActorRequest::RenameRun {
+            id: run_id,
+            request: request_body,
+        },
+    )
+    .await
+}
+
+async fn rename_cycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(execution_id): AxumPath<String>,
+    Json(request_body): Json<RenameRequest>,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    if !valid_run_id(&execution_id) {
+        return Err(ApiError::bad_request("invalid cycle execution id"));
+    }
+    normalize_execution_name(request_body.name.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    rename_command(
+        &state,
+        ActorRequest::RenameCycle {
+            execution_id,
+            request: request_body,
+        },
+    )
+    .await
+}
+
+async fn rename_command(
+    state: &AppState,
+    request_kind: ActorRequest,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    match request(state, request_kind).await? {
+        ActorResponse::Rename(Ok(snapshot)) => Ok(Json(snapshot)),
+        ActorResponse::Rename(Err(RenameError::BadRequest(message))) => {
+            Err(ApiError::bad_request(message))
+        }
+        ActorResponse::Rename(Err(RenameError::NotFound(message))) => {
+            Err(ApiError::not_found(message))
+        }
+        ActorResponse::Rename(Err(RenameError::Internal(message))) => {
+            Err(ApiError::internal(message))
+        }
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
 }
 
 async fn stop_cycle(
@@ -2430,6 +2886,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
@@ -2615,11 +3078,18 @@ mod tests {
         }
     }
 
-    fn cycle_recipe(steps: Vec<crate::core::CycleStep>, repeat_count: u32) -> CycleRecipe {
-        CycleRecipe {
+    fn cycle_recipe(
+        steps: Vec<crate::core::CycleStep>,
+        repeat_count: u32,
+    ) -> crate::core::CycleRecipe {
+        crate::core::CycleRecipe {
             steps,
             repeat_count,
         }
+    }
+
+    fn unnamed_cycle(recipe: crate::core::CycleRecipe) -> StartCycleRequest {
+        StartCycleRequest { recipe, name: None }
     }
 
     fn confirm_inactive(actor: &mut DeviceActor) {
@@ -2642,7 +3112,9 @@ mod tests {
     }
 
     fn confirm_running(actor: &mut DeviceActor) {
-        actor.start_test(test_config(), None).expect("start test");
+        actor
+            .start_test(test_config(), None, None)
+            .expect("start test");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
             4000,
@@ -2788,7 +3260,7 @@ mod tests {
         let (mut actor, directory) = mock_actor("duplicate-reports");
         confirm_inactive(&mut actor);
         actor
-            .start_test(test_config(), None)
+            .start_test(test_config(), None, None)
             .expect("start command");
         for raw_capacity in [100, 100, 95] {
             actor.record_report(
@@ -3089,7 +3561,9 @@ mod tests {
     fn starting_disconnect_stops_before_disconnect() {
         let (mut actor, directory) = mock_actor("starting-safe-disconnect");
         confirm_inactive(&mut actor);
-        actor.start_test(test_config(), None).expect("start test");
+        actor
+            .start_test(test_config(), None, None)
+            .expect("start test");
         assert_eq!(actor.snapshot.test.state, TestState::Starting);
         actor.sent_frames.clear();
 
@@ -3248,12 +3722,16 @@ mod tests {
         inject_write_failure(&mut actor);
 
         let error = actor
-            .handle_command(ApiCommand::Start(test_config()))
+            .start_test(test_config(), Some("uncertain run".to_owned()), None)
             .expect_err("start write fails");
 
-        assert!(error.contains("injected serial write failure"));
+        assert!(error.to_string().contains("injected serial write failure"));
         assert_failed_transport(&actor);
         assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+        assert_eq!(
+            actor.current_snapshot().current_run.name.as_deref(),
+            Some("uncertain run")
+        );
         assert!(
             actor
                 .snapshot
@@ -3275,7 +3753,7 @@ mod tests {
         inject_write_failure(&mut actor);
 
         actor
-            .start_test(test_config(), None)
+            .start_test(test_config(), None, None)
             .expect_err("metadata write fails");
 
         assert_eq!(actor.snapshot.test.state, TestState::Idle);
@@ -3292,7 +3770,18 @@ mod tests {
     fn late_start_metadata_failure_restores_archived_run_for_retry() {
         let (mut actor, directory) = mock_actor("late-start-metadata-failure");
         confirm_inactive(&mut actor);
-        confirm_running(&mut actor);
+        actor
+            .start_test(test_config(), Some("stable name".to_owned()), None)
+            .expect("start named test");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
         actor.stop_test().expect("stop previous run");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
@@ -3305,17 +3794,20 @@ mod tests {
         );
         let previous_history = actor.snapshot.history.clone();
         let previous_run_id = actor.persistence.current_run_id.clone();
+        let previous_run_name = actor.persistence.current_run_name.clone();
         let previous_sample_count = actor.persistence.raw_sample_count;
         actor.start_metadata_failure = Some("injected metadata failure".to_owned());
         actor.write_failure = Some("physical send must not run".to_owned());
 
         actor
-            .start_test(test_config(), None)
+            .start_test(test_config(), Some("attempted name".to_owned()), None)
             .expect_err("metadata write fails");
 
         assert_eq!(actor.snapshot.test.state, TestState::Stopped);
         assert_eq!(actor.snapshot.history, previous_history);
         assert_eq!(actor.persistence.current_run_id, previous_run_id);
+        assert_eq!(actor.persistence.current_run_name, previous_run_name);
+        assert_eq!(actor.current_snapshot().current_run.name, previous_run_name);
         assert_eq!(actor.persistence.raw_sample_count, previous_sample_count);
         assert_eq!(actor.persistence.runs.len(), 1);
         assert!(
@@ -3325,7 +3817,9 @@ mod tests {
 
         actor.write_failure = None;
         actor.start_metadata_failure = None;
-        actor.start_test(test_config(), None).expect("retry start");
+        actor
+            .start_test(test_config(), None, None)
+            .expect("retry start");
         assert_eq!(actor.persistence.runs.len(), 1);
         assert_eq!(actor.snapshot.test.state, TestState::Starting);
         fs::remove_dir_all(directory).expect("remove test directory");
@@ -3630,7 +4124,7 @@ mod tests {
         let directory = temporary_directory("cycle-export-prefix");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
         persistence
-            .begin_cycle("cycle-one".to_owned())
+            .begin_cycle("cycle-one".to_owned(), None)
             .expect("begin cycle");
         persistence
             .append_cycle_sample(&numbered_cycle_sample("cycle-one", 0))
@@ -3648,7 +4142,7 @@ mod tests {
         assert_eq!(prefix_contents.lines().count(), 2);
 
         persistence
-            .begin_cycle("cycle-two".to_owned())
+            .begin_cycle("cycle-two".to_owned(), None)
             .expect("begin second cycle");
         persistence
             .append_cycle_sample(&numbered_cycle_sample("cycle-two", 0))
@@ -3673,7 +4167,7 @@ mod tests {
         let directory = temporary_directory("cycle-presentation-bound");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
         persistence
-            .begin_cycle("cycle-bounded".to_owned())
+            .begin_cycle("cycle-bounded".to_owned(), None)
             .expect("begin cycle");
         let samples: Vec<_> = (0..100)
             .map(|sequence| numbered_cycle_sample("cycle-bounded", sequence))
@@ -3702,7 +4196,7 @@ mod tests {
         let directory = temporary_directory("cycle-sequence-order");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
         persistence
-            .begin_cycle("cycle-sequences".to_owned())
+            .begin_cycle("cycle-sequences".to_owned(), None)
             .expect("begin cycle");
         persistence
             .append_cycle_sample(&numbered_cycle_sample("cycle-sequences", 1))
@@ -3783,16 +4277,19 @@ mod tests {
         let (mut actor, directory) = mock_actor("cycle-no-client");
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(
-                vec![
-                    device_step(),
-                    crate::core::CycleStep::Rest {
-                        duration_seconds: 1,
-                    },
-                    device_step(),
-                ],
-                2,
-            ))
+            .start_cycle(StartCycleRequest {
+                recipe: cycle_recipe(
+                    vec![
+                        device_step(),
+                        crate::core::CycleStep::Rest {
+                            duration_seconds: 1,
+                        },
+                        device_step(),
+                    ],
+                    2,
+                ),
+                name: Some("completed cycle".to_owned()),
+            })
             .expect("start cycle");
         assert_eq!(actor.cycle.status().state, CycleState::StartingStep);
         assert!(
@@ -3802,7 +4299,7 @@ mod tests {
         );
         assert!(
             actor
-                .start_cycle(cycle_recipe(vec![device_step()], 1))
+                .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
                 .is_err()
         );
 
@@ -3872,6 +4369,10 @@ mod tests {
         }
 
         assert_eq!(actor.cycle.status().state, CycleState::Completed);
+        assert_eq!(
+            actor.current_snapshot().cycle.name.as_deref(),
+            Some("completed cycle")
+        );
         let starts = actor
             .sent_frames
             .iter()
@@ -3901,7 +4402,7 @@ mod tests {
                 .persistence
                 .run_summaries()
                 .iter()
-                .all(|summary| summary.sample_count == 1)
+                .all(|summary| summary.sample_count == 1 && summary.name.is_none())
         );
 
         let execution_id = actor
@@ -3974,15 +4475,35 @@ mod tests {
         };
         let mut restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
         assert_eq!(restarted.cycle.status().state, CycleState::Completed);
+        assert_eq!(
+            restarted.current_snapshot().cycle.name.as_deref(),
+            Some("completed cycle")
+        );
         assert_eq!(restarted.snapshot.cycle_history, history);
         confirm_inactive(&mut restarted);
         restarted
-            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
             .expect("start later cycle");
         assert!(restarted.persistence.cycle_path(&execution_id).is_file());
         assert_eq!(
             fs::read_dir(directory.join("cycles"))
                 .expect("read cycles directory")
+                .filter_map(Result::ok)
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("csv")
+                )
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_dir(directory.join("cycles"))
+                .expect("read cycles directory")
+                .filter_map(Result::ok)
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("json")
+                )
                 .count(),
             2
         );
@@ -3995,7 +4516,7 @@ mod tests {
         let (mut actor, directory) = mock_actor("cycle-firmware-filter");
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
             .expect("start cycle");
 
         actor.record_report_with_source(
@@ -4028,7 +4549,10 @@ mod tests {
         let (mut actor, directory) = mock_actor("cycle-stop-policy");
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(vec![device_step(), device_step()], 1))
+            .start_cycle(unnamed_cycle(cycle_recipe(
+                vec![device_step(), device_step()],
+                1,
+            )))
             .expect("start cycle");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
@@ -4055,7 +4579,7 @@ mod tests {
 
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
             .expect("second cycle");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
@@ -4071,7 +4595,7 @@ mod tests {
 
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
             .expect("third cycle");
         actor
             .handle_command(ApiCommand::Disconnect)
@@ -4089,7 +4613,7 @@ mod tests {
         let (mut actor, directory) = mock_actor("cycle-stop-retry");
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
             .expect("start cycle");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
@@ -4144,12 +4668,12 @@ mod tests {
         let (mut actor, directory) = mock_actor("cycle-restart");
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(
+            .start_cycle(unnamed_cycle(cycle_recipe(
                 vec![crate::core::CycleStep::Rest {
                     duration_seconds: 60,
                 }],
                 1,
-            ))
+            )))
             .expect("start rest cycle");
         actor.persist_and_publish().expect("persist rest");
         drop(actor);
@@ -4171,7 +4695,7 @@ mod tests {
         inject_write_failure(&mut restarted);
         assert!(
             restarted
-                .start_cycle(cycle_recipe(vec![device_step()], 1))
+                .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
                 .is_err()
         );
         assert_eq!(restarted.cycle.status().state, CycleState::Interrupted);
@@ -4183,7 +4707,10 @@ mod tests {
         let (mut actor, directory) = mock_actor("cycle-active-restart");
         confirm_inactive(&mut actor);
         actor
-            .start_cycle(cycle_recipe(vec![device_step(), device_step()], 2))
+            .start_cycle(unnamed_cycle(cycle_recipe(
+                vec![device_step(), device_step()],
+                2,
+            )))
             .expect("start cycle");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
@@ -4230,6 +4757,292 @@ mod tests {
         );
         assert!(restarted.persistence.cycle_path(&execution_id).is_file());
         assert!(restarted.sent_frames.is_empty());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn legacy_metadata_loads_without_names() {
+        let directory = temporary_directory("legacy-name-metadata");
+        let persistence = Persistence::new(&directory).expect("create persistence");
+        persistence
+            .save_metadata(&AuthoritativeSnapshot::default())
+            .expect("save metadata");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&persistence.metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        metadata
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("current_run_name");
+        metadata["cycle"]
+            .as_object_mut()
+            .expect("cycle object")
+            .remove("name");
+        fs::write(
+            &persistence.metadata_path,
+            serde_json::to_vec_pretty(&metadata).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy metadata");
+        drop(persistence);
+
+        let mut restarted = Persistence::new(&directory).expect("restart persistence");
+        let snapshot = restarted.load().expect("load legacy metadata");
+        assert_eq!(snapshot.current_run.name, None);
+        assert_eq!(snapshot.cycle.name, None);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one lifecycle test verifies one durable run"
+    )]
+    fn manual_run_names_archive_rename_clear_and_restart_without_touching_csv() {
+        let (mut actor, directory) = mock_actor("manual-run-names");
+        confirm_inactive(&mut actor);
+        actor
+            .start_test(test_config(), Some("  first run  ".to_owned()), None)
+            .expect("start named run");
+        let first_current_id = actor.persistence.current_run_id.clone();
+        assert_eq!(
+            actor.current_snapshot().current_run.name.as_deref(),
+            Some("first run")
+        );
+        assert_eq!(
+            actor.current_snapshot().current_run.id.as_deref(),
+            Some(first_current_id.as_str())
+        );
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.stop_test().expect("stop first run");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            0,
+            2,
+            ReportState::Idle,
+            "EBC-MOCK",
+            None,
+        );
+        let archive_snapshot = actor.current_snapshot();
+        let archived_while_current = actor
+            .persistence
+            .archive_current(&archive_snapshot)
+            .expect("archive current run")
+            .expect("current archive");
+        assert_eq!(archived_while_current.id, first_current_id);
+        actor.sent_frames.clear();
+        actor
+            .rename_run(
+                &first_current_id,
+                RenameRequest {
+                    name: Some("first archived".to_owned()),
+                },
+            )
+            .expect("rename current archived run");
+        assert!(actor.sent_frames.is_empty());
+        assert_eq!(
+            actor
+                .persistence
+                .run_summaries()
+                .into_iter()
+                .find(|summary| summary.id == first_current_id)
+                .expect("current archived summary")
+                .name
+                .as_deref(),
+            Some("first archived")
+        );
+        actor
+            .start_test(test_config(), None, None)
+            .expect("start unnamed run");
+        assert_eq!(actor.current_snapshot().current_run.name, None);
+
+        let archived = actor
+            .persistence
+            .run_summaries()
+            .into_iter()
+            .find(|summary| summary.name.as_deref() == Some("first archived"))
+            .expect("named archive");
+        let archived_id = archived.id.clone();
+        let csv_path = actor
+            .persistence
+            .runs_dir
+            .join(format!("{archived_id}.csv"));
+        let csv_before = fs::read(&csv_path).expect("read archived CSV");
+        actor.sent_frames.clear();
+        actor
+            .rename_run(
+                &archived_id,
+                RenameRequest {
+                    name: Some("  renamed archive  ".to_owned()),
+                },
+            )
+            .expect("rename archived run");
+        assert!(actor.sent_frames.is_empty());
+        assert_eq!(
+            fs::read(&csv_path).expect("reread archived CSV"),
+            csv_before
+        );
+        let renamed = actor
+            .persistence
+            .run_summaries()
+            .into_iter()
+            .find(|summary| summary.id == archived_id)
+            .expect("renamed summary");
+        assert_eq!(renamed.name.as_deref(), Some("renamed archive"));
+        assert_eq!(renamed.id, archived.id);
+        actor
+            .rename_run(&archived_id, RenameRequest::default())
+            .expect("clear archived name");
+        assert_eq!(
+            actor
+                .persistence
+                .run_summaries()
+                .into_iter()
+                .find(|summary| summary.id == archived_id)
+                .expect("cleared summary")
+                .name,
+            None
+        );
+
+        let second_id = actor.persistence.current_run_id.clone();
+        actor
+            .rename_run(
+                &second_id,
+                RenameRequest {
+                    name: Some("second run".to_owned()),
+                },
+            )
+            .expect("name current run");
+        actor.shutdown().expect("persist current name");
+        drop(actor);
+        let (snapshot_tx, _) = broadcast::channel(4);
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/null".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        let mut restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
+        assert_eq!(
+            restarted.current_snapshot().current_run.name.as_deref(),
+            Some("second run")
+        );
+        assert_eq!(restarted.persistence.current_run_id, second_id);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn cycle_names_use_sidecars_survive_restart_and_never_name_child_runs() {
+        let (mut actor, directory) = mock_actor("cycle-names");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(StartCycleRequest {
+                recipe: cycle_recipe(vec![device_step()], 1),
+                name: Some("  formation  ".to_owned()),
+            })
+            .expect("start named cycle");
+        let execution_id = actor
+            .cycle
+            .status()
+            .execution_id
+            .clone()
+            .expect("execution id");
+        let child_id = actor.persistence.current_run_id.clone();
+        assert_eq!(
+            actor.current_snapshot().cycle.name.as_deref(),
+            Some("formation")
+        );
+        assert_eq!(actor.current_snapshot().current_run.name, None);
+        assert!(actor.current_snapshot().current_run.cycle.is_some());
+        let metadata = actor
+            .persistence
+            .load_cycle_metadata(&execution_id)
+            .expect("load sidecar")
+            .expect("sidecar exists");
+        assert_eq!(metadata.name.as_deref(), Some("formation"));
+
+        let cycle_csv = actor.persistence.cycle_path(&execution_id);
+        let csv_before = fs::read(&cycle_csv).expect("read cycle CSV");
+        actor.sent_frames.clear();
+        actor
+            .rename_cycle(
+                &execution_id,
+                RenameRequest {
+                    name: Some("renamed cycle".to_owned()),
+                },
+            )
+            .expect("rename cycle");
+        assert!(actor.sent_frames.is_empty());
+        assert_eq!(fs::read(&cycle_csv).expect("reread cycle CSV"), csv_before);
+        assert_eq!(
+            actor.current_snapshot().cycle.name.as_deref(),
+            Some("renamed cycle")
+        );
+        assert!(matches!(
+            actor.rename_run(&child_id, RenameRequest::default()),
+            Err(RenameError::BadRequest(message)) if message.contains("cycle child")
+        ));
+        assert!(matches!(
+            actor.rename_cycle("unknown-cycle", RenameRequest::default()),
+            Err(RenameError::NotFound(_))
+        ));
+        assert!(matches!(
+            actor.rename_run("unknown-run", RenameRequest::default()),
+            Err(RenameError::NotFound(_))
+        ));
+
+        actor.persist_and_publish().expect("persist cycle name");
+        drop(actor);
+        let (snapshot_tx, _) = broadcast::channel(4);
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/null".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        let mut restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
+        assert_eq!(
+            restarted.current_snapshot().cycle.name.as_deref(),
+            Some("renamed cycle")
+        );
+        assert_eq!(
+            fs::read(&cycle_csv).expect("read old cycle CSV"),
+            csv_before
+        );
+        confirm_inactive(&mut restarted);
+        restarted
+            .start_cycle(StartCycleRequest {
+                recipe: cycle_recipe(
+                    vec![crate::core::CycleStep::Rest {
+                        duration_seconds: 1,
+                    }],
+                    1,
+                ),
+                name: None,
+            })
+            .expect("start second cycle");
+        assert_eq!(restarted.current_snapshot().cycle.name, None);
+        assert!(cycle_csv.is_file());
+        assert_eq!(
+            restarted
+                .persistence
+                .load_cycle_metadata(&execution_id)
+                .expect("load old sidecar")
+                .expect("old sidecar")
+                .name
+                .as_deref(),
+            Some("renamed cycle")
+        );
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

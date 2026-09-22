@@ -213,23 +213,44 @@ fn send_backend_command(
     event_tx: &BackendEventSender,
 ) {
     match &command {
-        BackendCommand::StartCycle(recipe) => {
+        BackendCommand::StartTest(request) => {
+            event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
+                direction: DiagnosticDirection::Out,
+                label: "StartTest".to_owned(),
+                raw_bytes: Vec::new(),
+            }));
+            let result = send_json(&format!("{}/api/test/start", urls.base), request, agent);
+            publish_command_result(result, event_tx);
+            return;
+        }
+        BackendCommand::StartCycle(request) => {
             event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
                 direction: DiagnosticDirection::Out,
                 label: "StartCycle".to_owned(),
                 raw_bytes: Vec::new(),
             }));
-            let request = agent
-                .post(&format!("{}/api/cycle/start", urls.base))
-                .set(COMMAND_HEADER, "1");
-            let result = request
-                .send_json(recipe)
-                .map_err(format_http_error)
-                .and_then(|response| {
-                    response
-                        .into_json::<AuthoritativeSnapshot>()
-                        .map_err(|error| format!("invalid server response: {error}"))
-                });
+            let result = send_json(&format!("{}/api/cycle/start", urls.base), request, agent);
+            publish_command_result(result, event_tx);
+            return;
+        }
+        BackendCommand::RenameRun { run_id, request } => {
+            let result = send_json(
+                &format!("{}/api/runs/{run_id}/name", urls.base),
+                request,
+                agent,
+            );
+            publish_command_result(result, event_tx);
+            return;
+        }
+        BackendCommand::RenameCycle {
+            execution_id,
+            request,
+        } => {
+            let result = send_json(
+                &format!("{}/api/cycles/{execution_id}/name", urls.base),
+                request,
+                agent,
+            );
             publish_command_result(result, event_tx);
             return;
         }
@@ -286,18 +307,40 @@ fn publish_command_result(
     }
 }
 
+fn send_json<T: serde::Serialize>(
+    url: &str,
+    body: &T,
+    agent: &ureq::Agent,
+) -> Result<AuthoritativeSnapshot, String> {
+    agent
+        .post(url)
+        .set(COMMAND_HEADER, "1")
+        .send_json(body)
+        .map_err(format_http_error)?
+        .into_json()
+        .map_err(|error| format!("invalid server response: {error}"))
+}
+
 fn send_command(
     command: ApiCommand,
     urls: &RemoteUrls,
     agent: &ureq::Agent,
 ) -> Result<AuthoritativeSnapshot, String> {
-    let request = agent.post(&urls.endpoint(command)).set(COMMAND_HEADER, "1");
+    if matches!(command, ApiCommand::Start(_)) {
+        return Err(
+            "ApiCommand::Start cannot be sent remotely; use BackendCommand::StartTest".to_owned(),
+        );
+    }
+    let request = agent
+        .post(&urls.endpoint(command)?)
+        .set(COMMAND_HEADER, "1");
     let response = match command {
-        ApiCommand::Start(config) | ApiCommand::Adjust(config) => request.send_json(config),
+        ApiCommand::Adjust(config) => request.send_json(config),
         ApiCommand::Calibration(calibration) => request.send_json(calibration),
         ApiCommand::Connect | ApiCommand::Disconnect | ApiCommand::Stop | ApiCommand::Resume => {
             request.call()
         }
+        ApiCommand::Start(_) => unreachable!("start was rejected above"),
     }
     .map_err(format_http_error)?;
     response
@@ -355,6 +398,7 @@ fn publish_network_error(event_tx: &BackendEventSender, error: &str) {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "transport tests should fail fast")]
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -362,6 +406,130 @@ mod tests {
     use futures::channel::mpsc;
 
     use super::*;
+    use crate::core::{
+        CycleRecipe, RenameRequest, StartCycleRequest, StartTestRequest, TestConfiguration,
+    };
+
+    fn config() -> TestConfiguration {
+        TestConfiguration::DischargeConstantCurrent {
+            current_ma: 1000,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        }
+    }
+
+    fn capture_backend_request(command: BackendCommand) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP test server");
+        let address = listener.local_addr().expect("HTTP test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept HTTP command");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set HTTP read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let expected_len = loop {
+                let read = stream.read(&mut chunk).expect("read HTTP command");
+                assert_ne!(read, 0, "HTTP command ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]).to_ascii_lowercase();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("JSON Content-Length header");
+                break headers_end + 4 + content_length;
+            };
+            while request.len() < expected_len {
+                let read = stream.read(&mut chunk).expect("read HTTP body");
+                assert_ne!(read, 0, "HTTP command body ended early");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let body = serde_json::to_string(&AuthoritativeSnapshot::default())
+                .expect("serialize response snapshot");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HTTP response");
+            String::from_utf8(request).expect("HTTP request is UTF-8")
+        });
+
+        let urls = RemoteUrls::parse(&format!("http://{address}")).expect("remote URLs");
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let event_tx = BackendEventSender::new(event_tx, || {});
+        let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
+        send_backend_command(command, &urls, &agent, &event_tx);
+        server.join().expect("HTTP test server")
+    }
+
+    fn request_body(request: &str) -> serde_json::Value {
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+        serde_json::from_str(body).expect("JSON request body")
+    }
+
+    #[test]
+    fn naming_commands_use_canonical_routes_and_envelopes() {
+        let start_test = StartTestRequest {
+            config: config(),
+            name: Some("run name".to_owned()),
+        };
+        let request = capture_backend_request(BackendCommand::StartTest(start_test.clone()));
+        assert!(request.starts_with("POST /api/test/start HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-ebc-command: 1\r\n")
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(start_test).expect("serialize start test")
+        );
+
+        let start_cycle = StartCycleRequest {
+            recipe: CycleRecipe {
+                steps: Vec::new(),
+                repeat_count: 1,
+            },
+            name: Some("cycle name".to_owned()),
+        };
+        let request = capture_backend_request(BackendCommand::StartCycle(start_cycle.clone()));
+        assert!(request.starts_with("POST /api/cycle/start HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(start_cycle).expect("serialize start cycle")
+        );
+
+        let rename = RenameRequest {
+            name: Some("renamed".to_owned()),
+        };
+        let request = capture_backend_request(BackendCommand::RenameRun {
+            run_id: "run-1".to_owned(),
+            request: rename.clone(),
+        });
+        assert!(request.starts_with("POST /api/runs/run-1/name HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(&rename).expect("serialize run rename")
+        );
+
+        let request = capture_backend_request(BackendCommand::RenameCycle {
+            execution_id: "cycle-1".to_owned(),
+            request: rename.clone(),
+        });
+        assert!(request.starts_with("POST /api/cycles/cycle-1/name HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(rename).expect("serialize cycle rename")
+        );
+    }
 
     #[test]
     fn disconnected_commands_are_rejected_and_never_retained() {

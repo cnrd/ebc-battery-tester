@@ -116,6 +116,7 @@ impl CycleEngine {
         &mut self,
         recipe: CycleRecipe,
         execution_id: String,
+        name: Option<String>,
         started_at_utc: Option<String>,
         now: Instant,
     ) -> Result<Option<CycleAction>, ValidationError> {
@@ -131,6 +132,7 @@ impl CycleEngine {
             state: CycleState::Preparing,
             recipe: Some(recipe),
             execution_id: Some(execution_id),
+            name,
             repeat_index: 0,
             step_index: 0,
             started_at_utc,
@@ -479,6 +481,7 @@ mod tests {
             .start(
                 recipe,
                 "execution".to_owned(),
+                None,
                 Some("timestamp".to_owned()),
                 now,
             )
@@ -508,6 +511,7 @@ mod tests {
                 .start(
                     recipe(vec![device_step(100)], 1),
                     "other".to_owned(),
+                    None,
                     Some("timestamp".to_owned()),
                     now,
                 )
@@ -855,16 +859,23 @@ mod tests {
     fn persisted_active_status_round_trips_then_recovers_interrupted() {
         let now = Instant::now();
         let mut engine = CycleEngine::new();
-        start(
-            &mut engine,
-            recipe(
-                vec![CycleStep::Rest {
-                    duration_seconds: 5,
-                }],
-                1,
-            ),
-            now,
+        let action = engine
+            .start(
+                recipe(vec![device_step(100)], 1),
+                "execution".to_owned(),
+                Some("Formation cycle".to_owned()),
+                Some("timestamp".to_owned()),
+                now,
+            )
+            .expect("valid recipe");
+        assert_eq!(engine.status().state, CycleState::StartingStep);
+        assert_eq!(engine.status().name.as_deref(), Some("Formation cycle"));
+        engine.on_action_committed(
+            action.as_ref().expect("start action"),
+            &status(TestState::Running),
         );
+        assert_eq!(engine.status().state, CycleState::RunningStep);
+        assert_eq!(engine.status().name.as_deref(), Some("Formation cycle"));
         let json = serde_json::to_string(engine.status()).expect("serialize cycle status");
         let persisted = serde_json::from_str(&json).expect("deserialize cycle status");
         let recovered = CycleEngine::from_status(persisted);
@@ -873,6 +884,7 @@ mod tests {
             recovered.status().execution_id.as_deref(),
             Some("execution")
         );
+        assert_eq!(recovered.status().name.as_deref(), Some("Formation cycle"));
         assert_eq!(recovered.status().step_index, 0);
         assert_eq!(recovered.status().result.as_deref(), Some(RESTART_REASON));
         assert_eq!(recovered.pending_action(), None);

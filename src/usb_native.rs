@@ -127,12 +127,39 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                 Ok(BackendCommand::Api(command)) => {
                     publish(backend.command(command), &mut port, &event_tx, &mut backend);
                 }
+                Ok(BackendCommand::StartTest(request)) => {
+                    publish(
+                        backend.start_test(request),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
+                }
                 Ok(BackendCommand::Resume(config)) => {
                     publish(backend.resume(config), &mut port, &event_tx, &mut backend);
                 }
-                Ok(BackendCommand::StartCycle(recipe)) => {
+                Ok(BackendCommand::StartCycle(request)) => {
                     publish(
-                        backend.start_cycle(recipe),
+                        backend.start_cycle(request),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
+                }
+                Ok(BackendCommand::RenameRun { run_id, request }) => {
+                    publish(
+                        backend.rename_run(&run_id, request),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
+                }
+                Ok(BackendCommand::RenameCycle {
+                    execution_id,
+                    request,
+                }) => {
+                    publish(
+                        backend.rename_cycle(&execution_id, request),
                         &mut port,
                         &event_tx,
                         &mut backend,

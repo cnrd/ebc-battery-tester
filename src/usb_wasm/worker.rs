@@ -139,6 +139,17 @@ pub(super) async fn local_backend_task(
                             &event_tx,
                         ).await;
                     }
+                    BackendCommand::StartTest(request) => {
+                        publish(
+                            backend.start_test(request),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
+                    }
                     BackendCommand::Resume(config) => {
                         publish(
                             backend.resume(config),
@@ -150,9 +161,31 @@ pub(super) async fn local_backend_task(
                             &event_tx,
                         ).await;
                     }
-                    BackendCommand::StartCycle(recipe) => {
+                    BackendCommand::StartCycle(request) => {
                         publish(
-                            backend.start_cycle(recipe),
+                            backend.start_cycle(request),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
+                    }
+                    BackendCommand::RenameRun { run_id, request } => {
+                        publish(
+                            backend.rename_run(&run_id, request),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
+                    }
+                    BackendCommand::RenameCycle { execution_id, request } => {
+                        publish(
+                            backend.rename_cycle(&execution_id, request),
                             &mut backend,
                             &mut generation,
                             &mut device,

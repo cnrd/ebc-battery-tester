@@ -1,4 +1,7 @@
-use crate::core::{CycleRecipe, CycleState, CycleStep, CycleStepCompletion, TestConfiguration};
+use crate::core::{
+    CycleRecipe, CycleState, CycleStep, CycleStepCompletion, RenameRequest, StartCycleRequest,
+    TestConfiguration,
+};
 use crate::device;
 use crate::session::DeviceSession;
 
@@ -7,6 +10,11 @@ use crate::session::DeviceSession;
 pub(crate) struct RecipePanel {
     repeat_count: u32,
     steps: Vec<StepDraft>,
+    execution_name: String,
+    #[serde(skip)]
+    execution_name_edit: String,
+    #[serde(skip)]
+    synced_execution: Option<(String, Option<String>)>,
 }
 
 impl Default for RecipePanel {
@@ -14,6 +22,9 @@ impl Default for RecipePanel {
         Self {
             repeat_count: 1,
             steps: vec![StepDraft::default()],
+            execution_name: String::new(),
+            execution_name_edit: String::new(),
+            synced_execution: None,
         }
     }
 }
@@ -252,9 +263,14 @@ impl RecipePanel {
         ui.separator();
         ui.heading("Cycle / Recipe");
         cycle_progress(session, ui);
+        self.execution_name_ui(session, ui);
 
         let executing = session.cycle_owns_orchestration();
         ui.add_enabled_ui(!executing, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Execution name (optional)");
+                ui.text_edit_singleline(&mut self.execution_name);
+            });
             ui.horizontal(|ui| {
                 ui.label("Repeat whole recipe");
                 ui.add(
@@ -313,7 +329,10 @@ impl RecipePanel {
                 )
                 .clicked()
             {
-                session.start_cycle(recipe);
+                session.start_cycle(StartCycleRequest {
+                    recipe,
+                    name: Some(self.execution_name.clone()),
+                });
             }
             if ui
                 .add_enabled(executing, egui::Button::new("Stop recipe"))
@@ -330,6 +349,28 @@ impl RecipePanel {
             repeat_count: self.repeat_count,
         }
     }
+
+    fn execution_name_ui(&mut self, session: &mut DeviceSession, ui: &mut egui::Ui) {
+        let Some(execution_id) = session.cycle.execution_id.clone() else {
+            self.synced_execution = None;
+            self.execution_name_edit.clear();
+            return;
+        };
+        let authoritative = (execution_id, session.cycle.name.clone());
+        if self.synced_execution.as_ref() != Some(&authoritative) {
+            self.execution_name_edit = authoritative.1.clone().unwrap_or_default();
+            self.synced_execution = Some(authoritative);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Edit execution name");
+            ui.text_edit_singleline(&mut self.execution_name_edit);
+            if ui.button("Rename").clicked() {
+                session.rename_current_cycle(RenameRequest {
+                    name: Some(self.execution_name_edit.clone()),
+                });
+            }
+        });
+    }
 }
 
 enum StepOperation {
@@ -340,6 +381,12 @@ enum StepOperation {
 
 fn cycle_progress(session: &DeviceSession, ui: &mut egui::Ui) {
     let status = &session.cycle;
+    if let Some(execution_id) = &status.execution_id {
+        ui.strong(format!(
+            "Execution: {}",
+            status.name.as_deref().unwrap_or(execution_id)
+        ));
+    }
     let Some(recipe) = &status.recipe else {
         ui.weak("No cycle has been run");
         return;

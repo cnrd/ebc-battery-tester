@@ -5,8 +5,8 @@ use std::sync::Arc;
 use futures::channel::mpsc::UnboundedSender;
 
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CycleRecipe, CycleSample, Sample, SnapshotUpdate,
-    TestConfiguration,
+    ApiCommand, AuthoritativeSnapshot, CycleSample, RenameRequest, Sample, SnapshotUpdate,
+    StartCycleRequest, StartTestRequest, TestConfiguration,
 };
 use crate::device::UsbDeviceInfo;
 
@@ -16,8 +16,17 @@ pub(crate) enum BackendCommand {
     Connect(usize),
     Disconnect,
     Api(ApiCommand),
+    StartTest(StartTestRequest),
     Resume(TestConfiguration),
-    StartCycle(CycleRecipe),
+    StartCycle(StartCycleRequest),
+    RenameRun {
+        run_id: String,
+        request: RenameRequest,
+    },
+    RenameCycle {
+        execution_id: String,
+        request: RenameRequest,
+    },
     StopCycle,
     Shutdown,
 }
@@ -104,7 +113,10 @@ pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
         BackendCommand::Api(command) => vec![command],
         BackendCommand::Resume(_) => vec![ApiCommand::Resume],
         BackendCommand::RefreshDevices
+        | BackendCommand::StartTest(_)
         | BackendCommand::StartCycle(_)
+        | BackendCommand::RenameRun { .. }
+        | BackendCommand::RenameCycle { .. }
         | BackendCommand::StopCycle
         | BackendCommand::Shutdown => Vec::new(),
     }
@@ -113,6 +125,15 @@ pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{CycleRecipe, RenameRequest, StartCycleRequest, StartTestRequest};
+
+    fn config() -> TestConfiguration {
+        TestConfiguration::DischargeConstantCurrent {
+            current_ma: 1000,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        }
+    }
 
     #[test]
     fn remote_shutdown_does_not_issue_a_server_command() {
@@ -130,5 +151,33 @@ mod tests {
             remote_api_commands(BackendCommand::Disconnect).as_slice(),
             [ApiCommand::Disconnect]
         ));
+    }
+
+    #[test]
+    fn envelope_commands_are_not_mapped_back_to_api_commands() {
+        let commands = [
+            BackendCommand::StartTest(StartTestRequest {
+                config: config(),
+                name: Some("run".to_owned()),
+            }),
+            BackendCommand::StartCycle(StartCycleRequest {
+                recipe: CycleRecipe {
+                    steps: Vec::new(),
+                    repeat_count: 1,
+                },
+                name: Some("cycle".to_owned()),
+            }),
+            BackendCommand::RenameRun {
+                run_id: "run-1".to_owned(),
+                request: RenameRequest::default(),
+            },
+            BackendCommand::RenameCycle {
+                execution_id: "cycle-1".to_owned(),
+                request: RenameRequest::default(),
+            },
+        ];
+        for command in commands {
+            assert!(remote_api_commands(command).is_empty());
+        }
     }
 }

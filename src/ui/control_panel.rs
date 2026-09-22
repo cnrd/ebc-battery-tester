@@ -1,4 +1,4 @@
-use crate::core::{ApiCommand, TestConfiguration};
+use crate::core::{ApiCommand, RenameRequest, StartTestRequest, TestConfiguration};
 use crate::device;
 use crate::session::DeviceSession;
 
@@ -13,8 +13,13 @@ pub(crate) struct ControlPanel {
     charge_current: f32,
     charge_voltage: f32,
     charge_cutoff_current: f32,
+    run_name: String,
     #[serde(skip)]
     discharge_time_enabled: bool,
+    #[serde(skip)]
+    run_name_edit: String,
+    #[serde(skip)]
+    synced_run: Option<(String, Option<String>)>,
 }
 
 impl Default for ControlPanel {
@@ -28,7 +33,10 @@ impl Default for ControlPanel {
             charge_current: 0.0,
             charge_voltage: 0.0,
             charge_cutoff_current: 0.0,
+            run_name: String::new(),
             discharge_time_enabled: false,
+            run_name_edit: String::new(),
+            synced_run: None,
         }
     }
 }
@@ -38,13 +46,15 @@ impl ControlPanel {
         ui.separator();
         ui.heading("Control");
         self.settings_ui(ui);
+        self.current_run_ui(session, ui);
         self.buttons_ui(session, ui);
     }
 
-    pub(crate) fn ui_mobile_primary(&self, session: &mut DeviceSession, ui: &mut egui::Ui) {
+    pub(crate) fn ui_mobile_primary(&mut self, session: &mut DeviceSession, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Control");
         ui.label(self.selected_device_mode.to_string());
+        self.current_run_ui(session, ui);
         ui.scope(|ui| {
             ui.spacing_mut().interact_size = egui::vec2(96.0, 44.0);
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -63,6 +73,9 @@ impl ControlPanel {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let selected_mode = self.selected_device_mode;
         egui::Grid::new("control_grid").show(ui, |ui| {
+            ui.label("Run name (optional)");
+            ui.text_edit_singleline(&mut self.run_name);
+            ui.end_row();
             ui.label("Device Mode:");
             egui::ComboBox::from_id_salt("device_mode_selector")
                 .selected_text(self.selected_device_mode.to_string())
@@ -86,6 +99,54 @@ impl ControlPanel {
                 device::DeviceMode::ChargeConstantVoltage => {
                     self.charge_constant_voltage_params(ui);
                 }
+            }
+        });
+    }
+
+    fn current_run_ui(&mut self, session: &mut DeviceSession, ui: &mut egui::Ui) {
+        let Some(run_id) = session.current_run.id.clone() else {
+            self.synced_run = None;
+            self.run_name_edit.clear();
+            return;
+        };
+
+        if let Some(context) = &session.current_run.cycle {
+            self.synced_run = None;
+            self.run_name_edit.clear();
+            let parent =
+                if session.cycle.execution_id.as_deref() == Some(context.execution_id.as_str()) {
+                    session
+                        .cycle
+                        .name
+                        .as_deref()
+                        .unwrap_or(context.execution_id.as_str())
+                } else {
+                    context.execution_id.as_str()
+                };
+            ui.label(format!(
+                "Cycle child run {run_id} | Parent: {parent} | Repeat {}, step {}",
+                context.repeat_index + 1,
+                context.step_index + 1
+            ));
+            return;
+        }
+
+        let authoritative = (run_id.clone(), session.current_run.name.clone());
+        if self.synced_run.as_ref() != Some(&authoritative) {
+            self.run_name_edit = authoritative.1.clone().unwrap_or_default();
+            self.synced_run = Some(authoritative);
+        }
+        ui.label(format!(
+            "Current run: {}",
+            session.current_run.name.as_deref().unwrap_or(&run_id)
+        ));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Edit name");
+            ui.text_edit_singleline(&mut self.run_name_edit);
+            if ui.button("Rename").clicked() {
+                session.rename_current_run(RenameRequest {
+                    name: Some(self.run_name_edit.clone()),
+                });
             }
         });
     }
@@ -160,8 +221,8 @@ impl ControlPanel {
                 .on_disabled_hover_text("Connect the device to a battery first")
                 .clicked()
             {
-                session.send_command(ApiCommand::Start(
-                    TestConfiguration::DischargeConstantCurrent {
+                session.start_test(StartTestRequest {
+                    config: TestConfiguration::DischargeConstantCurrent {
                         current_ma: (self.discharge_current * 1000.0) as u16,
                         cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
                         cutoff_time_min: if self.discharge_time_enabled {
@@ -170,7 +231,8 @@ impl ControlPanel {
                             device::MIN_CUTOFF_TIME_MIN
                         },
                     },
-                ));
+                    name: Some(self.run_name.clone()),
+                });
             }
             if ui
                 .add_enabled(session.can_resume(), egui::Button::new("Continue"))
@@ -255,8 +317,8 @@ impl ControlPanel {
                 .on_disabled_hover_text("Connect device to battery first")
                 .clicked()
             {
-                session.send_command(ApiCommand::Start(
-                    TestConfiguration::DischargeConstantPower {
+                session.start_test(StartTestRequest {
+                    config: TestConfiguration::DischargeConstantPower {
                         power_w: self.discharge_watts,
                         cutoff_voltage_mv: (self.discharge_cutoff_voltage * 1000.0) as u16,
                         cutoff_time_min: if self.discharge_time_enabled {
@@ -265,7 +327,8 @@ impl ControlPanel {
                             device::MIN_CUTOFF_TIME_MIN
                         },
                     },
-                ));
+                    name: Some(self.run_name.clone()),
+                });
             }
             if ui
                 .add_enabled(session.can_resume(), egui::Button::new("Continue"))
@@ -339,13 +402,14 @@ impl ControlPanel {
                 .on_disabled_hover_text("Connect device to battery first")
                 .clicked()
             {
-                session.send_command(ApiCommand::Start(
-                    TestConfiguration::ChargeConstantVoltage {
+                session.start_test(StartTestRequest {
+                    config: TestConfiguration::ChargeConstantVoltage {
                         current_ma: (self.charge_current * 1000.0) as u16,
                         voltage_mv: (self.charge_voltage * 1000.0) as u16,
                         cutoff_current_ma: (self.charge_cutoff_current * 1000.0) as u16,
                     },
-                ));
+                    name: Some(self.run_name.clone()),
+                });
             }
             if ui
                 .add_enabled(session.can_resume(), egui::Button::new("Continue"))

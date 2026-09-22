@@ -7,15 +7,17 @@ pub(crate) const COMMAND_HEADER: &str = "X-EBC-Command";
 pub(crate) const INITIAL_RECONNECT_DELAY_MS: u64 = 1_000;
 pub(crate) const MAX_RECONNECT_DELAY_MS: u64 = 15_000;
 
-pub(crate) fn command_endpoint(command: ApiCommand) -> &'static str {
+pub(crate) fn command_endpoint(command: ApiCommand) -> Result<&'static str, String> {
     match command {
-        ApiCommand::Connect => "/api/connect",
-        ApiCommand::Disconnect => "/api/disconnect",
-        ApiCommand::Start(_) => "/api/test/start",
-        ApiCommand::Adjust(_) => "/api/test/adjust",
-        ApiCommand::Stop => "/api/test/stop",
-        ApiCommand::Resume => "/api/test/resume",
-        ApiCommand::Calibration(_) => "/api/calibration",
+        ApiCommand::Connect => Ok("/api/connect"),
+        ApiCommand::Disconnect => Ok("/api/disconnect"),
+        ApiCommand::Start(_) => Err(
+            "ApiCommand::Start cannot be sent remotely; use BackendCommand::StartTest".to_owned(),
+        ),
+        ApiCommand::Adjust(_) => Ok("/api/test/adjust"),
+        ApiCommand::Stop => Ok("/api/test/stop"),
+        ApiCommand::Resume => Ok("/api/test/resume"),
+        ApiCommand::Calibration(_) => Ok("/api/calibration"),
     }
 }
 
@@ -87,8 +89,8 @@ impl RemoteUrls {
         })
     }
 
-    pub(crate) fn endpoint(&self, command: ApiCommand) -> String {
-        format!("{}{}", self.base, command_endpoint(command))
+    pub(crate) fn endpoint(&self, command: ApiCommand) -> Result<String, String> {
+        Ok(format!("{}{}", self.base, command_endpoint(command)?))
     }
 }
 
@@ -110,7 +112,6 @@ mod tests {
         let commands = [
             (ApiCommand::Connect, "/api/connect"),
             (ApiCommand::Disconnect, "/api/disconnect"),
-            (ApiCommand::Start(config()), "/api/test/start"),
             (ApiCommand::Adjust(config()), "/api/test/adjust"),
             (ApiCommand::Stop, "/api/test/stop"),
             (ApiCommand::Resume, "/api/test/resume"),
@@ -120,8 +121,9 @@ mod tests {
             ),
         ];
         for (command, endpoint) in commands {
-            assert_eq!(command_endpoint(command), endpoint);
+            assert_eq!(command_endpoint(command).as_deref(), Ok(endpoint));
         }
+        assert!(command_endpoint(ApiCommand::Start(config())).is_err());
         assert_eq!(COMMAND_HEADER, "X-EBC-Command");
     }
 
