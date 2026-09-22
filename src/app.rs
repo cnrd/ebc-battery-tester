@@ -38,6 +38,7 @@ fn mobile_sections(active: bool) -> [MobileSection; 5] {
 #[serde(default)]
 pub struct MainApp {
     control_panel: ui::control_panel::ControlPanel,
+    recipe_panel: ui::recipe_panel::RecipePanel,
     #[cfg(not(target_arch = "wasm32"))]
     backend_target: BackendTarget,
     #[cfg(not(target_arch = "wasm32"))]
@@ -119,6 +120,10 @@ impl eframe::App for MainApp {
         self.session.shutdown();
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the top-level layout keeps desktop and mobile section ordering together"
+    )]
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.about_window.poll();
         self.session.consume_events(ui.ctx());
@@ -203,18 +208,22 @@ impl eframe::App for MainApp {
                             if self.session.can_control_device() {
                                 self.control_panel.ui_mobile_settings(ui);
                             }
+                            self.recipe_panel.ui(&mut self.session, ui);
                         }
                     }
                 }
             });
         } else {
             egui::Panel::left("left_panel").show_inside(ui, |ui| {
-                self.connection_ui(ui);
-                ui.push_id("control_section", |ui| {
-                    if self.session.can_control_device() {
-                        ui::live_data::ui(&self.session, ui);
-                        self.control_panel.ui(&mut self.session, ui);
-                    }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.connection_ui(ui);
+                    ui.push_id("control_section", |ui| {
+                        if self.session.can_control_device() {
+                            ui::live_data::ui(&self.session, ui);
+                            self.control_panel.ui(&mut self.session, ui);
+                        }
+                        self.recipe_panel.ui(&mut self.session, ui);
+                    });
                 });
             });
 

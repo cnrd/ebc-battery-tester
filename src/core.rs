@@ -99,6 +99,8 @@ pub struct AuthoritativeSnapshot {
     pub device: DeviceState,
     pub test: TestStatus,
     #[serde(default)]
+    pub cycle: CycleStatus,
+    #[serde(default)]
     pub capabilities: Capabilities,
     pub history: Vec<Sample>,
 }
@@ -110,6 +112,8 @@ pub struct SnapshotUpdate {
     pub device: DeviceState,
     pub test: TestStatus,
     #[serde(default)]
+    pub cycle: CycleStatus,
+    #[serde(default)]
     pub capabilities: Capabilities,
 }
 
@@ -120,6 +124,7 @@ impl From<&AuthoritativeSnapshot> for SnapshotUpdate {
             connection_error: snapshot.connection_error.clone(),
             device: snapshot.device.clone(),
             test: snapshot.test.clone(),
+            cycle: snapshot.cycle.clone(),
             capabilities: snapshot.capabilities,
         }
     }
@@ -148,6 +153,8 @@ pub struct RunSummary {
     pub model: Option<String>,
     pub firmware_version: Option<String>,
     pub sample_count: usize,
+    #[serde(default)]
+    pub cycle: Option<CycleRunContext>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +240,98 @@ impl TestConfiguration {
             Self::ChargeConstantVoltage { .. } => DeviceMode::ChargeConstantVoltage,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleRecipe {
+    pub steps: Vec<CycleStep>,
+    pub repeat_count: u32,
+}
+
+impl CycleRecipe {
+    /// Validates that the recipe can be executed by the cycle engine.
+    ///
+    /// # Errors
+    /// Returns an error for an empty recipe, a zero repeat count, or an invalid
+    /// device configuration.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.steps.is_empty() {
+            return Err(ValidationError {
+                field: "steps".to_owned(),
+                message: "must contain at least one step".to_owned(),
+            });
+        }
+        if self.repeat_count == 0 {
+            return Err(ValidationError {
+                field: "repeat_count".to_owned(),
+                message: "must be at least 1".to_owned(),
+            });
+        }
+
+        for (index, step) in self.steps.iter().enumerate() {
+            if let CycleStep::Device { config, .. } = step {
+                config.validate().map_err(|error| ValidationError {
+                    field: format!("steps[{index}].{}", error.field),
+                    message: error.message,
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CycleStep {
+    Device {
+        config: TestConfiguration,
+        completion: CycleStepCompletion,
+    },
+    Rest {
+        duration_seconds: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CycleStepCompletion {
+    Hardware,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CycleState {
+    #[default]
+    Idle,
+    Preparing,
+    StartingStep,
+    RunningStep,
+    Settling,
+    Resting,
+    Stopping,
+    Completed,
+    Stopped,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CycleStatus {
+    pub state: CycleState,
+    pub recipe: Option<CycleRecipe>,
+    pub execution_id: Option<String>,
+    pub repeat_index: u32,
+    pub step_index: usize,
+    pub started_at_utc: Option<String>,
+    pub result: Option<String>,
+    pub rest_remaining_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleRunContext {
+    pub execution_id: String,
+    pub repeat_index: u32,
+    pub step_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +447,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validates_cycle_recipe_shape_and_device_steps() {
+        let empty = CycleRecipe {
+            steps: Vec::new(),
+            repeat_count: 1,
+        };
+        assert_eq!(empty.validate().expect_err("empty recipe").field, "steps");
+
+        let no_repeats = CycleRecipe {
+            steps: vec![CycleStep::Rest {
+                duration_seconds: 0,
+            }],
+            repeat_count: 0,
+        };
+        assert_eq!(
+            no_repeats.validate().expect_err("zero repeats").field,
+            "repeat_count"
+        );
+
+        let invalid_device = CycleRecipe {
+            steps: vec![CycleStep::Device {
+                config: TestConfiguration::DischargeConstantCurrent {
+                    current_ma: 11,
+                    cutoff_voltage_mv: 3000,
+                    cutoff_time_min: 0,
+                },
+                completion: CycleStepCompletion::Hardware,
+            }],
+            repeat_count: 1,
+        };
+        assert_eq!(
+            invalid_device
+                .validate()
+                .expect_err("invalid device step")
+                .field,
+            "steps[0].current_ma"
+        );
+
+        let maximum_rest = CycleRecipe {
+            steps: vec![CycleStep::Rest {
+                duration_seconds: u64::MAX,
+            }],
+            repeat_count: 1,
+        };
+        assert_eq!(maximum_rest.validate(), Ok(()));
+    }
+
     #[cfg(feature = "server")]
     #[test]
     fn api_snapshot_round_trips_json() {
@@ -370,6 +516,20 @@ mod tests {
             serde_json::from_value(value).expect("deserialize legacy update");
 
         assert_eq!(update.capabilities, Capabilities::default());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn missing_wire_cycle_defaults_to_idle() {
+        let mut value = serde_json::to_value(SnapshotUpdate::default()).expect("serialize update");
+        value
+            .as_object_mut()
+            .expect("update object")
+            .remove("cycle");
+        let update: SnapshotUpdate =
+            serde_json::from_value(value).expect("deserialize legacy update");
+
+        assert_eq!(update.cycle, CycleStatus::default());
     }
 
     #[cfg(feature = "server")]

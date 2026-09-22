@@ -212,6 +212,48 @@ fn send_backend_command(
     agent: &ureq::Agent,
     event_tx: &BackendEventSender,
 ) {
+    match &command {
+        BackendCommand::StartCycle(recipe) => {
+            event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
+                direction: DiagnosticDirection::Out,
+                label: "StartCycle".to_owned(),
+                raw_bytes: Vec::new(),
+            }));
+            let request = agent
+                .post(&format!("{}/api/cycle/start", urls.base))
+                .set(COMMAND_HEADER, "1");
+            let result = request
+                .send_json(recipe)
+                .map_err(format_http_error)
+                .and_then(|response| {
+                    response
+                        .into_json::<AuthoritativeSnapshot>()
+                        .map_err(|error| format!("invalid server response: {error}"))
+                });
+            publish_command_result(result, event_tx);
+            return;
+        }
+        BackendCommand::StopCycle => {
+            event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
+                direction: DiagnosticDirection::Out,
+                label: "StopCycle".to_owned(),
+                raw_bytes: Vec::new(),
+            }));
+            let result = agent
+                .post(&format!("{}/api/cycle/stop", urls.base))
+                .set(COMMAND_HEADER, "1")
+                .call()
+                .map_err(format_http_error)
+                .and_then(|response| {
+                    response
+                        .into_json::<AuthoritativeSnapshot>()
+                        .map_err(|error| format!("invalid server response: {error}"))
+                });
+            publish_command_result(result, event_tx);
+            return;
+        }
+        _ => {}
+    }
     for command in remote_api_commands(command) {
         event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
             direction: DiagnosticDirection::Out,
@@ -227,6 +269,19 @@ fn send_backend_command(
                 event_tx.send(BackendEvent::CommandError(error));
                 break;
             }
+        }
+    }
+}
+
+fn publish_command_result(
+    result: Result<AuthoritativeSnapshot, String>,
+    event_tx: &BackendEventSender,
+) {
+    match result {
+        Ok(_snapshot) => event_tx.send(BackendEvent::CommandSucceeded),
+        Err(error) => {
+            log::error!("remote command failed: {error}");
+            event_tx.send(BackendEvent::CommandError(error));
         }
     }
 }

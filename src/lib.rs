@@ -19,6 +19,7 @@ mod backend;
 mod backend_client;
 pub mod controller;
 pub mod core;
+pub mod cycle;
 pub mod device;
 #[cfg(feature = "gui")]
 mod export;

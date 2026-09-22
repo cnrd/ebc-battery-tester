@@ -2,7 +2,7 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
     DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, WebSocketEvent};
+use crate::core::{ApiCommand, AuthoritativeSnapshot, CycleRecipe, WebSocketEvent};
 use crate::remote_backend::{
     COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, command_endpoint,
     publish_websocket,
@@ -74,6 +74,14 @@ pub(super) async fn remote_task(
                                 let _closed = writer.close().await;
                                 return;
                             }
+                            if let BackendCommand::StartCycle(ref recipe) = command {
+                                publish_cycle_result(send_start_cycle(&recipe).await, &event_tx);
+                                continue;
+                            }
+                            if matches!(command, BackendCommand::StopCycle) {
+                                publish_cycle_result(send_stop_cycle().await, &event_tx);
+                                continue;
+                            }
                             for command in remote_api_commands(command) {
                                 event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
                                     direction: DiagnosticDirection::Out,
@@ -123,6 +131,47 @@ pub(super) async fn remote_task(
         }
         reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
     }
+}
+
+fn publish_cycle_result(
+    result: Result<AuthoritativeSnapshot, String>,
+    event_tx: &BackendEventSender,
+) {
+    match result {
+        Ok(_snapshot) => event_tx.send(BackendEvent::CommandSucceeded),
+        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+    }
+}
+
+async fn send_start_cycle(recipe: &CycleRecipe) -> Result<AuthoritativeSnapshot, String> {
+    let response = Request::post("/api/cycle/start")
+        .header(COMMAND_HEADER, "1")
+        .json(recipe)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_response(response).await
+}
+
+async fn send_stop_cycle() -> Result<AuthoritativeSnapshot, String> {
+    let response = Request::post("/api/cycle/stop")
+        .header(COMMAND_HEADER, "1")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_response(response).await
+}
+
+async fn decode_response(
+    response: gloo_net::http::Response,
+) -> Result<AuthoritativeSnapshot, String> {
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status}: {body}"));
+    }
+    response.json().await.map_err(|error| error.to_string())
 }
 
 fn send_connection(event_tx: &BackendEventSender, status: BackendConnectionStatus) {

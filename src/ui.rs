@@ -4,6 +4,7 @@ pub(crate) mod control_panel;
 pub(crate) mod live_data;
 pub(crate) mod log_window;
 pub(crate) mod plot;
+pub(crate) mod recipe_panel;
 pub(crate) mod usb_panel;
 
 pub(crate) fn format_duration(total_seconds: f64) -> String {

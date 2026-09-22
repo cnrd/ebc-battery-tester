@@ -27,9 +27,11 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CalibrationCommand, RunSummary, Sample,
-    ServerConnectionState, SnapshotUpdate, TestConfiguration, TestState, WebSocketEvent,
+    ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CycleRecipe, CycleRunContext,
+    CycleState, CycleStatus, RunSummary, Sample, ServerConnectionState, SnapshotUpdate,
+    TestConfiguration, TestState, WebSocketEvent,
 };
+use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
 
 const SNAPSHOT_CHANNEL_CAPACITY: usize = 16;
@@ -88,9 +90,15 @@ enum ActorRequest {
     Runs,
     RunCsv(String),
     Command(ApiCommand),
+    StartCycle(CycleRecipe),
+    StopCycle,
     Shutdown,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "actor responses are transferred across the channel without cloning"
+)]
 enum ActorResponse {
     Snapshot(AuthoritativeSnapshot),
     History(Vec<Sample>),
@@ -116,6 +124,7 @@ struct Persistence {
     runs: Vec<RunSummary>,
     archived_run_id: Option<String>,
     current_run_id: String,
+    current_run_cycle: Option<CycleRunContext>,
     next_sequence: u64,
     raw_sample_count: usize,
     sample_writer: Option<BufWriter<File>>,
@@ -129,9 +138,13 @@ struct Metadata {
     device: crate::core::DeviceState,
     test: crate::core::TestStatus,
     #[serde(default)]
+    cycle: CycleStatus,
+    #[serde(default)]
     archived_run_id: Option<String>,
     #[serde(default)]
     current_run_id: String,
+    #[serde(default)]
+    current_run_cycle: Option<CycleRunContext>,
     #[serde(default)]
     next_sequence: u64,
 }
@@ -158,6 +171,7 @@ impl Persistence {
             runs: Vec::new(),
             archived_run_id: None,
             current_run_id: String::new(),
+            current_run_cycle: None,
             next_sequence: 0,
             raw_sample_count: 0,
             sample_writer: None,
@@ -175,12 +189,14 @@ impl Persistence {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             self.archived_run_id = metadata.archived_run_id;
             self.current_run_id = metadata.current_run_id;
+            self.current_run_cycle = metadata.current_run_cycle;
             self.next_sequence = metadata.next_sequence;
             AuthoritativeSnapshot {
                 connection: ServerConnectionState::Disconnected,
                 connection_error: None,
                 device: metadata.device,
                 test: metadata.test,
+                cycle: metadata.cycle,
                 capabilities: Default::default(),
                 history: Vec::new(),
             }
@@ -253,8 +269,10 @@ impl Persistence {
             connection_error: snapshot.connection_error.clone(),
             device: snapshot.device.clone(),
             test: snapshot.test.clone(),
+            cycle: snapshot.cycle.clone(),
             archived_run_id: self.archived_run_id.clone(),
             current_run_id: self.current_run_id.clone(),
+            current_run_cycle: self.current_run_cycle.clone(),
             next_sequence: self.next_sequence,
         };
         let temporary = self.metadata_path.with_extension("json.tmp");
@@ -289,9 +307,10 @@ impl Persistence {
         sync_parent(&self.samples_path)
     }
 
-    fn begin_current_run(&mut self, run_id: String) {
+    fn begin_current_run(&mut self, run_id: String, cycle: Option<CycleRunContext>) {
         self.archived_run_id = None;
         self.current_run_id = run_id;
+        self.current_run_cycle = cycle;
         self.next_sequence = 0;
     }
 
@@ -364,6 +383,7 @@ impl Persistence {
             } else {
                 snapshot.history.len()
             },
+            cycle: self.current_run_cycle.clone(),
         };
         let json_path = self.runs_dir.join(format!("{id}.json"));
         let json_temporary = self.runs_dir.join(format!("{id}.json.tmp"));
@@ -730,6 +750,7 @@ struct DeviceActor {
     config: ServerConfig,
     snapshot: AuthoritativeSnapshot,
     controller: TestController,
+    cycle: CycleEngine,
     persistence: Persistence,
     port: Option<Box<dyn serialport::SerialPort>>,
     serial_buffer: Vec<u8>,
@@ -752,6 +773,7 @@ struct StartPreparationRollback {
     history: Vec<Sample>,
     archived_run_id: Option<String>,
     current_run_id: String,
+    current_run_cycle: Option<CycleRunContext>,
     next_sequence: u64,
     raw_sample_count: usize,
 }
@@ -769,6 +791,8 @@ impl DeviceActor {
             snapshot.test.clone(),
             snapshot.history.last(),
         );
+        let cycle = CycleEngine::from_persisted_status(snapshot.cycle.clone());
+        snapshot.cycle = cycle.status().clone();
         if snapshot.history.len() > SNAPSHOT_SAMPLE_LIMIT {
             snapshot.history = presentation_history(&snapshot.history, SNAPSHOT_SAMPLE_LIMIT);
         }
@@ -776,6 +800,7 @@ impl DeviceActor {
             config,
             snapshot,
             controller,
+            cycle,
             persistence,
             port: None,
             serial_buffer: Vec::new(),
@@ -849,12 +874,39 @@ impl DeviceActor {
             ActorRequest::Command(command) => self
                 .handle_command(command)
                 .map(|()| ActorResponse::Snapshot(self.current_snapshot())),
+            ActorRequest::StartCycle(recipe) => self
+                .start_cycle(recipe)
+                .and_then(|()| self.persist_and_publish())
+                .map(|()| ActorResponse::Snapshot(self.current_snapshot())),
+            ActorRequest::StopCycle => self
+                .stop_cycle()
+                .and_then(|()| self.persist_and_publish())
+                .map(|()| ActorResponse::Snapshot(self.current_snapshot())),
             ActorRequest::Shutdown => Err("shutdown must be handled by the actor loop".to_owned()),
         };
         let _response_sent = message.response.send(result);
     }
 
     fn handle_command(&mut self, command: ApiCommand) -> Result<(), String> {
+        if command == ApiCommand::Stop
+            && (self.cycle.owns_orchestration()
+                || self.cycle.status().state == CycleState::Interrupted)
+        {
+            self.stop_cycle()?;
+            self.persist_and_publish()?;
+            return Ok(());
+        }
+        if self.cycle.owns_orchestration()
+            && matches!(
+                command,
+                ApiCommand::Start(_)
+                    | ApiCommand::Resume
+                    | ApiCommand::Adjust(_)
+                    | ApiCommand::Calibration(_)
+            )
+        {
+            return Err("the active cycle owns test orchestration".to_owned());
+        }
         match command {
             ApiCommand::Connect => {
                 if let Err(error) = self.connect() {
@@ -862,8 +914,12 @@ impl DeviceActor {
                     return Err(error);
                 }
             }
-            ApiCommand::Disconnect => self.disconnect()?,
-            ApiCommand::Start(config) => self.start_test(config)?,
+            ApiCommand::Disconnect => {
+                self.cycle
+                    .interrupt("cycle interrupted by explicit device disconnect");
+                self.disconnect()?;
+            }
+            ApiCommand::Start(config) => self.start_test(config, None)?,
             ApiCommand::Adjust(config) => self.adjust_test(config)?,
             ApiCommand::Stop => self.stop_test()?,
             ApiCommand::Resume => self.resume_test()?,
@@ -879,6 +935,8 @@ impl DeviceActor {
     }
 
     fn connect(&mut self) -> Result<(), String> {
+        self.cycle
+            .interrupt_for_gap("cycle interrupted by device connection change");
         self.controller
             .begin_connection("device connection changed; physical state is unknown");
         self.snapshot.connection = ServerConnectionState::Connecting;
@@ -926,7 +984,11 @@ impl DeviceActor {
         Ok(())
     }
 
-    fn start_test(&mut self, config: TestConfiguration) -> Result<(), String> {
+    fn start_test(
+        &mut self,
+        config: TestConfiguration,
+        cycle: Option<CycleRunContext>,
+    ) -> Result<(), String> {
         let prepared = self.controller.prepare_command(ApiCommand::Start(config))?;
         self.sync_controller_state();
         self.persistence.archive_current(&self.snapshot)?;
@@ -934,6 +996,7 @@ impl DeviceActor {
             history: self.snapshot.history.clone(),
             archived_run_id: self.persistence.archived_run_id.clone(),
             current_run_id: self.persistence.current_run_id.clone(),
+            current_run_cycle: self.persistence.current_run_cycle.clone(),
             next_sequence: self.persistence.next_sequence,
             raw_sample_count: self.persistence.raw_sample_count,
         };
@@ -942,7 +1005,7 @@ impl DeviceActor {
         }
         self.snapshot.history.clear();
         let run_id = self.persistence.new_run_id();
-        self.persistence.begin_current_run(run_id);
+        self.persistence.begin_current_run(run_id, cycle);
         self.sync_controller_state();
         if let Err(error) = self.save_start_metadata() {
             return Err(self.restore_start_preparation(rollback, &error));
@@ -956,6 +1019,71 @@ impl DeviceActor {
             self.sync_controller_state();
         }
         Ok(())
+    }
+
+    fn start_cycle(&mut self, recipe: CycleRecipe) -> Result<(), String> {
+        recipe.validate().map_err(|error| error.to_string())?;
+        if !self.controller.capabilities().start {
+            return Err(
+                "cycle start requires a fresh current-connection inactive report".to_owned(),
+            );
+        }
+        if self.controller.device().current_ma != Some(0) {
+            return Err("cycle start requires confirmed zero device current".to_owned());
+        }
+        let started_at = Utc::now().to_rfc3339();
+        let execution_id = format!("cycle-{}", started_at.replace([':', '.', '+'], "-"));
+        let action = self
+            .cycle
+            .start(recipe, execution_id, Some(started_at), Instant::now())
+            .map_err(|error| error.to_string())?;
+        self.sync_controller_state();
+        if let Some(action) = action {
+            self.execute_cycle_action(action)?;
+        }
+        Ok(())
+    }
+
+    fn stop_cycle(&mut self) -> Result<(), String> {
+        if let Some(action) = self.cycle.stop(self.controller.test()) {
+            self.execute_cycle_action(action)?;
+        }
+        self.sync_controller_state();
+        Ok(())
+    }
+
+    fn execute_cycle_action(&mut self, action: CycleAction) -> Result<(), String> {
+        let result = match action {
+            CycleAction::Start(config) => {
+                let context = self
+                    .current_cycle_context()
+                    .ok_or_else(|| "cycle device step is missing execution context".to_owned())?;
+                self.start_test(config, Some(context))
+            }
+            CycleAction::Stop => self.stop_test(),
+        };
+        if let Err(error) = result {
+            self.cycle
+                .on_action_failed(format!("cycle physical action failed: {error}"));
+            self.sync_controller_state();
+            if let Err(persistence_error) = self.persistence.save_metadata(&self.snapshot) {
+                log::error!("failed to persist interrupted cycle action: {persistence_error}");
+            }
+            self.publish();
+            return Err(error);
+        }
+        self.cycle
+            .on_action_committed(&action, self.controller.test());
+        self.sync_controller_state();
+        Ok(())
+    }
+
+    fn current_cycle_context(&self) -> Option<CycleRunContext> {
+        Some(CycleRunContext {
+            execution_id: self.cycle.status().execution_id.clone()?,
+            repeat_index: self.cycle.status().repeat_index,
+            step_index: self.cycle.status().step_index,
+        })
     }
 
     fn save_start_metadata(&self) -> Result<(), String> {
@@ -974,6 +1102,7 @@ impl DeviceActor {
         self.snapshot.history = rollback.history;
         self.persistence.archived_run_id = rollback.archived_run_id.clone();
         self.persistence.current_run_id = rollback.current_run_id;
+        self.persistence.current_run_cycle = rollback.current_run_cycle;
         self.persistence.next_sequence = rollback.next_sequence;
         self.persistence.raw_sample_count = rollback.raw_sample_count;
 
@@ -1091,6 +1220,9 @@ impl DeviceActor {
     }
 
     fn handle_protocol_write_failure(&mut self, command: Option<CommandKind>, error: &str) {
+        self.cycle.interrupt(format!(
+            "cycle interrupted by protocol write failure: {error}"
+        ));
         self.port = None;
         self.serial_buffer.clear();
         self.mock_idle_report_due = None;
@@ -1110,6 +1242,7 @@ impl DeviceActor {
     }
 
     fn tick(&mut self) {
+        let previous_cycle = self.cycle.status().clone();
         if self.config.mock {
             self.tick_mock();
         } else {
@@ -1122,6 +1255,19 @@ impl DeviceActor {
             log::error!("timer sync write failed: {error}");
         }
         self.sync_controller_state();
+        if let Some(action) = self.cycle.tick(Instant::now())
+            && let Err(error) = self.execute_cycle_action(action)
+        {
+            log::error!("cycle action failed during tick: {error}");
+        }
+        if self.cycle.status() != &previous_cycle {
+            if let Err(error) = self.archive_final_cycle_run(&previous_cycle) {
+                log::error!("failed to archive final cycle run: {error}");
+            }
+            if let Err(error) = self.persist_and_publish() {
+                log::error!("failed to persist cycle tick: {error}");
+            }
+        }
     }
 
     fn tick_mock(&mut self) {
@@ -1298,9 +1444,50 @@ impl DeviceActor {
         if let Err(error) = persistence_result {
             log::error!("failed to persist device report: {error}");
         }
+        let previous_cycle = self.cycle.status().clone();
+        let action = self.cycle.on_physical_state(
+            Instant::now(),
+            self.controller.device(),
+            self.controller.test(),
+            true,
+        );
+        if let Some(action) = action
+            && let Err(error) = self.execute_cycle_action(action)
+        {
+            log::error!("cycle action failed after device report: {error}");
+        }
+        if self.cycle.status() != &previous_cycle {
+            if let Err(error) = self.archive_final_cycle_run(&previous_cycle) {
+                log::error!("failed to archive final cycle run: {error}");
+            }
+            if let Err(error) = self.persist_and_publish() {
+                log::error!("failed to persist cycle report transition: {error}");
+            }
+        }
+    }
+
+    fn archive_final_cycle_run(&mut self, previous: &CycleStatus) -> Result<(), String> {
+        if previous.state == CycleState::Completed
+            || self.cycle.status().state != CycleState::Completed
+        {
+            return Ok(());
+        }
+        let current_execution = self
+            .persistence
+            .current_run_cycle
+            .as_ref()
+            .map(|context| context.execution_id.as_str());
+        if current_execution == self.cycle.status().execution_id.as_deref() {
+            self.sync_controller_state();
+            self.persistence.archive_current(&self.snapshot)?;
+        }
+        Ok(())
     }
 
     fn set_connection_error(&mut self, error: &str) {
+        self.cycle.interrupt_for_gap(format!(
+            "cycle interrupted by device connection failure: {error}"
+        ));
         self.port = None;
         self.serial_buffer.clear();
         self.mock_idle_report_due = None;
@@ -1342,7 +1529,18 @@ impl DeviceActor {
         self.controller.update_elapsed();
         self.snapshot.device = self.controller.device().clone();
         self.snapshot.test = self.controller.test().clone();
+        self.snapshot.cycle = self.cycle.status().clone();
         self.snapshot.capabilities = self.controller.capabilities();
+        if self.cycle.owns_orchestration() {
+            self.snapshot.capabilities.start = false;
+            self.snapshot.capabilities.resume = false;
+            self.snapshot.capabilities.stop = true;
+            self.snapshot.capabilities.show_stop = true;
+            self.snapshot.capabilities.adjust = false;
+            self.snapshot.capabilities.calibrate_voltage = false;
+            self.snapshot.capabilities.calibrate_current = false;
+            self.snapshot.capabilities.confirm_calibration = false;
+        }
     }
 
     fn snapshot_for_clients(&self) -> AuthoritativeSnapshot {
@@ -1429,6 +1627,8 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         .route("/test/adjust", post(adjust_test))
         .route("/test/stop", post(stop_test))
         .route("/test/resume", post(resume_test))
+        .route("/cycle/start", post(start_cycle))
+        .route("/cycle/stop", post(stop_cycle))
         .route("/calibration", post(calibration))
         .route("/ws", get(websocket));
     let static_files = ServeDir::new(&config.static_dir)
@@ -1512,6 +1712,16 @@ async fn command(
     command: ApiCommand,
 ) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
     match request(state, ActorRequest::Command(command)).await? {
+        ActorResponse::Snapshot(snapshot) => Ok(Json(snapshot)),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+async fn cycle_command(
+    state: &AppState,
+    request_kind: ActorRequest,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    match request(state, request_kind).await? {
         ActorResponse::Snapshot(snapshot) => Ok(Json(snapshot)),
         _ => Err(ApiError::internal("unexpected actor response")),
     }
@@ -1639,6 +1849,26 @@ async fn resume_test(
 ) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
     validate_mutation(&headers, &state)?;
     command(&state, ApiCommand::Resume).await
+}
+
+async fn start_cycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(recipe): Json<CycleRecipe>,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    recipe
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    cycle_command(&state, ActorRequest::StartCycle(recipe)).await
+}
+
+async fn stop_cycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    cycle_command(&state, ActorRequest::StopCycle).await
 }
 
 async fn calibration(
@@ -1949,6 +2179,20 @@ mod tests {
         }
     }
 
+    fn device_step() -> crate::core::CycleStep {
+        crate::core::CycleStep::Device {
+            config: test_config(),
+            completion: crate::core::CycleStepCompletion::Hardware,
+        }
+    }
+
+    fn cycle_recipe(steps: Vec<crate::core::CycleStep>, repeat_count: u32) -> CycleRecipe {
+        CycleRecipe {
+            steps,
+            repeat_count,
+        }
+    }
+
     fn confirm_inactive(actor: &mut DeviceActor) {
         actor.snapshot.connection = ServerConnectionState::Connected;
         actor.controller.connection_established();
@@ -1969,7 +2213,7 @@ mod tests {
     }
 
     fn confirm_running(actor: &mut DeviceActor) {
-        actor.start_test(test_config()).expect("start test");
+        actor.start_test(test_config(), None).expect("start test");
         actor.record_report(
             device::DeviceMode::DischargeConstantCurrent,
             4000,
@@ -2093,7 +2337,9 @@ mod tests {
     fn duplicate_and_stale_reports_keep_metrics_monotonic() {
         let (mut actor, directory) = mock_actor("duplicate-reports");
         confirm_inactive(&mut actor);
-        actor.start_test(test_config()).expect("start command");
+        actor
+            .start_test(test_config(), None)
+            .expect("start command");
         for raw_capacity in [100, 100, 95] {
             actor.record_report(
                 device::DeviceMode::DischargeConstantCurrent,
@@ -2393,7 +2639,7 @@ mod tests {
     fn starting_disconnect_stops_before_disconnect() {
         let (mut actor, directory) = mock_actor("starting-safe-disconnect");
         confirm_inactive(&mut actor);
-        actor.start_test(test_config()).expect("start test");
+        actor.start_test(test_config(), None).expect("start test");
         assert_eq!(actor.snapshot.test.state, TestState::Starting);
         actor.sent_frames.clear();
 
@@ -2579,7 +2825,7 @@ mod tests {
         inject_write_failure(&mut actor);
 
         actor
-            .start_test(test_config())
+            .start_test(test_config(), None)
             .expect_err("metadata write fails");
 
         assert_eq!(actor.snapshot.test.state, TestState::Idle);
@@ -2614,7 +2860,7 @@ mod tests {
         actor.write_failure = Some("physical send must not run".to_owned());
 
         actor
-            .start_test(test_config())
+            .start_test(test_config(), None)
             .expect_err("metadata write fails");
 
         assert_eq!(actor.snapshot.test.state, TestState::Stopped);
@@ -2629,7 +2875,7 @@ mod tests {
 
         actor.write_failure = None;
         actor.start_metadata_failure = None;
-        actor.start_test(test_config()).expect("retry start");
+        actor.start_test(test_config(), None).expect("retry start");
         assert_eq!(actor.persistence.runs.len(), 1);
         assert_eq!(actor.snapshot.test.state, TestState::Starting);
         fs::remove_dir_all(directory).expect("remove test directory");
@@ -2979,6 +3225,262 @@ mod tests {
         send_actor_request(&actor_tx, ActorRequest::Shutdown).expect("shutdown actor");
         drop(actor_tx);
         actor_thread.join().expect("join actor");
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn no_client_cycle_settles_rests_repeats_and_archives_each_device_step() {
+        let (mut actor, directory) = mock_actor("cycle-no-client");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(
+                vec![
+                    device_step(),
+                    crate::core::CycleStep::Rest {
+                        duration_seconds: 0,
+                    },
+                    device_step(),
+                ],
+                2,
+            ))
+            .expect("start cycle");
+        assert_eq!(actor.cycle.status().state, CycleState::StartingStep);
+        assert!(
+            actor
+                .handle_command(ApiCommand::Start(test_config()))
+                .is_err()
+        );
+        assert!(
+            actor
+                .start_cycle(cycle_recipe(vec![device_step()], 1))
+                .is_err()
+        );
+
+        for run in 0_u16..4 {
+            let base = run.saturating_mul(10);
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                4000,
+                1000,
+                base + 1,
+                ReportState::Active,
+                "EBC-MOCK",
+                None,
+            );
+            assert_eq!(actor.cycle.status().state, CycleState::RunningStep);
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                3900,
+                1000,
+                base + 2,
+                ReportState::Finished,
+                "EBC-MOCK",
+                None,
+            );
+            assert_eq!(actor.cycle.status().state, CycleState::Settling);
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                3900,
+                1000,
+                base + 2,
+                ReportState::Idle,
+                "EBC-MOCK",
+                None,
+            );
+            assert_eq!(actor.cycle.status().state, CycleState::Settling);
+            actor.record_report(
+                device::DeviceMode::DischargeConstantCurrent,
+                3900,
+                0,
+                base + 2,
+                ReportState::Idle,
+                "EBC-MOCK",
+                None,
+            );
+
+            if run.is_multiple_of(2) {
+                assert_eq!(actor.cycle.status().state, CycleState::Resting);
+                actor.tick();
+                assert_eq!(actor.cycle.status().state, CycleState::StartingStep);
+            } else if run < 3 {
+                assert_eq!(actor.cycle.status().state, CycleState::StartingStep);
+            }
+        }
+
+        assert_eq!(actor.cycle.status().state, CycleState::Completed);
+        let starts = actor
+            .sent_frames
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame,
+                    OutboundFrame::StartConstantCurrentDischarge(..)
+                        | OutboundFrame::StartConstantPowerDischarge(..)
+                        | OutboundFrame::StartConstantVoltageCharge(..)
+                )
+            })
+            .count();
+        assert_eq!(starts, 4);
+        assert_eq!(actor.persistence.run_summaries().len(), 4);
+        let contexts: BTreeSet<_> = actor
+            .persistence
+            .run_summaries()
+            .iter()
+            .map(|summary| {
+                let context = summary.cycle.as_ref().expect("cycle run context");
+                (context.repeat_index, context.step_index)
+            })
+            .collect();
+        assert_eq!(contexts, BTreeSet::from([(0, 0), (0, 2), (1, 0), (1, 2)]));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn cycle_stop_failure_gap_and_disconnect_never_advance() {
+        let (mut actor, directory) = mock_actor("cycle-stop-policy");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(vec![device_step(), device_step()], 1))
+            .expect("start cycle");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.stop_cycle().expect("request cycle stop");
+        assert_eq!(actor.cycle.status().state, CycleState::Stopping);
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            2,
+            ReportState::Idle,
+            "EBC-MOCK",
+            None,
+        );
+        assert_eq!(actor.cycle.status().state, CycleState::Stopped);
+        assert_eq!(actor.cycle.status().step_index, 0);
+
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .expect("second cycle");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            3,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.set_connection_error("injected read failure");
+        assert_eq!(actor.cycle.status().state, CycleState::Interrupted);
+
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .expect("third cycle");
+        actor
+            .handle_command(ApiCommand::Disconnect)
+            .expect("safe disconnect");
+        assert_eq!(actor.cycle.status().state, CycleState::Interrupted);
+        assert!(matches!(
+            actor.sent_frames.as_slice(),
+            [.., OutboundFrame::Stop, OutboundFrame::Disconnect]
+        ));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn server_restart_interrupts_persisted_rest_and_start_failure_is_terminal() {
+        let (mut actor, directory) = mock_actor("cycle-restart");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(
+                vec![crate::core::CycleStep::Rest {
+                    duration_seconds: 60,
+                }],
+                1,
+            ))
+            .expect("start rest cycle");
+        actor.persist_and_publish().expect("persist rest");
+        drop(actor);
+
+        let (snapshot_tx, _) = broadcast::channel(4);
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/null".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        let mut restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
+        assert_eq!(restarted.cycle.status().state, CycleState::Interrupted);
+        assert_eq!(restarted.cycle.status().step_index, 0);
+        assert!(restarted.sent_frames.is_empty());
+
+        confirm_inactive(&mut restarted);
+        inject_write_failure(&mut restarted);
+        assert!(
+            restarted
+                .start_cycle(cycle_recipe(vec![device_step()], 1))
+                .is_err()
+        );
+        assert_eq!(restarted.cycle.status().state, CycleState::Interrupted);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn server_restart_never_resumes_an_active_cycle_step() {
+        let (mut actor, directory) = mock_actor("cycle-active-restart");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(vec![device_step(), device_step()], 2))
+            .expect("start cycle");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.persist_and_publish().expect("persist active cycle");
+        let execution_id = actor
+            .cycle
+            .status()
+            .execution_id
+            .clone()
+            .expect("execution id");
+        drop(actor);
+
+        let (snapshot_tx, _) = broadcast::channel(4);
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/null".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        let restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
+        assert_eq!(restarted.cycle.status().state, CycleState::Interrupted);
+        assert_eq!(
+            restarted.cycle.status().execution_id.as_deref(),
+            Some(execution_id.as_str())
+        );
+        assert_eq!(restarted.cycle.status().repeat_index, 0);
+        assert_eq!(restarted.cycle.status().step_index, 0);
+        assert_eq!(
+            restarted.controller.test().state,
+            TestState::RecoveredUncertain
+        );
+        assert!(restarted.sent_frames.is_empty());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

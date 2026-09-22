@@ -7,8 +7,8 @@ use crate::backend_client::BackendClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend_client::BackendTarget;
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Capabilities, Sample, ServerConnectionState,
-    TestConfiguration, TestState,
+    ApiCommand, AuthoritativeSnapshot, Capabilities, CycleRecipe, CycleState, CycleStatus, Sample,
+    ServerConnectionState, TestConfiguration, TestState,
 };
 use crate::device::{self, ConnectionStatus};
 use crate::export::{LogDirection, LogEntry};
@@ -118,6 +118,7 @@ pub(crate) struct DeviceSession {
     pub(crate) activity_known: bool,
     pub(crate) mode_on: bool,
     pub(crate) test_state: TestState,
+    pub(crate) cycle: CycleStatus,
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) command_error: Option<String>,
     transport_mode: TransportMode,
@@ -146,6 +147,7 @@ impl Default for DeviceSession {
             activity_known: false,
             mode_on: false,
             test_state: TestState::Idle,
+            cycle: CycleStatus::default(),
             log_entries: Vec::new(),
             command_error: None,
             transport_mode: TransportMode::Direct,
@@ -215,39 +217,69 @@ impl DeviceSession {
     }
 
     pub(crate) fn can_start(&self) -> bool {
-        self.capabilities.start
+        self.capabilities.start && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_resume(&self) -> bool {
-        self.capabilities.resume
+        self.capabilities.resume && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_calibrate(&self) -> bool {
-        self.capabilities.calibrate_voltage
+        self.capabilities.calibrate_voltage && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_calibrate_voltage(&self) -> bool {
-        self.capabilities.calibrate_voltage
+        self.capabilities.calibrate_voltage && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_calibrate_current(&self) -> bool {
-        self.capabilities.calibrate_current
+        self.capabilities.calibrate_current && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_confirm_calibration(&self) -> bool {
-        self.capabilities.confirm_calibration
+        self.capabilities.confirm_calibration && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_adjust(&self) -> bool {
-        self.capabilities.adjust
+        self.capabilities.adjust && !self.cycle_owns_orchestration()
     }
 
     pub(crate) fn show_stop_control(&self) -> bool {
-        self.capabilities.show_stop
+        self.capabilities.show_stop || self.cycle_owns_orchestration()
     }
 
     pub(crate) fn can_stop(&self) -> bool {
-        self.capabilities.stop
+        self.capabilities.stop || self.cycle_owns_orchestration()
+    }
+
+    pub(crate) fn cycle_owns_orchestration(&self) -> bool {
+        matches!(
+            self.cycle.state,
+            CycleState::Preparing
+                | CycleState::StartingStep
+                | CycleState::RunningStep
+                | CycleState::Settling
+                | CycleState::Resting
+                | CycleState::Stopping
+        )
+    }
+
+    pub(crate) fn start_cycle(&mut self, recipe: CycleRecipe) {
+        if self.is_remote() && self.remote_status != BackendConnectionStatus::Connected {
+            self.command_error =
+                Some("browser is disconnected; cycle command was not sent".to_owned());
+            return;
+        }
+        self.backend.command(BackendCommand::StartCycle(recipe));
+    }
+
+    pub(crate) fn stop_cycle(&mut self) {
+        if self.is_remote() && self.remote_status != BackendConnectionStatus::Connected {
+            self.command_error =
+                Some("browser is disconnected; cycle command was not sent".to_owned());
+            return;
+        }
+        self.backend.command(BackendCommand::StopCycle);
     }
 
     pub(crate) fn can_control_device(&self) -> bool {
@@ -339,6 +371,7 @@ impl DeviceSession {
         self.activity_known = update.device.activity_known;
         self.mode_on = update.device.active;
         self.test_state = update.test.state;
+        self.cycle = update.cycle;
         self.elapsed_seconds = update.test.elapsed_seconds;
     }
 

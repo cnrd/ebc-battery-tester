@@ -67,6 +67,10 @@ fn connect(idx: usize) -> Result<Box<dyn serialport::SerialPort>, String> {
 }
 
 #[expect(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the native transport loop handles all backend command variants"
+)]
 fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
     let mut backend = LocalBackend::default();
     let mut port: Option<Box<dyn serialport::SerialPort>> = None;
@@ -111,7 +115,7 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                 }
                 Ok(BackendCommand::Disconnect) => {
                     publish(
-                        LocalBackend::safe_disconnect(),
+                        backend.request_disconnect(),
                         &mut port,
                         &event_tx,
                         &mut backend,
@@ -125,6 +129,17 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                 }
                 Ok(BackendCommand::Resume(config)) => {
                     publish(backend.resume(config), &mut port, &event_tx, &mut backend);
+                }
+                Ok(BackendCommand::StartCycle(recipe)) => {
+                    publish(
+                        backend.start_cycle(recipe),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
+                }
+                Ok(BackendCommand::StopCycle) => {
+                    publish(backend.stop_cycle(), &mut port, &event_tx, &mut backend);
                 }
                 Ok(BackendCommand::Shutdown) => {
                     publish(backend.shutdown(), &mut port, &event_tx, &mut backend);

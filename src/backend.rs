@@ -4,16 +4,20 @@ use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
 
-use crate::core::{ApiCommand, AuthoritativeSnapshot, Sample, SnapshotUpdate, TestConfiguration};
+use crate::core::{
+    ApiCommand, AuthoritativeSnapshot, CycleRecipe, Sample, SnapshotUpdate, TestConfiguration,
+};
 use crate::device::UsbDeviceInfo;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum BackendCommand {
     RefreshDevices,
     Connect(usize),
     Disconnect,
     Api(ApiCommand),
     Resume(TestConfiguration),
+    StartCycle(CycleRecipe),
+    StopCycle,
     Shutdown,
 }
 
@@ -87,13 +91,20 @@ impl BackendEventSender {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "backend command dispatchers transfer command ownership"
+)]
 pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
     match command {
         BackendCommand::Connect(_) => vec![ApiCommand::Connect],
         BackendCommand::Disconnect => vec![ApiCommand::Disconnect],
         BackendCommand::Api(command) => vec![command],
         BackendCommand::Resume(_) => vec![ApiCommand::Resume],
-        BackendCommand::RefreshDevices | BackendCommand::Shutdown => Vec::new(),
+        BackendCommand::RefreshDevices
+        | BackendCommand::StartCycle(_)
+        | BackendCommand::StopCycle
+        | BackendCommand::Shutdown => Vec::new(),
     }
 }
 

@@ -5,10 +5,12 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Sample, ServerConnectionState, SnapshotUpdate,
-    TestConfiguration,
+    ApiCommand, AuthoritativeSnapshot, CycleRecipe, CycleState, Sample, ServerConnectionState,
+    SnapshotUpdate, TestConfiguration,
 };
+use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OutboundFrame};
+use std::time::Instant;
 
 #[derive(Default)]
 pub(crate) struct LocalOutput {
@@ -30,35 +32,45 @@ impl LocalSend {
 
 #[derive(Clone, Copy, Debug)]
 enum SendCompletion {
-    Command(PreparedCommand),
+    Command {
+        prepared: PreparedCommand,
+        cycle_action: Option<CycleAction>,
+        notify_command: bool,
+    },
     TimerSync,
     BestEffort,
 }
 
 pub(crate) struct LocalBackend {
     controller: TestController,
+    cycle: CycleEngine,
     connection: ServerConnectionState,
     connection_error: Option<String>,
     next_sequence: u64,
     last_published_elapsed: u64,
     shutdown_started: bool,
+    next_cycle_execution_id: u64,
 }
 
 impl Default for LocalBackend {
     fn default() -> Self {
         Self {
             controller: TestController::new(ControllerMode::Direct),
+            cycle: CycleEngine::new(),
             connection: ServerConnectionState::Disconnected,
             connection_error: None,
             next_sequence: 0,
             last_published_elapsed: 0,
             shutdown_started: false,
+            next_cycle_execution_id: 1,
         }
     }
 }
 
 impl LocalBackend {
     pub(crate) fn begin_connection(&mut self) -> LocalOutput {
+        self.cycle
+            .interrupt_for_gap("cycle interrupted by connection change");
         self.controller.begin_connection("connection changed");
         self.connection = ServerConnectionState::Connecting;
         self.connection_error = None;
@@ -73,6 +85,8 @@ impl LocalBackend {
     }
 
     pub(crate) fn connection_failed(&mut self, error: String) -> LocalOutput {
+        self.cycle
+            .interrupt_for_gap(format!("cycle interrupted by connection failure: {error}"));
         self.controller.disconnect("device connection lost");
         self.connection = ServerConnectionState::Error;
         self.connection_error = Some(error);
@@ -80,6 +94,8 @@ impl LocalBackend {
     }
 
     pub(crate) fn disconnected(&mut self) -> LocalOutput {
+        self.cycle
+            .interrupt_for_gap("cycle interrupted because the device disconnected");
         self.controller.disconnect("device disconnected");
         self.connection = ServerConnectionState::Disconnected;
         self.connection_error = None;
@@ -87,6 +103,23 @@ impl LocalBackend {
     }
 
     pub(crate) fn command(&mut self, command: ApiCommand) -> LocalOutput {
+        if command == ApiCommand::Stop
+            && (self.cycle.owns_orchestration()
+                || self.cycle.status().state == CycleState::Interrupted)
+        {
+            return self.stop_cycle();
+        }
+        if self.cycle.owns_orchestration()
+            && matches!(
+                command,
+                ApiCommand::Start(_)
+                    | ApiCommand::Resume
+                    | ApiCommand::Adjust(_)
+                    | ApiCommand::Calibration(_)
+            )
+        {
+            return Self::command_error("the active cycle owns test orchestration".to_owned());
+        }
         let prepared = match self.controller.prepare_command(command) {
             Ok(prepared) => prepared,
             Err(error) => return Self::command_error(error),
@@ -95,15 +128,22 @@ impl LocalBackend {
             return LocalOutput {
                 sends: vec![LocalSend {
                     frame,
-                    completion: SendCompletion::Command(prepared),
+                    completion: SendCompletion::Command {
+                        prepared,
+                        cycle_action: None,
+                        notify_command: true,
+                    },
                 }],
                 ..LocalOutput::default()
             };
         }
-        self.command_succeeded(prepared)
+        self.command_succeeded(prepared, None, true)
     }
 
     pub(crate) fn resume(&self, config: TestConfiguration) -> LocalOutput {
+        if self.cycle.owns_orchestration() {
+            return Self::command_error("the active cycle owns test orchestration".to_owned());
+        }
         let prepared = match self.controller.prepare_resume(config) {
             Ok(prepared) => prepared,
             Err(error) => return Self::command_error(error),
@@ -114,9 +154,58 @@ impl LocalBackend {
         LocalOutput {
             sends: vec![LocalSend {
                 frame,
-                completion: SendCompletion::Command(prepared),
+                completion: SendCompletion::Command {
+                    prepared,
+                    cycle_action: None,
+                    notify_command: true,
+                },
             }],
             ..LocalOutput::default()
+        }
+    }
+
+    pub(crate) fn start_cycle(&mut self, recipe: CycleRecipe) -> LocalOutput {
+        if let Err(error) = recipe.validate() {
+            return Self::command_error(error.to_string());
+        }
+        if self.cycle.is_executing() {
+            return Self::command_error("a cycle is already active".to_owned());
+        }
+        if !self.controller.capabilities().start {
+            return Self::command_error(
+                "cycle start requires a fresh current-connection inactive report".to_owned(),
+            );
+        }
+        if self.controller.device().current_ma != Some(0) {
+            return Self::command_error(
+                "cycle start requires confirmed zero device current".to_owned(),
+            );
+        }
+        let Some(next_id) = self.next_cycle_execution_id.checked_add(1) else {
+            return Self::command_error("local cycle execution IDs are exhausted".to_owned());
+        };
+        let execution_id = format!("local-cycle-{}", self.next_cycle_execution_id);
+        self.next_cycle_execution_id = next_id;
+        let action = match self.cycle.start(recipe, execution_id, None, Instant::now()) {
+            Ok(action) => action,
+            Err(error) => return Self::command_error(error.to_string()),
+        };
+        if let Some(action) = action {
+            self.prepare_cycle_action(action, true)
+        } else {
+            let mut output = self.state_output();
+            output.events.push(BackendEvent::CommandSucceeded);
+            output
+        }
+    }
+
+    pub(crate) fn stop_cycle(&mut self) -> LocalOutput {
+        if let Some(action) = self.cycle.stop(self.controller.test()) {
+            self.prepare_cycle_action(action, true)
+        } else {
+            let mut output = self.state_output();
+            output.events.push(BackendEvent::CommandSucceeded);
+            output
         }
     }
 
@@ -127,24 +216,69 @@ impl LocalBackend {
     ) -> LocalOutput {
         match result {
             Ok(()) => match send.completion {
-                SendCompletion::Command(prepared) => self.command_succeeded(prepared),
+                SendCompletion::Command {
+                    prepared,
+                    cycle_action,
+                    notify_command,
+                } => self.command_succeeded(prepared, cycle_action, notify_command),
                 SendCompletion::TimerSync | SendCompletion::BestEffort => LocalOutput::default(),
             },
             Err(error) => self.send_failed(send, &error),
         }
     }
 
-    fn command_succeeded(&mut self, prepared: PreparedCommand) -> LocalOutput {
+    fn command_succeeded(
+        &mut self,
+        prepared: PreparedCommand,
+        cycle_action: Option<CycleAction>,
+        notify_command: bool,
+    ) -> LocalOutput {
         let mut output = LocalOutput::default();
         self.controller.commit_command(prepared, None);
+        if let Some(action) = cycle_action {
+            self.cycle
+                .on_action_committed(&action, self.controller.test());
+        }
         if prepared.kind() == CommandKind::Start {
             self.next_sequence = 0;
             output.events.push(BackendEvent::Snapshot(self.snapshot()));
         } else {
             output.events.push(BackendEvent::Update(self.state()));
         }
-        output.events.push(BackendEvent::CommandSucceeded);
+        if notify_command {
+            output.events.push(BackendEvent::CommandSucceeded);
+        }
         output
+    }
+
+    fn prepare_cycle_action(&mut self, action: CycleAction, notify_command: bool) -> LocalOutput {
+        let command = match action {
+            CycleAction::Start(config) => ApiCommand::Start(config),
+            CycleAction::Stop => ApiCommand::Stop,
+        };
+        let prepared = match self.controller.prepare_command(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.cycle.on_action_failed(error.clone());
+                let mut output = self.state_output();
+                output.events.push(BackendEvent::CommandError(error));
+                return output;
+            }
+        };
+        if let Some(frame) = prepared.frame() {
+            return LocalOutput {
+                sends: vec![LocalSend {
+                    frame,
+                    completion: SendCompletion::Command {
+                        prepared,
+                        cycle_action: Some(action),
+                        notify_command,
+                    },
+                }],
+                events: vec![BackendEvent::Update(self.state())],
+            };
+        }
+        self.command_succeeded(prepared, Some(action), notify_command)
     }
 
     pub(crate) fn safe_disconnect() -> LocalOutput {
@@ -168,11 +302,24 @@ impl LocalBackend {
             return LocalOutput::default();
         }
         self.shutdown_started = true;
-        Self::safe_disconnect()
+        self.cycle
+            .interrupt("cycle interrupted by local backend shutdown");
+        let mut output = Self::safe_disconnect();
+        output.events.push(BackendEvent::Update(self.state()));
+        output
+    }
+
+    pub(crate) fn request_disconnect(&mut self) -> LocalOutput {
+        self.cycle
+            .interrupt("cycle interrupted by explicit device disconnect");
+        let mut output = Self::safe_disconnect();
+        output.events.push(BackendEvent::Update(self.state()));
+        output
     }
 
     pub(crate) fn tick(&mut self) -> LocalOutput {
         let mut output = LocalOutput::default();
+        let previous_cycle = self.cycle.status().clone();
         if let Some(minutes) = self.controller.next_timer_sync() {
             output.sends.push(LocalSend {
                 frame: OutboundFrame::TimerSync(minutes),
@@ -180,8 +327,11 @@ impl LocalBackend {
             });
         }
         self.controller.update_elapsed();
+        if let Some(action) = self.cycle.tick(Instant::now()) {
+            output.extend(self.prepare_cycle_action(action, false));
+        }
         let elapsed = self.controller.test().elapsed_seconds;
-        if elapsed != self.last_published_elapsed {
+        if elapsed != self.last_published_elapsed || self.cycle.status() != &previous_cycle {
             self.last_published_elapsed = elapsed;
             output.events.push(BackendEvent::Update(self.state()));
         }
@@ -257,6 +407,12 @@ impl LocalBackend {
 
     fn report(&mut self, report: DeviceReport, sample_report: bool) -> LocalOutput {
         let (_, measurement) = self.controller.report(report);
+        let cycle_action = self.cycle.on_physical_state(
+            Instant::now(),
+            self.controller.device(),
+            self.controller.test(),
+            true,
+        );
         self.last_published_elapsed = self.controller.test().elapsed_seconds;
         let mut output = self.state_output();
         if sample_report && let Some(measurement) = measurement {
@@ -273,6 +429,9 @@ impl LocalBackend {
             }));
             self.next_sequence = self.next_sequence.saturating_add(1);
         }
+        if let Some(action) = cycle_action {
+            output.extend(self.prepare_cycle_action(action, false));
+        }
         output
     }
 
@@ -284,13 +443,25 @@ impl LocalBackend {
     }
 
     fn state(&self) -> BackendState {
+        let mut capabilities = self.controller.capabilities();
+        if self.cycle.owns_orchestration() {
+            capabilities.start = false;
+            capabilities.resume = false;
+            capabilities.stop = true;
+            capabilities.show_stop = true;
+            capabilities.adjust = false;
+            capabilities.calibrate_voltage = false;
+            capabilities.calibrate_current = false;
+            capabilities.confirm_calibration = false;
+        }
         BackendState {
             update: SnapshotUpdate {
                 connection: self.connection.clone(),
                 connection_error: self.connection_error.clone(),
                 device: self.controller.device().clone(),
                 test: self.controller.test().clone(),
-                capabilities: self.controller.capabilities(),
+                cycle: self.cycle.status().clone(),
+                capabilities,
             },
         }
     }
@@ -302,6 +473,7 @@ impl LocalBackend {
             connection_error: state.update.connection_error,
             device: state.update.device,
             test: state.update.test,
+            cycle: state.update.cycle,
             capabilities: state.update.capabilities,
             history: Vec::new(),
         }
@@ -318,10 +490,23 @@ impl LocalBackend {
         let message = format!("failed to send {:?}: {error}", send.frame);
         if !matches!(send.completion, SendCompletion::BestEffort) {
             match send.completion {
-                SendCompletion::Command(prepared) => self
-                    .controller
-                    .command_write_failed(prepared.kind(), &message),
-                SendCompletion::TimerSync => self.controller.disconnect(&message),
+                SendCompletion::Command {
+                    prepared,
+                    cycle_action,
+                    ..
+                } => {
+                    self.controller
+                        .command_write_failed(prepared.kind(), &message);
+                    if cycle_action.is_some() {
+                        self.cycle.on_action_failed(message.clone());
+                    } else {
+                        self.cycle.interrupt_for_gap(message.clone());
+                    }
+                }
+                SendCompletion::TimerSync => {
+                    self.controller.disconnect(&message);
+                    self.cycle.interrupt_for_gap(message.clone());
+                }
                 SendCompletion::BestEffort => unreachable!(),
             }
             self.connection = ServerConnectionState::Error;
@@ -343,11 +528,18 @@ impl LocalBackend {
     }
 }
 
+impl LocalOutput {
+    fn extend(&mut self, mut other: Self) {
+        self.sends.append(&mut other.sends);
+        self.events.append(&mut other.events);
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "backend tests should fail fast")]
 mod tests {
     use super::*;
-    use crate::core::TestState;
+    use crate::core::{CycleState, CycleStep, CycleStepCompletion, TestState};
     use crate::device::DeviceMode;
 
     fn config() -> TestConfiguration {
@@ -355,6 +547,28 @@ mod tests {
             current_ma: 1000,
             cutoff_voltage_mv: 3000,
             cutoff_time_min: 0,
+        }
+    }
+
+    fn config_with_current(current_ma: u16) -> TestConfiguration {
+        TestConfiguration::DischargeConstantCurrent {
+            current_ma,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        }
+    }
+
+    fn device_step(current_ma: u16) -> CycleStep {
+        CycleStep::Device {
+            config: config_with_current(current_ma),
+            completion: CycleStepCompletion::Hardware,
+        }
+    }
+
+    fn recipe(steps: Vec<CycleStep>) -> CycleRecipe {
+        CycleRecipe {
+            steps,
+            repeat_count: 1,
         }
     }
 
@@ -695,5 +909,154 @@ mod tests {
             [OutboundFrame::Stop, OutboundFrame::Disconnect]
         ));
         assert!(backend.shutdown().sends.is_empty());
+    }
+
+    #[test]
+    fn cycle_progresses_between_device_steps_without_gui_commands() {
+        let mut backend = connected_backend();
+        let first = backend.start_cycle(recipe(vec![device_step(1000), device_step(1500)]));
+        assert!(matches!(
+            send_frames(&first).as_slice(),
+            [OutboundFrame::StartConstantCurrentDischarge(1000, 3000, 0)]
+        ));
+        finish_success(&mut backend, &first);
+        backend.report(report(ReportState::Active, 1), true);
+
+        let settling = backend.report(report(ReportState::Finished, 2), true);
+        assert_eq!(state(&settling).update.cycle.state, CycleState::Settling);
+        assert!(settling.sends.is_empty());
+        let second = backend.report(report(ReportState::Idle, 2), true);
+        assert!(matches!(
+            send_frames(&second).as_slice(),
+            [OutboundFrame::StartConstantCurrentDischarge(1500, 3000, 0)]
+        ));
+
+        let committed = finish_success(&mut backend, &second);
+        assert!(matches!(
+            committed.events.first(),
+            Some(BackendEvent::Snapshot(snapshot))
+                if snapshot.cycle.step_index == 1 && snapshot.test.elapsed_seconds == 0
+        ));
+    }
+
+    #[test]
+    fn cycle_rest_advances_from_backend_tick() {
+        let mut backend = connected_backend();
+        let started = backend.start_cycle(recipe(vec![
+            CycleStep::Rest {
+                duration_seconds: 0,
+            },
+            device_step(1000),
+        ]));
+        assert!(started.sends.is_empty());
+        assert_eq!(state(&started).update.cycle.state, CycleState::Resting);
+
+        let tick = backend.tick();
+        assert!(matches!(
+            send_frames(&tick).as_slice(),
+            [OutboundFrame::StartConstantCurrentDischarge(1000, 3000, 0)]
+        ));
+        assert_eq!(state(&tick).update.cycle.step_index, 1);
+    }
+
+    #[test]
+    fn connection_gap_interrupts_active_cycle() {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+
+        let failed = backend.connection_failed("serial gap".to_owned());
+        assert_eq!(state(&failed).update.cycle.state, CycleState::Interrupted);
+        assert!(
+            state(&failed)
+                .update
+                .cycle
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("connection failure"))
+        );
+    }
+
+    #[test]
+    fn cycle_rejects_manual_orchestration_commands() {
+        let mut backend = connected_backend();
+        let started = backend.start_cycle(recipe(vec![CycleStep::Rest {
+            duration_seconds: 60,
+        }]));
+        assert!(started.sends.is_empty());
+
+        for command in [
+            ApiCommand::Start(config()),
+            ApiCommand::Resume,
+            ApiCommand::Adjust(config()),
+            ApiCommand::Calibration(crate::core::CalibrationCommand::VoltageLow(4000)),
+        ] {
+            let rejected = backend.command(command);
+            assert!(matches!(
+                rejected.events.as_slice(),
+                [BackendEvent::CommandError(error)] if error.contains("cycle owns")
+            ));
+            assert!(rejected.sends.is_empty());
+        }
+    }
+
+    #[test]
+    fn stopping_active_cycle_waits_for_inactive_report() {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+
+        let stop = backend.stop_cycle();
+        assert!(matches!(
+            send_frames(&stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        let stopping = finish_success(&mut backend, &stop);
+        assert_eq!(state(&stopping).update.cycle.state, CycleState::Stopping);
+        let stopped = backend.report(report(ReportState::Idle, 1), true);
+        assert_eq!(state(&stopped).update.cycle.state, CycleState::Stopped);
+    }
+
+    #[test]
+    fn cycle_start_write_failure_interrupts_without_commit() {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+
+        let failed = finish_failure(&mut backend, &start);
+        assert_eq!(state(&failed).update.cycle.state, CycleState::Interrupted);
+        assert_eq!(
+            state(&failed).update.test.state,
+            TestState::RecoveredUncertain
+        );
+        assert!(matches!(
+            failed.events.last(),
+            Some(BackendEvent::CommandError(error)) if error.contains("write failure")
+        ));
+    }
+
+    #[test]
+    fn cycle_start_prepare_rejection_interrupts_engine() {
+        let mut backend = connected_backend();
+        let action = backend
+            .cycle
+            .start(
+                recipe(vec![device_step(1000)]),
+                "test-cycle".to_owned(),
+                None,
+                Instant::now(),
+            )
+            .expect("valid cycle")
+            .expect("device action");
+        backend.controller.begin_connection("injected stale report");
+
+        let rejected = backend.prepare_cycle_action(action, true);
+        assert_eq!(state(&rejected).update.cycle.state, CycleState::Interrupted);
+        assert!(matches!(
+            rejected.events.last(),
+            Some(BackendEvent::CommandError(error)) if error.contains("not connected")
+        ));
+        assert!(rejected.sends.is_empty());
     }
 }

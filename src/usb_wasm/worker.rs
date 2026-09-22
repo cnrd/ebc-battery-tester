@@ -111,7 +111,7 @@ pub(super) async fn local_backend_task(
                     BackendCommand::Disconnect => {
                         generation = generation.wrapping_add(1);
                         disconnect_device(
-                            LocalBackend::safe_disconnect(),
+                            backend.request_disconnect(),
                             &mut backend,
                             &mut device,
                             &mut out_endpoint_num,
@@ -142,6 +142,28 @@ pub(super) async fn local_backend_task(
                     BackendCommand::Resume(config) => {
                         publish(
                             backend.resume(config),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
+                    }
+                    BackendCommand::StartCycle(recipe) => {
+                        publish(
+                            backend.start_cycle(recipe),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
+                    }
+                    BackendCommand::StopCycle => {
+                        publish(
+                            backend.stop_cycle(),
                             &mut backend,
                             &mut generation,
                             &mut device,
