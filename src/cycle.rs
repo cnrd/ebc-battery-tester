@@ -174,7 +174,9 @@ impl CycleEngine {
             return None;
         }
 
-        if self.is_executing() && test.state == TestState::Stopped {
+        let expects_active_operation = self.status.state == CycleState::RunningStep
+            || (self.status.state == CycleState::StartingStep && self.start_committed);
+        if expects_active_operation && test.state == TestState::Stopped {
             self.set_interrupted("physical test stopped unexpectedly");
             return None;
         }
@@ -225,6 +227,11 @@ impl CycleEngine {
     }
 
     pub fn on_action_failed(&mut self, reason: impl Into<String>) {
+        if self.status.state == CycleState::Interrupted
+            && self.pending_action == Some(CycleAction::Stop)
+        {
+            self.safety_stop_issued = false;
+        }
         self.pending_action = None;
         self.start_committed = false;
         self.set_interrupted(reason);
@@ -575,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn rest_only_recipe_uses_monotonic_time_and_skips_zero_rests() {
+    fn rest_only_recipe_uses_monotonic_time() {
         let now = Instant::now();
         let mut engine = CycleEngine::new();
         assert_eq!(
@@ -584,7 +591,7 @@ mod tests {
                 recipe(
                     vec![
                         CycleStep::Rest {
-                            duration_seconds: 0
+                            duration_seconds: 1
                         },
                         CycleStep::Rest {
                             duration_seconds: 2
@@ -597,10 +604,88 @@ mod tests {
             None
         );
         assert_eq!(engine.tick(now), None);
-        assert_eq!(engine.status().rest_remaining_seconds, Some(2));
-        assert_eq!(engine.tick(now + Duration::from_millis(1100)), None);
         assert_eq!(engine.status().rest_remaining_seconds, Some(1));
-        assert_eq!(engine.tick(now + Duration::from_secs(4)), None);
+        assert_eq!(engine.tick(now + Duration::from_millis(500)), None);
+        assert_eq!(engine.status().rest_remaining_seconds, Some(1));
+        assert_eq!(engine.tick(now + Duration::from_secs(1)), None);
+        assert_eq!(engine.status().step_index, 1);
+        assert_eq!(engine.tick(now + Duration::from_secs(3)), None);
+        assert_eq!(engine.status().repeat_index, 1);
+        assert_eq!(engine.status().step_index, 0);
+        assert_eq!(engine.tick(now + Duration::from_secs(6)), None);
+        assert_eq!(engine.status().state, CycleState::Completed);
+    }
+
+    #[test]
+    fn stopped_physical_state_is_expected_during_rest() {
+        let now = Instant::now();
+        let mut engine = CycleEngine::new();
+        assert_eq!(
+            start(
+                &mut engine,
+                recipe(
+                    vec![
+                        CycleStep::Rest {
+                            duration_seconds: 2,
+                        },
+                        device_step(100),
+                    ],
+                    1,
+                ),
+                now,
+            ),
+            None
+        );
+
+        assert_eq!(
+            engine.on_physical_state(
+                now + Duration::from_secs(1),
+                &settled_device(),
+                &status(TestState::Stopped),
+                true,
+            ),
+            None
+        );
+        assert_eq!(engine.status().state, CycleState::Resting);
+        assert_eq!(
+            engine.tick(now + Duration::from_secs(2)),
+            Some(CycleAction::Start(config(100)))
+        );
+        assert_eq!(engine.status().state, CycleState::StartingStep);
+    }
+
+    #[test]
+    fn stopped_physical_state_is_ignored_before_step_start_commits() {
+        let now = Instant::now();
+        let mut engine = CycleEngine::new();
+        assert_eq!(
+            start(&mut engine, recipe(vec![device_step(100)], 1), now),
+            Some(CycleAction::Start(config(100)))
+        );
+
+        engine.on_physical_state(now, &settled_device(), &status(TestState::Stopped), true);
+
+        assert_eq!(engine.status().state, CycleState::StartingStep);
+        assert_eq!(
+            engine.pending_action(),
+            Some(&CycleAction::Start(config(100)))
+        );
+    }
+
+    #[test]
+    fn stopped_physical_state_does_not_interrupt_settling() {
+        let now = Instant::now();
+        let mut engine = CycleEngine::new();
+        let action = start(&mut engine, recipe(vec![device_step(100)], 1), now);
+        engine.on_action_committed(action.as_ref().expect("start"), &status(TestState::Running));
+        let mut stale_current = settled_device();
+        stale_current.current_ma = Some(1000);
+        engine.on_physical_state(now, &stale_current, &status(TestState::Completed), true);
+        assert_eq!(engine.status().state, CycleState::Settling);
+
+        engine.on_physical_state(now, &stale_current, &status(TestState::Stopped), true);
+        assert_eq!(engine.status().state, CycleState::Settling);
+        engine.on_physical_state(now, &settled_device(), &status(TestState::Stopped), true);
         assert_eq!(engine.status().state, CycleState::Completed);
     }
 
@@ -640,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertainty_interrupts_and_explicit_stop_issues_one_safety_stop() {
+    fn interrupted_safety_stop_deduplicates_and_retries_after_failure() {
         let now = Instant::now();
         let mut engine = CycleEngine::new();
         start(&mut engine, recipe(vec![device_step(100)], 1), now);
@@ -653,6 +738,13 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            engine.stop(&status(TestState::RecoveredUncertain)),
+            Some(CycleAction::Stop)
+        );
+        assert_eq!(engine.stop(&status(TestState::RecoveredUncertain)), None);
+        engine.on_action_failed("stop write failed");
+        assert_eq!(engine.status().state, CycleState::Interrupted);
         assert_eq!(
             engine.stop(&status(TestState::RecoveredUncertain)),
             Some(CycleAction::Stop)

@@ -3229,6 +3229,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test verifies one complete multi-run cycle sequence"
+    )]
     fn no_client_cycle_settles_rests_repeats_and_archives_each_device_step() {
         let (mut actor, directory) = mock_actor("cycle-no-client");
         confirm_inactive(&mut actor);
@@ -3237,7 +3241,7 @@ mod tests {
                 vec![
                     device_step(),
                     crate::core::CycleStep::Rest {
-                        duration_seconds: 0,
+                        duration_seconds: 1,
                     },
                     device_step(),
                 ],
@@ -3300,7 +3304,11 @@ mod tests {
 
             if run.is_multiple_of(2) {
                 assert_eq!(actor.cycle.status().state, CycleState::Resting);
-                actor.tick();
+                let action = actor
+                    .cycle
+                    .tick(Instant::now() + Duration::from_secs(1))
+                    .expect("rest advances to device step");
+                actor.execute_cycle_action(action).expect("start next step");
                 assert_eq!(actor.cycle.status().state, CycleState::StartingStep);
             } else if run < 3 {
                 assert_eq!(actor.cycle.status().state, CycleState::StartingStep);
@@ -3393,6 +3401,61 @@ mod tests {
             actor.sent_frames.as_slice(),
             [.., OutboundFrame::Stop, OutboundFrame::Disconnect]
         ));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn interrupted_safety_stop_retries_after_server_reconnect() {
+        let (mut actor, directory) = mock_actor("cycle-stop-retry");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(cycle_recipe(vec![device_step()], 1))
+            .expect("start cycle");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            1,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.set_connection_error("serial observation gap");
+        actor.connect().expect("reconnect mock device before stop");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            2,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        inject_write_failure(&mut actor);
+
+        actor.stop_cycle().expect_err("first safety stop fails");
+        assert_eq!(actor.cycle.status().state, CycleState::Interrupted);
+
+        actor.connect().expect("reconnect mock device");
+        actor.record_report(
+            device::DeviceMode::DischargeConstantCurrent,
+            4000,
+            1000,
+            3,
+            ReportState::Active,
+            "EBC-MOCK",
+            None,
+        );
+        actor.stop_cycle().expect("retry safety stop");
+        actor.stop_cycle().expect("deduplicated safety stop");
+
+        let stop_frames = actor
+            .sent_frames
+            .iter()
+            .filter(|frame| matches!(frame, OutboundFrame::Stop))
+            .count();
+        assert_eq!(stop_frames, 2);
+        assert_eq!(actor.cycle.status().state, CycleState::Interrupted);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

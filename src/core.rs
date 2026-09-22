@@ -269,11 +269,22 @@ impl CycleRecipe {
         }
 
         for (index, step) in self.steps.iter().enumerate() {
-            if let CycleStep::Device { config, .. } = step {
-                config.validate().map_err(|error| ValidationError {
-                    field: format!("steps[{index}].{}", error.field),
-                    message: error.message,
-                })?;
+            match step {
+                CycleStep::Device { config, .. } => {
+                    config.validate().map_err(|error| ValidationError {
+                        field: format!("steps[{index}].{}", error.field),
+                        message: error.message,
+                    })?;
+                }
+                CycleStep::Rest {
+                    duration_seconds: 0,
+                } => {
+                    return Err(ValidationError {
+                        field: format!("steps[{index}].duration_seconds"),
+                        message: "must be at least 1".to_owned(),
+                    });
+                }
+                CycleStep::Rest { .. } => {}
             }
         }
         Ok(())
@@ -465,6 +476,16 @@ mod tests {
             no_repeats.validate().expect_err("zero repeats").field,
             "repeat_count"
         );
+
+        let zero_rest = CycleRecipe {
+            steps: vec![CycleStep::Rest {
+                duration_seconds: 0,
+            }],
+            repeat_count: 1,
+        };
+        let zero_rest_error = zero_rest.validate().expect_err("zero-duration rest");
+        assert_eq!(zero_rest_error.field, "steps[0].duration_seconds");
+        assert_eq!(zero_rest_error.message, "must be at least 1");
 
         let invalid_device = CycleRecipe {
             steps: vec![CycleStep::Device {

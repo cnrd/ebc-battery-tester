@@ -940,23 +940,17 @@ mod tests {
     }
 
     #[test]
-    fn cycle_rest_advances_from_backend_tick() {
+    fn cycle_rejects_zero_duration_rest() {
         let mut backend = connected_backend();
-        let started = backend.start_cycle(recipe(vec![
-            CycleStep::Rest {
-                duration_seconds: 0,
-            },
-            device_step(1000),
-        ]));
+        let started = backend.start_cycle(recipe(vec![CycleStep::Rest {
+            duration_seconds: 0,
+        }]));
         assert!(started.sends.is_empty());
-        assert_eq!(state(&started).update.cycle.state, CycleState::Resting);
-
-        let tick = backend.tick();
         assert!(matches!(
-            send_frames(&tick).as_slice(),
-            [OutboundFrame::StartConstantCurrentDischarge(1000, 3000, 0)]
+            started.events.as_slice(),
+            [BackendEvent::CommandError(error)] if error.contains("must be at least 1")
         ));
-        assert_eq!(state(&tick).update.cycle.step_index, 1);
+        assert_eq!(backend.cycle.status().state, CycleState::Idle);
     }
 
     #[test]
@@ -1034,6 +1028,39 @@ mod tests {
             failed.events.last(),
             Some(BackendEvent::CommandError(error)) if error.contains("write failure")
         ));
+    }
+
+    #[test]
+    fn interrupted_safety_stop_retries_after_reconnect() {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(recipe(vec![device_step(1000)]));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        backend.connection_failed("serial gap".to_owned());
+        backend.begin_connection();
+        backend.connection_established();
+        backend.report(report(ReportState::Active, 2), true);
+
+        let first_stop = backend.stop_cycle();
+        assert!(matches!(
+            send_frames(&first_stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        assert!(backend.stop_cycle().sends.is_empty());
+        let failed = finish_failure(&mut backend, &first_stop);
+        assert_eq!(state(&failed).update.cycle.state, CycleState::Interrupted);
+
+        backend.begin_connection();
+        backend.connection_established();
+        backend.report(report(ReportState::Active, 3), true);
+        let retry = backend.stop_cycle();
+        assert!(matches!(
+            send_frames(&retry).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &retry);
+        assert!(backend.stop_cycle().sends.is_empty());
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
     }
 
     #[test]
