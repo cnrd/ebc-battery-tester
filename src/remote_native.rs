@@ -565,9 +565,9 @@ mod tests {
 
     use super::*;
     use crate::core::{
-        CreateSavedRecipeRequest, CycleRecipe, DeleteSavedRecipeRequest, RenameRequest,
-        StartCycleRequest, StartSavedRecipeRequest, StartTestRequest, TestConfiguration,
-        UpdateSavedRecipeRequest,
+        CreateSavedRecipeRequest, CycleRecipe, DeleteSavedRecipeRequest, RECIPE_EXPORT_FORMAT,
+        RECIPE_EXPORT_VERSION, RenameRequest, StartCycleRequest, StartSavedRecipeRequest,
+        StartTestRequest, TestConfiguration, UpdateSavedRecipeRequest,
     };
 
     fn config() -> TestConfiguration {
@@ -665,8 +665,8 @@ mod tests {
 
     fn recipe_export() -> RecipeExport {
         RecipeExport {
-            format: "ebc-cycle-recipe".to_owned(),
-            version: 1,
+            format: RECIPE_EXPORT_FORMAT.to_owned(),
+            version: RECIPE_EXPORT_VERSION,
             name: "Imported".to_owned(),
             recipe: CycleRecipe {
                 steps: Vec::new(),
