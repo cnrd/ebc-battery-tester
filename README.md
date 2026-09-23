@@ -136,7 +136,10 @@ remains available from `GET /api/history.csv`.
 
 Cycle executions also retain an independent continuous telemetry stream under
 `/data/cycles/<execution-id>.csv`; `/data/cycles/<execution-id>.json` is its
-metadata sidecar and stores the optional execution name. The telemetry includes
+metadata sidecar and stores the execution ID/name, actual recipe snapshot,
+optional saved-recipe provenance, and start timestamp. Saved templates are
+stored independently under `/data/recipes/<recipe-id>.json`; no recipe CSVs are
+created. The telemetry includes
 normal mode reports from device steps, settling, rests, and repeat boundaries
 without changing the per-run sample files or metrics. The latest cycle is
 exported by `GET /api/cycle/history.csv`; a specific execution is exported by
@@ -317,12 +320,65 @@ does not change protocol behavior.
 
 ## API outline
 
+Saved recipes are reusable editable templates with immutable installation-local
+IDs, required names, and optimistic-concurrency revisions. Names need not be
+unique. A new recipe starts at revision 1; updating its name or complete flat
+`CycleRecipe` requires the current `expected_revision` and increments the
+revision once. Stale updates and deletes return `409 Conflict`.
+
+A cycle started by saved recipe ID atomically captures the template's current
+complete `CycleRecipe` and an immutable `{id, name, revision}` reference. The
+execution engine uses only that snapshot and never reads the template again.
+Editing or deleting a saved recipe never changes an already-started execution.
+The optional execution name remains independent from the required recipe name.
+Ad-hoc `/api/cycle/start` executions have no saved-recipe provenance.
+
+Remote clients share the server library persisted under
+`/data/recipes/<recipe-id>.json`. Local USB/WebUSB libraries instead remain in
+the existing eframe application storage. Local and remote libraries are never
+merged automatically.
+
+Portable recipe files are ordinary single-recipe JSON with the recommended
+`.ebc-recipe.json` suffix. Saved recipe IDs and revisions are local to one
+installation. Portable files contain no installation-specific identity. Import
+always creates a new saved recipe with a fresh ID, revision 1, and new local
+timestamps, even when the name or contents duplicate an existing recipe.
+
+Version 1 uses the existing flat recipe language:
+
+```json
+{
+  "format": "ebc-battery-tester-recipe",
+  "version": 1,
+  "name": "4.2 V capacity test",
+  "recipe": {
+    "steps": [
+      {
+        "type": "device",
+        "config": {
+          "mode": "discharge_constant_current",
+          "current_ma": 500,
+          "cutoff_voltage_mv": 3000,
+          "cutoff_time_min": 0
+        },
+        "completion": "hardware"
+      },
+      {
+        "type": "rest",
+        "duration_seconds": 60
+      }
+    ],
+    "repeat_count": 1
+  }
+}
+```
+
 Manual runs have an immutable, server-assigned `run_id`; cycle executions have
 an immutable, server-assigned `execution_id`. Their optional names are editable,
 need not be unique, and may be cleared without changing either ID. A cycle's
 device-step child runs are linked to their parent by `CycleRunContext` and always
-have `name: null`; naming saved recipes is a separate future concept and names
-are not part of `CycleRecipe`.
+have `name: null`. Saved recipe names and execution names are not part of
+`CycleRecipe`.
 
 The canonical manual start body wraps the test configuration and optional name:
 
@@ -371,6 +427,13 @@ All endpoints are under `/api`:
 | `GET` | `/api/cycle/history.csv` | Current/latest full-resolution cycle telemetry |
 | `GET` | `/api/cycles/{id}/history.csv` | Cycle telemetry by execution ID |
 | `GET` | `/api/ws` | Snapshot/sample/cycle-sample WebSocket stream |
+| `GET` | `/api/recipes` | Full authoritative saved-recipe library |
+| `POST` | `/api/recipes` | Create a saved recipe |
+| `PUT` | `/api/recipes/{recipe_id}` | Update name and recipe with `expected_revision` |
+| `DELETE` | `/api/recipes/{recipe_id}` | Delete with `expected_revision` |
+| `POST` | `/api/recipes/{recipe_id}/start` | Start the actor-resolved saved recipe with optional `execution_name` |
+| `GET` | `/api/recipes/{recipe_id}/export` | Download portable version-1 JSON |
+| `POST` | `/api/recipes/import` | Import portable JSON as a new local identity |
 | `POST` | `/api/connect`, `/api/disconnect` | Serial connection control |
 | `POST` | `/api/test/start` | `StartTestRequest` JSON envelope (`config` and optional `name`) |
 | `POST` | `/api/test/adjust` | Raw test configuration JSON |
@@ -381,7 +444,7 @@ All endpoints are under `/api`:
 | `POST` | `/api/cycles/{execution_id}/name` | Rename or clear any persisted cycle execution name |
 | `POST` | `/api/calibration` | JSON calibration command |
 
-Every mutating `POST` requires `X-EBC-Command: 1`; the remote UI sends it and API
+Every mutating `POST`, `PUT`, and `DELETE` requires `X-EBC-Command: 1`; the remote UI sends it and API
 errors are displayed in the connection panel. Browser WebSockets require an
 `Origin`. By default an HTTP or HTTPS origin must match `Host`; when TLS terminates or
 the public host differs at a reverse proxy, set `EBC_ALLOWED_ORIGIN` to the exact

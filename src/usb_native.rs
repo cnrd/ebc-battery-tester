@@ -146,6 +146,29 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                         &mut backend,
                     );
                 }
+                Ok(BackendCommand::StartSavedRecipeSnapshot {
+                    recipe,
+                    reference,
+                    execution_name,
+                }) => {
+                    publish(
+                        backend.start_saved_recipe(recipe, reference, execution_name),
+                        &mut port,
+                        &event_tx,
+                        &mut backend,
+                    );
+                }
+                Ok(
+                    BackendCommand::StartSavedRecipe { .. }
+                    | BackendCommand::RefreshRecipes
+                    | BackendCommand::CreateSavedRecipe(_)
+                    | BackendCommand::UpdateSavedRecipe { .. }
+                    | BackendCommand::DeleteSavedRecipe { .. }
+                    | BackendCommand::ImportRecipe(_)
+                    | BackendCommand::ExportRecipe { .. },
+                ) => event_tx.send(BackendEvent::CommandError(
+                    "remote recipe command sent to local backend".to_owned(),
+                )),
                 Ok(BackendCommand::RenameRun { run_id, request }) => {
                     publish(
                         backend.rename_run(&run_id, request),

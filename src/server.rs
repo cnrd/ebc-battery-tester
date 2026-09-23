@@ -9,12 +9,12 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -27,10 +27,13 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CurrentRunMetadata, CycleRunContext,
-    CycleSample, CycleState, CycleStatus, RenameRequest, RunSummary, Sample, ServerConnectionState,
-    SnapshotUpdate, StartCycleRequest, StartTestRequest, TestConfiguration, TestState,
-    WebSocketEvent, cycle_presentation_history, normalize_execution_name,
+    ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CreateSavedRecipeRequest,
+    CurrentRunMetadata, CycleRecipe, CycleRunContext, CycleSample, CycleState, CycleStatus,
+    DeleteSavedRecipeRequest, RECIPE_EXPORT_FORMAT, RECIPE_EXPORT_VERSION, RecipeExport,
+    RenameRequest, RunSummary, Sample, SavedRecipe, SavedRecipeReference, ServerConnectionState,
+    SnapshotUpdate, StartCycleRequest, StartSavedRecipeRequest, StartTestRequest,
+    TestConfiguration, TestState, UpdateSavedRecipeRequest, WebSocketEvent,
+    cycle_presentation_history, normalize_optional_name, normalize_required_name,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
@@ -91,6 +94,22 @@ enum ActorRequest {
     CycleCsv(String),
     Runs,
     RunCsv(String),
+    Recipes,
+    CreateRecipe(CreateSavedRecipeRequest),
+    UpdateRecipe {
+        id: String,
+        request: UpdateSavedRecipeRequest,
+    },
+    DeleteRecipe {
+        id: String,
+        request: DeleteSavedRecipeRequest,
+    },
+    ImportRecipe(RecipeExport),
+    ExportRecipe(String),
+    StartSavedRecipe {
+        id: String,
+        request: StartSavedRecipeRequest,
+    },
     Command(ApiCommand),
     StartTest(StartTestRequest),
     StartCycle(StartCycleRequest),
@@ -108,24 +127,34 @@ enum ActorRequest {
 
 enum ActorResponse {
     Snapshot(AuthoritativeSnapshot),
-    Subscription(AuthoritativeSnapshot, broadcast::Receiver<WebSocketEvent>),
+    Subscription(
+        AuthoritativeSnapshot,
+        Vec<SavedRecipe>,
+        broadcast::Receiver<WebSocketEvent>,
+    ),
     History(Vec<Sample>),
     Runs(Vec<RunSummary>),
     Export(ExportDescriptor),
     Start(Result<AuthoritativeSnapshot, StartError>),
     Rename(Result<AuthoritativeSnapshot, RenameError>),
+    Recipes(Vec<SavedRecipe>),
+    Recipe(Result<SavedRecipe, RecipeError>),
+    RecipeExport(Result<RecipeExport, RecipeError>),
 }
 
 #[derive(Debug)]
 enum StartError {
     BadRequest(String),
+    NotFound(String),
     Internal(String),
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadRequest(message) | Self::Internal(message) => formatter.write_str(message),
+            Self::BadRequest(message) | Self::NotFound(message) | Self::Internal(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -134,6 +163,14 @@ impl std::fmt::Display for StartError {
 enum RenameError {
     BadRequest(String),
     NotFound(String),
+    Internal(String),
+}
+
+#[derive(Debug)]
+enum RecipeError {
+    BadRequest(String),
+    NotFound(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -167,6 +204,9 @@ struct Persistence {
     next_cycle_sequence: u64,
     cycle_writer: Option<BufWriter<File>>,
     last_cycle_sync: Instant,
+    recipes_dir: PathBuf,
+    recipes: Vec<SavedRecipe>,
+    reserved_recipe_ids: BTreeSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,11 +229,15 @@ struct Metadata {
     next_sequence: u64,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct CycleExecutionMetadata {
     execution_id: String,
     name: Option<String>,
+    recipe: Option<CycleRecipe>,
+    saved_recipe: Option<SavedRecipeReference>,
+    #[serde(alias = "started_at")]
+    started_at_utc: Option<String>,
 }
 
 impl Persistence {
@@ -218,6 +262,13 @@ impl Persistence {
                 cycles_dir.display()
             )
         })?;
+        let recipes_dir = data_dir.join("recipes");
+        fs::create_dir_all(&recipes_dir).map_err(|error| {
+            format!(
+                "failed to create recipe directory {}: {error}",
+                recipes_dir.display()
+            )
+        })?;
         let mut persistence = Self {
             metadata_path: data_dir.join("session.json"),
             samples_path: data_dir.join("samples.csv"),
@@ -237,8 +288,13 @@ impl Persistence {
             next_cycle_sequence: 0,
             cycle_writer: None,
             last_cycle_sync: Instant::now(),
+            recipes_dir,
+            recipes: Vec::new(),
+            reserved_recipe_ids: BTreeSet::new(),
         };
         persistence.runs = persistence.load_run_summaries()?;
+        (persistence.recipes, persistence.reserved_recipe_ids) =
+            persistence.load_saved_recipes()?;
         Ok(persistence)
     }
 
@@ -324,20 +380,35 @@ impl Persistence {
                 self.current_run_id.clone_from(&last.run_id);
             }
         }
-        if let Some(execution_id) = snapshot.cycle.execution_id.clone() {
-            let cycle_history = self.load_cycle_samples(&execution_id)?;
-            self.current_cycle_name = self
-                .load_cycle_metadata(&execution_id)?
-                .and_then(|metadata| metadata.name);
-            snapshot.cycle.name.clone_from(&self.current_cycle_name);
-            self.current_cycle_id = Some(execution_id);
-            self.next_cycle_sequence = cycle_history
-                .last()
-                .map_or(0, |sample| sample.sequence.saturating_add(1));
-            snapshot.cycle_history = cycle_history;
-        }
+        self.load_current_cycle(&mut snapshot)?;
         self.sync_snapshot_metadata(&mut snapshot);
         Ok(snapshot)
+    }
+
+    fn load_current_cycle(&mut self, snapshot: &mut AuthoritativeSnapshot) -> Result<(), String> {
+        let Some(execution_id) = snapshot.cycle.execution_id.clone() else {
+            return Ok(());
+        };
+        let cycle_history = self.load_cycle_samples(&execution_id)?;
+        if let Some(metadata) = self.load_cycle_metadata(&execution_id)? {
+            self.current_cycle_name = metadata.name;
+            if metadata.recipe.is_some() {
+                snapshot.cycle.recipe = metadata.recipe;
+            }
+            if metadata.saved_recipe.is_some() {
+                snapshot.cycle.saved_recipe = metadata.saved_recipe;
+            }
+            if metadata.started_at_utc.is_some() {
+                snapshot.cycle.started_at_utc = metadata.started_at_utc;
+            }
+        }
+        snapshot.cycle.name.clone_from(&self.current_cycle_name);
+        self.current_cycle_id = Some(execution_id);
+        self.next_cycle_sequence = cycle_history
+            .last()
+            .map_or(0, |sample| sample.sequence.saturating_add(1));
+        snapshot.cycle_history = cycle_history;
+        Ok(())
     }
 
     fn save_metadata(&self, snapshot: &AuthoritativeSnapshot) -> Result<(), String> {
@@ -555,6 +626,159 @@ impl Persistence {
         atomic_write_json(&path, summary)
     }
 
+    fn load_saved_recipes(&self) -> Result<(Vec<SavedRecipe>, BTreeSet<String>), String> {
+        let mut recipes = Vec::new();
+        let mut reserved = BTreeSet::new();
+        for entry in fs::read_dir(&self.recipes_dir).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if !path.is_file() {
+                return Err(format!(
+                    "unexpected entry in recipe directory: {}",
+                    path.display()
+                ));
+            }
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            if extension == Some("tmp") || extension == Some("rollback") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| format!("invalid recipe filename: {}", path.display()))?;
+            if !valid_run_id(id) {
+                return Err(format!("invalid recipe id in filename: {}", path.display()));
+            }
+            if !reserved.insert(id.to_owned()) {
+                return Err(format!("duplicate reserved recipe id: {id}"));
+            }
+            if extension == Some("deleted") {
+                continue;
+            }
+            if extension != Some("json") {
+                return Err(format!(
+                    "unexpected file in recipe directory: {}",
+                    path.display()
+                ));
+            }
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            let recipe: SavedRecipe = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid saved recipe {}: {error}", path.display()))?;
+            validate_saved_recipe(&recipe, id)
+                .map_err(|error| format!("invalid saved recipe {}: {error}", path.display()))?;
+            recipes.push(recipe);
+        }
+        sort_saved_recipes(&mut recipes);
+        Ok((recipes, reserved))
+    }
+
+    fn saved_recipes(&self) -> Vec<SavedRecipe> {
+        self.recipes.clone()
+    }
+
+    fn saved_recipe(&self, id: &str) -> Option<&SavedRecipe> {
+        self.recipes.iter().find(|recipe| recipe.id == id)
+    }
+
+    fn create_saved_recipe(
+        &mut self,
+        name: String,
+        recipe: CycleRecipe,
+    ) -> Result<SavedRecipe, String> {
+        let now = Utc::now().to_rfc3339();
+        let id = self.next_recipe_id(&now);
+        let saved = SavedRecipe {
+            id: id.clone(),
+            name,
+            recipe,
+            revision: 1,
+            created_at_utc: now.clone(),
+            updated_at_utc: now,
+        };
+        atomic_write_json(&self.recipe_path(&id), &saved)?;
+        self.reserved_recipe_ids.insert(id);
+        self.recipes.push(saved.clone());
+        sort_saved_recipes(&mut self.recipes);
+        Ok(saved)
+    }
+
+    fn update_saved_recipe(
+        &mut self,
+        id: &str,
+        request: UpdateSavedRecipeRequest,
+    ) -> Result<SavedRecipe, RecipeError> {
+        let Some(index) = self.recipes.iter().position(|recipe| recipe.id == id) else {
+            return Err(RecipeError::NotFound("saved recipe not found".to_owned()));
+        };
+        if self.recipes[index].revision != request.expected_revision {
+            return Err(RecipeError::Conflict(format!(
+                "saved recipe revision is {}; expected {}",
+                self.recipes[index].revision, request.expected_revision
+            )));
+        }
+        let mut updated = self.recipes[index].clone();
+        updated.name = request.name;
+        updated.recipe = request.recipe;
+        updated.revision = updated
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| RecipeError::Internal("saved recipe revision overflow".to_owned()))?;
+        updated.updated_at_utc = Utc::now().to_rfc3339();
+        atomic_write_json(&self.recipe_path(id), &updated).map_err(RecipeError::Internal)?;
+        self.recipes[index] = updated.clone();
+        sort_saved_recipes(&mut self.recipes);
+        Ok(updated)
+    }
+
+    fn delete_saved_recipe(
+        &mut self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<SavedRecipe, RecipeError> {
+        let Some(index) = self.recipes.iter().position(|recipe| recipe.id == id) else {
+            return Err(RecipeError::NotFound("saved recipe not found".to_owned()));
+        };
+        if self.recipes[index].revision != expected_revision {
+            return Err(RecipeError::Conflict(format!(
+                "saved recipe revision is {}; expected {expected_revision}",
+                self.recipes[index].revision
+            )));
+        }
+        let path = self.recipe_path(id);
+        let tombstone = self.recipes_dir.join(format!("{id}.deleted"));
+        fs::rename(&path, &tombstone).map_err(|error| RecipeError::Internal(error.to_string()))?;
+        if let Err(error) = sync_directory(&self.recipes_dir) {
+            let rollback = fs::rename(&tombstone, &path)
+                .map_err(|rollback_error| rollback_error.to_string())
+                .and_then(|()| sync_directory(&self.recipes_dir));
+            return Err(RecipeError::Internal(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; failed to restore deleted recipe: {rollback_error}")
+                }
+            }));
+        }
+        Ok(self.recipes.remove(index))
+    }
+
+    fn next_recipe_id(&self, timestamp: &str) -> String {
+        let base = format!("recipe-{}", timestamp_id(timestamp));
+        let mut id = base.clone();
+        let mut collision = 2_u32;
+        while self.reserved_recipe_ids.contains(&id)
+            || self.recipe_path(&id).exists()
+            || self.recipes_dir.join(format!("{id}.deleted")).exists()
+        {
+            id = format!("{base}-{collision}");
+            collision = collision.saturating_add(1);
+        }
+        id
+    }
+
+    fn recipe_path(&self, id: &str) -> PathBuf {
+        self.recipes_dir.join(format!("{id}.json"))
+    }
+
     fn live_export(&mut self) -> Result<ExportDescriptor, String> {
         self.flush_samples()?;
         if !self.samples_path.exists() {
@@ -576,7 +800,14 @@ impl Persistence {
         )
     }
 
-    fn begin_cycle(&mut self, execution_id: String, name: Option<String>) -> Result<(), String> {
+    fn begin_cycle(
+        &mut self,
+        execution_id: String,
+        name: Option<String>,
+        recipe: CycleRecipe,
+        saved_recipe: Option<SavedRecipeReference>,
+        started_at_utc: String,
+    ) -> Result<(), String> {
         if !valid_run_id(&execution_id) {
             return Err("invalid cycle execution id".to_owned());
         }
@@ -594,6 +825,9 @@ impl Persistence {
         let metadata = CycleExecutionMetadata {
             execution_id: execution_id.clone(),
             name: name.clone(),
+            recipe: Some(recipe),
+            saved_recipe,
+            started_at_utc: Some(started_at_utc),
         };
         if let Err(error) = self.write_cycle_metadata(&metadata) {
             let cleanup = fs::remove_file(&path);
@@ -1086,6 +1320,53 @@ fn valid_run_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn timestamp_id(timestamp: &str) -> String {
+    timestamp
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn validate_saved_recipe(recipe: &SavedRecipe, filename_id: &str) -> Result<(), String> {
+    if recipe.id != filename_id || !valid_run_id(&recipe.id) {
+        return Err("id does not match its filename".to_owned());
+    }
+    let normalized = normalize_required_name(&recipe.name).map_err(|error| error.to_string())?;
+    if normalized != recipe.name {
+        return Err("name is not normalized".to_owned());
+    }
+    recipe
+        .recipe
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if recipe.revision == 0 {
+        return Err("revision must be at least 1".to_owned());
+    }
+    let created = chrono::DateTime::parse_from_rfc3339(&recipe.created_at_utc)
+        .map_err(|error| format!("invalid created_at_utc: {error}"))?;
+    let updated = chrono::DateTime::parse_from_rfc3339(&recipe.updated_at_utc)
+        .map_err(|error| format!("invalid updated_at_utc: {error}"))?;
+    if updated < created {
+        return Err("updated_at_utc precedes created_at_utc".to_owned());
+    }
+    Ok(())
+}
+
+fn sort_saved_recipes(recipes: &mut [SavedRecipe]) {
+    recipes.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
 fn presentation_history(samples: &[Sample], limit: usize) -> Vec<Sample> {
     if samples.len() <= limit {
         return samples.to_vec();
@@ -1318,6 +1599,7 @@ impl DeviceActor {
                 self.sync_controller_state();
                 Ok(ActorResponse::Subscription(
                     self.snapshot_for_clients(),
+                    self.persistence.saved_recipes(),
                     self.snapshot_tx.subscribe(),
                 ))
             }
@@ -1336,19 +1618,37 @@ impl DeviceActor {
                 .map(ActorResponse::Export),
             ActorRequest::Runs => Ok(ActorResponse::Runs(self.persistence.run_summaries())),
             ActorRequest::RunCsv(id) => self.persistence.run_export(&id).map(ActorResponse::Export),
+            ActorRequest::Recipes => Ok(ActorResponse::Recipes(self.persistence.saved_recipes())),
+            ActorRequest::CreateRecipe(request) => {
+                Ok(ActorResponse::Recipe(self.create_saved_recipe(request)))
+            }
+            ActorRequest::UpdateRecipe { id, request } => Ok(ActorResponse::Recipe(
+                self.update_saved_recipe(&id, request),
+            )),
+            ActorRequest::DeleteRecipe { id, request } => Ok(ActorResponse::Recipe(
+                self.delete_saved_recipe(&id, request),
+            )),
+            ActorRequest::ImportRecipe(export) => {
+                Ok(ActorResponse::Recipe(self.import_saved_recipe(export)))
+            }
+            ActorRequest::ExportRecipe(id) => {
+                Ok(ActorResponse::RecipeExport(self.export_saved_recipe(&id)))
+            }
+            ActorRequest::StartSavedRecipe { id, request } => {
+                let result = self.start_saved_recipe(&id, request);
+                Ok(ActorResponse::Start(self.finish_start_response(result)))
+            }
             ActorRequest::Command(command) => self
                 .handle_command(command)
                 .map(|()| ActorResponse::Snapshot(self.current_snapshot())),
-            ActorRequest::StartTest(request) => Ok(ActorResponse::Start(
-                self.start_test(request.config, request.name, None)
-                    .and_then(|()| self.persist_and_publish().map_err(StartError::Internal))
-                    .map(|()| self.current_snapshot()),
-            )),
-            ActorRequest::StartCycle(request) => Ok(ActorResponse::Start(
-                self.start_cycle(request)
-                    .and_then(|()| self.persist_and_publish().map_err(StartError::Internal))
-                    .map(|()| self.current_snapshot()),
-            )),
+            ActorRequest::StartTest(request) => {
+                let result = self.start_test(request.config, request.name, None);
+                Ok(ActorResponse::Start(self.finish_start_response(result)))
+            }
+            ActorRequest::StartCycle(request) => {
+                let result = self.start_cycle(request);
+                Ok(ActorResponse::Start(self.finish_start_response(result)))
+            }
             ActorRequest::RenameRun { id, request } => Ok(ActorResponse::Rename(
                 self.rename_run(&id, request)
                     .map(|()| self.current_snapshot()),
@@ -1478,7 +1778,7 @@ impl DeviceActor {
         name: Option<String>,
         cycle: Option<CycleRunContext>,
     ) -> Result<(), StartError> {
-        let name = normalize_execution_name(name.as_deref())
+        let name = normalize_optional_name(name.as_deref())
             .map_err(|error| StartError::BadRequest(error.to_string()))?;
         let name = if cycle.is_some() { None } else { name };
         let prepared = self
@@ -1524,12 +1824,140 @@ impl DeviceActor {
         Ok(())
     }
 
+    fn get_saved_recipe(&self, id: &str) -> Result<SavedRecipe, RecipeError> {
+        if !valid_run_id(id) {
+            return Err(RecipeError::BadRequest(
+                "invalid saved recipe id".to_owned(),
+            ));
+        }
+        self.persistence
+            .saved_recipe(id)
+            .cloned()
+            .ok_or_else(|| RecipeError::NotFound("saved recipe not found".to_owned()))
+    }
+
+    fn create_saved_recipe(
+        &mut self,
+        request: CreateSavedRecipeRequest,
+    ) -> Result<SavedRecipe, RecipeError> {
+        let name = normalize_required_name(&request.name)
+            .map_err(|error| RecipeError::BadRequest(error.to_string()))?;
+        request
+            .recipe
+            .validate()
+            .map_err(|error| RecipeError::BadRequest(error.to_string()))?;
+        let recipe = self
+            .persistence
+            .create_saved_recipe(name, request.recipe)
+            .map_err(RecipeError::Internal)?;
+        let _receivers = self
+            .snapshot_tx
+            .send(WebSocketEvent::RecipeUpsert(recipe.clone()));
+        Ok(recipe)
+    }
+
+    fn update_saved_recipe(
+        &mut self,
+        id: &str,
+        mut request: UpdateSavedRecipeRequest,
+    ) -> Result<SavedRecipe, RecipeError> {
+        if !valid_run_id(id) {
+            return Err(RecipeError::BadRequest(
+                "invalid saved recipe id".to_owned(),
+            ));
+        }
+        request.name = normalize_required_name(&request.name)
+            .map_err(|error| RecipeError::BadRequest(error.to_string()))?;
+        request
+            .recipe
+            .validate()
+            .map_err(|error| RecipeError::BadRequest(error.to_string()))?;
+        let recipe = self.persistence.update_saved_recipe(id, request)?;
+        let _receivers = self
+            .snapshot_tx
+            .send(WebSocketEvent::RecipeUpsert(recipe.clone()));
+        Ok(recipe)
+    }
+
+    fn delete_saved_recipe(
+        &mut self,
+        id: &str,
+        request: DeleteSavedRecipeRequest,
+    ) -> Result<SavedRecipe, RecipeError> {
+        if !valid_run_id(id) {
+            return Err(RecipeError::BadRequest(
+                "invalid saved recipe id".to_owned(),
+            ));
+        }
+        let recipe = self
+            .persistence
+            .delete_saved_recipe(id, request.expected_revision)?;
+        let _receivers = self
+            .snapshot_tx
+            .send(WebSocketEvent::RecipeDelete(id.to_owned()));
+        Ok(recipe)
+    }
+
+    fn import_saved_recipe(&mut self, export: RecipeExport) -> Result<SavedRecipe, RecipeError> {
+        export
+            .validate()
+            .map_err(|error| RecipeError::BadRequest(error.to_string()))?;
+        self.create_saved_recipe(CreateSavedRecipeRequest {
+            name: export.name,
+            recipe: export.recipe,
+        })
+    }
+
+    fn export_saved_recipe(&self, id: &str) -> Result<RecipeExport, RecipeError> {
+        let saved = self.get_saved_recipe(id)?;
+        Ok(RecipeExport {
+            format: RECIPE_EXPORT_FORMAT.to_owned(),
+            version: RECIPE_EXPORT_VERSION,
+            name: saved.name,
+            recipe: saved.recipe,
+        })
+    }
+
+    fn start_saved_recipe(
+        &mut self,
+        id: &str,
+        request: StartSavedRecipeRequest,
+    ) -> Result<(), StartError> {
+        let saved = self.get_saved_recipe(id).map_err(|error| match error {
+            RecipeError::BadRequest(message) => StartError::BadRequest(message),
+            RecipeError::NotFound(message) => StartError::NotFound(message),
+            RecipeError::Conflict(message) | RecipeError::Internal(message) => {
+                StartError::Internal(message)
+            }
+        })?;
+        let saved_reference = SavedRecipeReference {
+            id: saved.id,
+            name: saved.name,
+            revision: saved.revision,
+        };
+        self.start_cycle_with_saved(
+            StartCycleRequest {
+                recipe: saved.recipe,
+                name: request.execution_name,
+            },
+            Some(saved_reference),
+        )
+    }
+
     fn start_cycle(&mut self, request: StartCycleRequest) -> Result<(), StartError> {
+        self.start_cycle_with_saved(request, None)
+    }
+
+    fn start_cycle_with_saved(
+        &mut self,
+        request: StartCycleRequest,
+        saved_recipe: Option<SavedRecipeReference>,
+    ) -> Result<(), StartError> {
         request
             .recipe
             .validate()
             .map_err(|error| StartError::BadRequest(error.to_string()))?;
-        let name = normalize_execution_name(request.name.as_deref())
+        let name = normalize_optional_name(request.name.as_deref())
             .map_err(|error| StartError::BadRequest(error.to_string()))?;
         if self.cycle.is_executing() {
             return Err(StartError::BadRequest(
@@ -1546,28 +1974,83 @@ impl DeviceActor {
                 "cycle start requires confirmed zero device current".to_owned(),
             ));
         }
+        let previous_cycle = self.cycle.clone();
+        let previous_status = self.snapshot.cycle.clone();
+        let previous_history = self.snapshot.cycle_history.clone();
+        let previous_cycle_id = self.persistence.current_cycle_id.clone();
+        let previous_cycle_name = self.persistence.current_cycle_name.clone();
+        let previous_sequence = self.persistence.next_cycle_sequence;
         let started_at = Utc::now().to_rfc3339();
         let execution_id = format!("cycle-{}", started_at.replace([':', '.', '+'], "-"));
         self.persistence
-            .begin_cycle(execution_id.clone(), name.clone())
+            .begin_cycle(
+                execution_id.clone(),
+                name.clone(),
+                request.recipe.clone(),
+                saved_recipe.clone(),
+                started_at.clone(),
+            )
             .map_err(StartError::Internal)?;
         let action = self
             .cycle
             .start(
                 request.recipe,
-                execution_id,
+                execution_id.clone(),
                 name,
+                saved_recipe,
                 Some(started_at),
                 Instant::now(),
             )
             .map_err(|error| StartError::BadRequest(error.to_string()))?;
         self.snapshot.cycle_history.clear();
         self.sync_controller_state();
+        if let Err(error) = self.save_start_metadata() {
+            self.cycle = previous_cycle;
+            self.snapshot.cycle = previous_status;
+            self.snapshot.cycle_history = previous_history;
+            self.persistence.current_cycle_id = previous_cycle_id;
+            self.persistence.current_cycle_name = previous_cycle_name;
+            self.persistence.next_cycle_sequence = previous_sequence;
+            self.sync_controller_state();
+            let csv_cleanup = fs::remove_file(self.persistence.cycle_path(&execution_id));
+            let sidecar_cleanup =
+                fs::remove_file(self.persistence.cycle_metadata_path(&execution_id));
+            let sync_cleanup = sync_directory(&self.persistence.cycles_dir);
+            let cleanup_errors = [csv_cleanup, sidecar_cleanup]
+                .into_iter()
+                .filter_map(Result::err)
+                .filter(|cleanup_error| cleanup_error.kind() != std::io::ErrorKind::NotFound)
+                .map(|cleanup_error| cleanup_error.to_string())
+                .chain(sync_cleanup.err())
+                .collect::<Vec<_>>();
+            return Err(StartError::Internal(if cleanup_errors.is_empty() {
+                error
+            } else {
+                format!(
+                    "{error}; failed to roll back cycle start: {}",
+                    cleanup_errors.join("; ")
+                )
+            }));
+        }
         if let Some(action) = action {
             self.execute_cycle_action(action)
                 .map_err(StartError::Internal)?;
         }
         Ok(())
+    }
+
+    fn finish_start_response(
+        &mut self,
+        result: Result<(), StartError>,
+    ) -> Result<AuthoritativeSnapshot, StartError> {
+        result?;
+        if let Err(error) = self.persist_and_publish() {
+            log::error!(
+                "failed to persist committed start state; initial recovery metadata remains durable: {error}"
+            );
+            self.publish();
+        }
+        Ok(self.current_snapshot())
     }
 
     fn stop_cycle(&mut self) -> Result<(), String> {
@@ -1586,7 +2069,7 @@ impl DeviceActor {
         if !valid_run_id(id) {
             return Err(RenameError::BadRequest("invalid run id".to_owned()));
         }
-        let name = normalize_execution_name(request.name.as_deref())
+        let name = normalize_optional_name(request.name.as_deref())
             .map_err(|error| RenameError::BadRequest(error.to_string()))?;
 
         if self.persistence.current_run_id == id {
@@ -1675,7 +2158,7 @@ impl DeviceActor {
                 "invalid cycle execution id".to_owned(),
             ));
         }
-        let name = normalize_execution_name(request.name.as_deref())
+        let name = normalize_optional_name(request.name.as_deref())
             .map_err(|error| RenameError::BadRequest(error.to_string()))?;
         if !self.persistence.cycle_path(execution_id).is_file() {
             return Err(RenameError::NotFound(
@@ -1687,10 +2170,11 @@ impl DeviceActor {
             .persistence
             .load_cycle_metadata(execution_id)
             .map_err(RenameError::Internal)?;
-        let renamed = CycleExecutionMetadata {
+        let mut renamed = previous.clone().unwrap_or_else(|| CycleExecutionMetadata {
             execution_id: execution_id.to_owned(),
-            name: name.clone(),
-        };
+            ..CycleExecutionMetadata::default()
+        });
+        renamed.name.clone_from(&name);
         self.persistence
             .write_cycle_metadata(&renamed)
             .map_err(RenameError::Internal)?;
@@ -2386,30 +2870,10 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         actor_tx: actor_tx.clone(),
         allowed_origin: std::env::var("EBC_ALLOWED_ORIGIN").ok(),
     };
-    let api = Router::new()
-        .route("/status", get(get_status))
-        .route("/history", get(get_history))
-        .route("/history.csv", get(get_history_csv))
-        .route("/cycle/history.csv", get(get_cycle_history_csv))
-        .route("/cycles/{id}/history.csv", get(get_cycle_csv))
-        .route("/runs", get(get_runs))
-        .route("/runs/{file}", get(get_run_csv))
-        .route("/runs/{run_id}/name", post(rename_run))
-        .route("/cycles/{execution_id}/name", post(rename_cycle))
-        .route("/connect", post(connect))
-        .route("/disconnect", post(disconnect))
-        .route("/test/start", post(start_test))
-        .route("/test/adjust", post(adjust_test))
-        .route("/test/stop", post(stop_test))
-        .route("/test/resume", post(resume_test))
-        .route("/cycle/start", post(start_cycle))
-        .route("/cycle/stop", post(stop_cycle))
-        .route("/calibration", post(calibration))
-        .route("/ws", get(websocket));
     let static_files = ServeDir::new(&config.static_dir)
         .not_found_service(ServeFile::new(config.static_dir.join("index.html")));
     let app = Router::new()
-        .nest("/api", api)
+        .nest("/api", api_router())
         .fallback_service(static_files)
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.http_addr)
@@ -2438,6 +2902,37 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         .map_err(|error| format!("failed to join device actor: {error}"))?
         .map_err(|_panic_payload| "device actor panicked".to_owned())?;
     server_result
+}
+
+fn api_router() -> Router<AppState> {
+    Router::new()
+        .route("/status", get(get_status))
+        .route("/history", get(get_history))
+        .route("/history.csv", get(get_history_csv))
+        .route("/cycle/history.csv", get(get_cycle_history_csv))
+        .route("/cycles/{id}/history.csv", get(get_cycle_csv))
+        .route("/runs", get(get_runs))
+        .route("/runs/{file}", get(get_run_csv))
+        .route("/recipes", get(get_recipes).post(create_saved_recipe))
+        .route("/recipes/import", post(import_saved_recipe))
+        .route(
+            "/recipes/{id}",
+            put(update_saved_recipe).delete(delete_saved_recipe),
+        )
+        .route("/recipes/{id}/export", get(export_saved_recipe))
+        .route("/recipes/{id}/start", post(start_saved_recipe))
+        .route("/runs/{run_id}/name", post(rename_run))
+        .route("/cycles/{execution_id}/name", post(rename_cycle))
+        .route("/connect", post(connect))
+        .route("/disconnect", post(disconnect))
+        .route("/test/start", post(start_test))
+        .route("/test/adjust", post(adjust_test))
+        .route("/test/stop", post(stop_test))
+        .route("/test/resume", post(resume_test))
+        .route("/cycle/start", post(start_cycle))
+        .route("/cycle/stop", post(stop_cycle))
+        .route("/calibration", post(calibration))
+        .route("/ws", get(websocket))
 }
 
 async fn shutdown_signal() {
@@ -2511,6 +3006,9 @@ async fn start_command(
         ActorResponse::Start(Err(StartError::BadRequest(message))) => {
             Err(ApiError::bad_request(message))
         }
+        ActorResponse::Start(Err(StartError::NotFound(message))) => {
+            Err(ApiError::not_found(message))
+        }
         ActorResponse::Start(Err(StartError::Internal(message))) => {
             Err(ApiError::internal(message))
         }
@@ -2565,6 +3063,155 @@ async fn get_runs(State(state): State<AppState>) -> Result<Json<Vec<RunSummary>>
     match request(&state, ActorRequest::Runs).await? {
         ActorResponse::Runs(runs) => Ok(Json(runs)),
         _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+async fn get_recipes(State(state): State<AppState>) -> Result<Json<Vec<SavedRecipe>>, ApiError> {
+    match request(&state, ActorRequest::Recipes).await? {
+        ActorResponse::Recipes(recipes) => Ok(Json(recipes)),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+async fn create_saved_recipe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request_body): Json<CreateSavedRecipeRequest>,
+) -> Result<Json<SavedRecipe>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    recipe_response(request(&state, ActorRequest::CreateRecipe(request_body)).await?)
+}
+
+async fn update_saved_recipe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request_body): Json<UpdateSavedRecipeRequest>,
+) -> Result<Json<SavedRecipe>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    recipe_response(
+        request(
+            &state,
+            ActorRequest::UpdateRecipe {
+                id,
+                request: request_body,
+            },
+        )
+        .await?,
+    )
+}
+
+async fn delete_saved_recipe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request_body): Json<DeleteSavedRecipeRequest>,
+) -> Result<Json<SavedRecipe>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    recipe_response(
+        request(
+            &state,
+            ActorRequest::DeleteRecipe {
+                id,
+                request: request_body,
+            },
+        )
+        .await?,
+    )
+}
+
+async fn import_saved_recipe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SavedRecipe>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    let export: RecipeExport = serde_json::from_slice(&body)
+        .map_err(|error| ApiError::bad_request(format!("invalid recipe JSON: {error}")))?;
+    recipe_response(request(&state, ActorRequest::ImportRecipe(export)).await?)
+}
+
+async fn export_saved_recipe(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    match request(&state, ActorRequest::ExportRecipe(id)).await? {
+        ActorResponse::RecipeExport(Ok(export)) => {
+            let filename = recipe_export_filename(&export.name);
+            let disposition = HeaderValue::from_str(&format!(
+                "attachment; filename=\"{filename}\""
+            ))
+            .map_err(|error| ApiError::internal(format!("invalid export filename: {error}")))?;
+            let body = serde_json::to_vec_pretty(&export)
+                .map_err(|error| ApiError::internal(format!("failed to encode recipe: {error}")))?;
+            Ok((
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json; charset=utf-8"),
+                    ),
+                    (header::CONTENT_DISPOSITION, disposition),
+                ],
+                body,
+            )
+                .into_response())
+        }
+        ActorResponse::RecipeExport(Err(error)) => Err(recipe_api_error(error)),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+fn recipe_export_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches([' ', '.']);
+    let stem = if sanitized.is_empty() {
+        "recipe"
+    } else {
+        sanitized
+    };
+    format!("{stem}.ebc-recipe.json")
+}
+
+async fn start_saved_recipe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request_body): Json<StartSavedRecipeRequest>,
+) -> Result<Json<AuthoritativeSnapshot>, ApiError> {
+    validate_mutation(&headers, &state)?;
+    start_command(
+        &state,
+        ActorRequest::StartSavedRecipe {
+            id,
+            request: request_body,
+        },
+    )
+    .await
+}
+
+fn recipe_response(response: ActorResponse) -> Result<Json<SavedRecipe>, ApiError> {
+    match response {
+        ActorResponse::Recipe(Ok(recipe)) => Ok(Json(recipe)),
+        ActorResponse::Recipe(Err(error)) => Err(recipe_api_error(error)),
+        _ => Err(ApiError::internal("unexpected actor response")),
+    }
+}
+
+fn recipe_api_error(error: RecipeError) -> ApiError {
+    match error {
+        RecipeError::BadRequest(message) => ApiError::bad_request(message),
+        RecipeError::NotFound(message) => ApiError::not_found(message),
+        RecipeError::Conflict(message) => ApiError::conflict(message),
+        RecipeError::Internal(message) => ApiError::internal(message),
     }
 }
 
@@ -2632,7 +3279,7 @@ async fn start_test(
         .config
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    request_body.name = normalize_execution_name(request_body.name.as_deref())
+    request_body.name = normalize_optional_name(request_body.name.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     start_command(&state, ActorRequest::StartTest(request_body)).await
 }
@@ -2675,7 +3322,7 @@ async fn start_cycle(
         .recipe
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    request_body.name = normalize_execution_name(request_body.name.as_deref())
+    request_body.name = normalize_optional_name(request_body.name.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     start_command(&state, ActorRequest::StartCycle(request_body)).await
 }
@@ -2690,7 +3337,7 @@ async fn rename_run(
     if !valid_run_id(&run_id) {
         return Err(ApiError::bad_request("invalid run id"));
     }
-    normalize_execution_name(request_body.name.as_deref())
+    normalize_optional_name(request_body.name.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     rename_command(
         &state,
@@ -2712,7 +3359,7 @@ async fn rename_cycle(
     if !valid_run_id(&execution_id) {
         return Err(ApiError::bad_request("invalid cycle execution id"));
     }
-    normalize_execution_name(request_body.name.as_deref())
+    normalize_optional_name(request_body.name.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     rename_command(
         &state,
@@ -2826,7 +3473,7 @@ fn validate_origin(
 }
 
 async fn websocket_client(mut socket: WebSocket, state: AppState) {
-    let Ok(ActorResponse::Subscription(snapshot, mut updates)) =
+    let Ok(ActorResponse::Subscription(snapshot, recipes, mut updates)) =
         request(&state, ActorRequest::Subscribe).await
     else {
         return;
@@ -2837,14 +3484,29 @@ async fn websocket_client(mut socket: WebSocket, state: AppState) {
     {
         return;
     }
+    if send_event(&mut socket, &WebSocketEvent::RecipeLibrary(recipes))
+        .await
+        .is_err()
+    {
+        return;
+    }
     loop {
         let event = match updates.recv().await {
             Ok(event) => event,
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 match request(&state, ActorRequest::Subscribe).await {
-                    Ok(ActorResponse::Subscription(snapshot, replacement)) => {
+                    Ok(ActorResponse::Subscription(snapshot, recipes, replacement)) => {
                         updates = replacement;
-                        WebSocketEvent::Snapshot(snapshot)
+                        if send_event(&mut socket, &WebSocketEvent::Snapshot(snapshot))
+                            .await
+                            .is_err()
+                            || send_event(&mut socket, &WebSocketEvent::RecipeLibrary(recipes))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                        continue;
                     }
                     _ => break,
                 }
@@ -2886,6 +3548,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }
@@ -3090,6 +3759,18 @@ mod tests {
 
     fn unnamed_cycle(recipe: crate::core::CycleRecipe) -> StartCycleRequest {
         StartCycleRequest { recipe, name: None }
+    }
+
+    fn saved_recipe_request(name: &str) -> CreateSavedRecipeRequest {
+        CreateSavedRecipeRequest {
+            name: name.to_owned(),
+            recipe: cycle_recipe(
+                vec![crate::core::CycleStep::Rest {
+                    duration_seconds: 60,
+                }],
+                1,
+            ),
+        }
     }
 
     fn confirm_inactive(actor: &mut DeviceActor) {
@@ -3767,6 +4448,28 @@ mod tests {
     }
 
     #[test]
+    fn cycle_start_metadata_failure_rolls_back_sidecar_and_status_before_action() {
+        let (mut actor, directory) = mock_actor("failed-cycle-start-persistence");
+        confirm_inactive(&mut actor);
+        actor.start_metadata_failure = Some("injected metadata failure".to_owned());
+        let prior_cycle = actor.current_snapshot().cycle;
+
+        actor
+            .start_cycle(unnamed_cycle(cycle_recipe(vec![device_step()], 1)))
+            .expect_err("cycle metadata write fails");
+
+        assert_eq!(actor.current_snapshot().cycle, prior_cycle);
+        assert!(actor.sent_frames.is_empty());
+        assert_eq!(
+            fs::read_dir(&actor.persistence.cycles_dir)
+                .expect("read cycle directory")
+                .count(),
+            0
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn late_start_metadata_failure_restores_archived_run_for_retry() {
         let (mut actor, directory) = mock_actor("late-start-metadata-failure");
         confirm_inactive(&mut actor);
@@ -4124,7 +4827,13 @@ mod tests {
         let directory = temporary_directory("cycle-export-prefix");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
         persistence
-            .begin_cycle("cycle-one".to_owned(), None)
+            .begin_cycle(
+                "cycle-one".to_owned(),
+                None,
+                cycle_recipe(vec![device_step()], 1),
+                None,
+                "2026-01-01T00:00:00Z".to_owned(),
+            )
             .expect("begin cycle");
         persistence
             .append_cycle_sample(&numbered_cycle_sample("cycle-one", 0))
@@ -4142,7 +4851,13 @@ mod tests {
         assert_eq!(prefix_contents.lines().count(), 2);
 
         persistence
-            .begin_cycle("cycle-two".to_owned(), None)
+            .begin_cycle(
+                "cycle-two".to_owned(),
+                None,
+                cycle_recipe(vec![device_step()], 1),
+                None,
+                "2026-01-01T00:00:00Z".to_owned(),
+            )
             .expect("begin second cycle");
         persistence
             .append_cycle_sample(&numbered_cycle_sample("cycle-two", 0))
@@ -4167,7 +4882,13 @@ mod tests {
         let directory = temporary_directory("cycle-presentation-bound");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
         persistence
-            .begin_cycle("cycle-bounded".to_owned(), None)
+            .begin_cycle(
+                "cycle-bounded".to_owned(),
+                None,
+                cycle_recipe(vec![device_step()], 1),
+                None,
+                "2026-01-01T00:00:00Z".to_owned(),
+            )
             .expect("begin cycle");
         let samples: Vec<_> = (0..100)
             .map(|sequence| numbered_cycle_sample("cycle-bounded", sequence))
@@ -4196,7 +4917,13 @@ mod tests {
         let directory = temporary_directory("cycle-sequence-order");
         let mut persistence = Persistence::new(&directory).expect("create persistence");
         persistence
-            .begin_cycle("cycle-sequences".to_owned(), None)
+            .begin_cycle(
+                "cycle-sequences".to_owned(),
+                None,
+                cycle_recipe(vec![device_step()], 1),
+                None,
+                "2026-01-01T00:00:00Z".to_owned(),
+            )
             .expect("begin cycle");
         persistence
             .append_cycle_sample(&numbered_cycle_sample("cycle-sequences", 1))
@@ -5043,6 +5770,390 @@ mod tests {
                 .as_deref(),
             Some("renamed cycle")
         );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one persistence scenario covers ordering, conflicts, deletion, and restart identity"
+    )]
+    fn saved_recipes_persist_sort_conflict_delete_and_reserve_ids() {
+        let (mut actor, directory) = mock_actor("saved-recipes");
+        let mut events = actor.snapshot_tx.subscribe();
+        let beta = actor
+            .create_saved_recipe(saved_recipe_request("  beta  "))
+            .expect("create beta");
+        let upper = actor
+            .create_saved_recipe(saved_recipe_request("Alpha"))
+            .expect("create upper alpha");
+        let lower = actor
+            .create_saved_recipe(saved_recipe_request("alpha"))
+            .expect("create lower alpha");
+        assert!(matches!(
+            events.try_recv().expect("recipe event"),
+            WebSocketEvent::RecipeUpsert(recipe) if recipe.id == beta.id
+        ));
+
+        let recipes = actor.persistence.saved_recipes();
+        assert_eq!(recipes[2].id, beta.id);
+        let mut alpha_ids = vec![upper.id.clone(), lower.id.clone()];
+        alpha_ids.sort();
+        assert_eq!(
+            recipes[..2]
+                .iter()
+                .map(|recipe| recipe.id.clone())
+                .collect::<Vec<_>>(),
+            alpha_ids
+        );
+        let (response, receiver) = oneshot::channel();
+        actor.handle_message(ActorMessage {
+            request: ActorRequest::Subscribe,
+            response,
+        });
+        let ActorResponse::Subscription(_, library, _) = receiver
+            .blocking_recv()
+            .expect("subscription response")
+            .expect("subscription")
+        else {
+            panic!("unexpected subscription response");
+        };
+        assert_eq!(library, recipes);
+        let library_json = serde_json::to_value(WebSocketEvent::RecipeLibrary(library))
+            .expect("serialize recipe library event");
+        assert_eq!(library_json["event"], "recipe_library");
+
+        let upper_path = actor.persistence.recipe_path(&upper.id);
+        let upper_before_conflict = fs::read(&upper_path).expect("read recipe before conflict");
+        assert!(matches!(
+            actor.update_saved_recipe(
+                &upper.id,
+                UpdateSavedRecipeRequest {
+                    name: "changed".to_owned(),
+                    recipe: upper.recipe.clone(),
+                    expected_revision: 99,
+                },
+            ),
+            Err(RecipeError::Conflict(_))
+        ));
+        assert_eq!(
+            fs::read(&upper_path).expect("read recipe after update conflict"),
+            upper_before_conflict
+        );
+        let updated = actor
+            .update_saved_recipe(
+                &upper.id,
+                UpdateSavedRecipeRequest {
+                    name: "  Changed  ".to_owned(),
+                    recipe: upper.recipe.clone(),
+                    expected_revision: upper.revision,
+                },
+            )
+            .expect("update recipe");
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.name, "Changed");
+        assert_eq!(updated.created_at_utc, upper.created_at_utc);
+        assert_ne!(updated.updated_at_utc, upper.updated_at_utc);
+        assert!(matches!(
+            actor.delete_saved_recipe(
+                &updated.id,
+                DeleteSavedRecipeRequest {
+                    expected_revision: 1,
+                },
+            ),
+            Err(RecipeError::Conflict(_))
+        ));
+        assert_eq!(
+            fs::read(actor.persistence.recipe_path(&updated.id))
+                .expect("read recipe after delete conflict"),
+            serde_json::to_vec_pretty(&updated)
+                .expect("serialize updated recipe")
+                .into_iter()
+                .chain(std::iter::once(b'\n'))
+                .collect::<Vec<_>>()
+        );
+        let deleted = actor
+            .delete_saved_recipe(
+                &updated.id,
+                DeleteSavedRecipeRequest {
+                    expected_revision: updated.revision,
+                },
+            )
+            .expect("delete recipe");
+        assert!(!actor.persistence.recipe_path(&deleted.id).exists());
+        assert!(
+            actor
+                .persistence
+                .recipes_dir
+                .join(format!("{}.deleted", deleted.id))
+                .is_file()
+        );
+        drop(actor);
+
+        let mut restarted = Persistence::new(&directory).expect("restart recipe persistence");
+        assert_eq!(restarted.saved_recipes().len(), 2);
+        assert!(restarted.reserved_recipe_ids.contains(&deleted.id));
+        let fixed = "2026-01-01T00:00:00+00:00";
+        let base = restarted.next_recipe_id(fixed);
+        restarted.reserved_recipe_ids.insert(base.clone());
+        assert_eq!(restarted.next_recipe_id(fixed), format!("{base}-2"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn recipe_import_export_and_strict_startup_validation() {
+        let (mut actor, directory) = mock_actor("recipe-import");
+        let samples_before = fs::read(&actor.persistence.samples_path).unwrap_or_default();
+        let export = RecipeExport {
+            format: RECIPE_EXPORT_FORMAT.to_owned(),
+            version: RECIPE_EXPORT_VERSION,
+            name: "  Portable  ".to_owned(),
+            recipe: saved_recipe_request("ignored").recipe,
+        };
+        let imported = actor
+            .import_saved_recipe(export)
+            .expect("import valid recipe");
+        assert_eq!(imported.name, "Portable");
+        let persisted_before_export = fs::read(actor.persistence.recipe_path(&imported.id))
+            .expect("read imported persistence");
+        let exported = actor
+            .export_saved_recipe(&imported.id)
+            .expect("export recipe");
+        exported.validate().expect("valid exported envelope");
+        assert_eq!(exported.name, imported.name);
+        assert_eq!(exported.recipe, imported.recipe);
+        assert_eq!(
+            fs::read(actor.persistence.recipe_path(&imported.id))
+                .expect("read persistence after export"),
+            persisted_before_export
+        );
+        assert_eq!(
+            actor
+                .persistence
+                .saved_recipe(&imported.id)
+                .expect("imported recipe"),
+            &imported
+        );
+        let duplicate_a = actor
+            .import_saved_recipe(exported.clone())
+            .expect("duplicate import A");
+        let duplicate_b = actor
+            .import_saved_recipe(exported.clone())
+            .expect("duplicate import B");
+        assert_ne!(imported.id, duplicate_a.id);
+        assert_ne!(duplicate_a.id, duplicate_b.id);
+        assert_eq!(duplicate_a.revision, 1);
+        assert_eq!(duplicate_b.revision, 1);
+        assert_eq!(duplicate_a.name, duplicate_b.name);
+        assert_eq!(duplicate_a.recipe, duplicate_b.recipe);
+        assert!(actor.sent_frames.is_empty());
+        assert_eq!(
+            fs::read(&actor.persistence.samples_path).unwrap_or_default(),
+            samples_before
+        );
+        assert!(matches!(
+            actor.import_saved_recipe(RecipeExport {
+                format: "other".to_owned(),
+                ..exported
+            }),
+            Err(RecipeError::BadRequest(_))
+        ));
+        drop(actor);
+
+        let invalid_path = directory.join("recipes").join("invalid.json");
+        fs::write(&invalid_path, b"{}\n").expect("write invalid recipe");
+        assert!(Persistence::new(&directory).is_err());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one lifecycle scenario proves immutable provenance across edit, delete, rename, and restart"
+    )]
+    fn saved_start_provenance_survives_edit_delete_rename_and_restart() {
+        let (mut actor, directory) = mock_actor("saved-provenance");
+        let saved = actor
+            .create_saved_recipe(saved_recipe_request("Formation"))
+            .expect("create recipe");
+        confirm_inactive(&mut actor);
+        actor.sent_frames.clear();
+        actor
+            .start_saved_recipe(
+                &saved.id,
+                StartSavedRecipeRequest {
+                    execution_name: Some("  Cell 7  ".to_owned()),
+                },
+            )
+            .expect("start saved recipe");
+        assert!(actor.sent_frames.is_empty(), "a first rest sends no frame");
+        let status = actor.current_snapshot().cycle;
+        let reference = status.saved_recipe.clone().expect("saved provenance");
+        assert_eq!(reference.id, saved.id);
+        assert_eq!(reference.name, saved.name);
+        assert_eq!(reference.revision, saved.revision);
+        assert_eq!(status.name.as_deref(), Some("Cell 7"));
+        let execution_id = status.execution_id.clone().expect("execution id");
+
+        let recipe_b = cycle_recipe(
+            vec![crate::core::CycleStep::Rest {
+                duration_seconds: 120,
+            }],
+            2,
+        );
+        let updated = actor
+            .update_saved_recipe(
+                &saved.id,
+                UpdateSavedRecipeRequest {
+                    name: "Formation v2".to_owned(),
+                    recipe: recipe_b.clone(),
+                    expected_revision: saved.revision,
+                },
+            )
+            .expect("edit executing recipe");
+        assert_eq!(updated.revision, 2);
+        assert_eq!(actor.current_snapshot().cycle.recipe, status.recipe);
+        assert_eq!(
+            actor.current_snapshot().cycle.saved_recipe,
+            Some(reference.clone())
+        );
+
+        actor.stop_cycle().expect("stop first execution");
+        actor
+            .start_saved_recipe(
+                &saved.id,
+                StartSavedRecipeRequest {
+                    execution_name: None,
+                },
+            )
+            .expect("start updated recipe");
+        let updated_status = actor.current_snapshot().cycle;
+        let updated_reference = SavedRecipeReference {
+            id: updated.id.clone(),
+            name: updated.name.clone(),
+            revision: updated.revision,
+        };
+        assert_eq!(updated_status.recipe.as_ref(), Some(&recipe_b));
+        assert_eq!(
+            updated_status.saved_recipe.as_ref(),
+            Some(&updated_reference)
+        );
+        let updated_execution_id = updated_status
+            .execution_id
+            .clone()
+            .expect("updated execution id");
+        let original_sidecar = actor
+            .persistence
+            .load_cycle_metadata(&execution_id)
+            .expect("load original sidecar")
+            .expect("original sidecar");
+        assert_eq!(original_sidecar.recipe, status.recipe);
+        assert_eq!(original_sidecar.saved_recipe, Some(reference.clone()));
+
+        let state_before_delete = updated_status.state;
+        actor
+            .delete_saved_recipe(
+                &updated.id,
+                DeleteSavedRecipeRequest {
+                    expected_revision: updated.revision,
+                },
+            )
+            .expect("delete executing recipe");
+        let after_delete = actor.current_snapshot().cycle;
+        assert_eq!(after_delete.state, state_before_delete);
+        assert_eq!(after_delete.recipe.as_ref(), Some(&recipe_b));
+        assert_eq!(after_delete.saved_recipe.as_ref(), Some(&updated_reference));
+        assert!(matches!(
+            actor.start_saved_recipe(
+                &updated.id,
+                StartSavedRecipeRequest {
+                    execution_name: None,
+                },
+            ),
+            Err(StartError::NotFound(_))
+        ));
+        actor
+            .stop_cycle()
+            .expect("deleted template execution remains stoppable");
+        assert_eq!(actor.current_snapshot().cycle.state, CycleState::Stopped);
+        actor
+            .rename_cycle(
+                &updated_execution_id,
+                RenameRequest {
+                    name: Some("Renamed execution".to_owned()),
+                },
+            )
+            .expect("rename execution");
+        let sidecar = actor
+            .persistence
+            .load_cycle_metadata(&updated_execution_id)
+            .expect("load sidecar")
+            .expect("sidecar");
+        assert_eq!(sidecar.recipe, Some(recipe_b));
+        assert_eq!(sidecar.saved_recipe, Some(updated_reference.clone()));
+        assert_eq!(sidecar.started_at_utc, updated_status.started_at_utc);
+        assert_eq!(sidecar.name.as_deref(), Some("Renamed execution"));
+        assert_eq!(
+            original_sidecar,
+            actor
+                .persistence
+                .load_cycle_metadata(&execution_id)
+                .expect("reload original sidecar")
+                .expect("original sidecar")
+        );
+        actor.shutdown().expect("persist actor");
+        drop(actor);
+
+        let (snapshot_tx, _) = broadcast::channel(4);
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/null".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        let mut restarted = DeviceActor::new(config, snapshot_tx).expect("restart actor");
+        let recovered = restarted.current_snapshot().cycle;
+        assert_eq!(recovered.saved_recipe, Some(updated_reference));
+        assert_eq!(recovered.recipe, sidecar.recipe);
+        assert_eq!(recovered.name.as_deref(), Some("Renamed execution"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn legacy_cycle_sidecar_loads_and_ad_hoc_cycle_has_no_saved_provenance() {
+        let (mut actor, directory) = mock_actor("legacy-cycle-sidecar");
+        confirm_inactive(&mut actor);
+        actor
+            .start_cycle(unnamed_cycle(cycle_recipe(
+                vec![crate::core::CycleStep::Rest {
+                    duration_seconds: 60,
+                }],
+                1,
+            )))
+            .expect("start ad-hoc cycle");
+        assert_eq!(actor.current_snapshot().cycle.saved_recipe, None);
+        let execution_id = actor
+            .cycle
+            .status()
+            .execution_id
+            .clone()
+            .expect("execution id");
+        let path = actor.persistence.cycle_metadata_path(&execution_id);
+        fs::write(
+            &path,
+            format!("{{\"execution_id\":\"{execution_id}\",\"name\":\"Legacy\"}}\n"),
+        )
+        .expect("write legacy sidecar");
+        let legacy = actor
+            .persistence
+            .load_cycle_metadata(&execution_id)
+            .expect("load legacy sidecar")
+            .expect("legacy sidecar");
+        assert_eq!(legacy.name.as_deref(), Some("Legacy"));
+        assert_eq!(legacy.recipe, None);
+        assert_eq!(legacy.saved_recipe, None);
+        assert_eq!(legacy.started_at_utc, None);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

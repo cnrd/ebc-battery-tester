@@ -5,9 +5,10 @@ use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CurrentRunMetadata, CycleRunContext, CycleSample,
-    CycleState, RenameRequest, Sample, ServerConnectionState, SnapshotUpdate, StartCycleRequest,
-    StartTestRequest, TestConfiguration, cycle_presentation_history, normalize_execution_name,
+    ApiCommand, AuthoritativeSnapshot, CurrentRunMetadata, CycleRecipe, CycleRunContext,
+    CycleSample, CycleState, RenameRequest, Sample, SavedRecipeReference, ServerConnectionState,
+    SnapshotUpdate, StartCycleRequest, StartTestRequest, TestConfiguration,
+    cycle_presentation_history, normalize_optional_name,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OutboundFrame};
@@ -177,7 +178,7 @@ impl LocalBackend {
         if self.cycle.owns_orchestration() {
             return Self::command_error("the active cycle owns test orchestration".to_owned());
         }
-        let name = match normalize_execution_name(request.name.as_deref()) {
+        let name = match normalize_optional_name(request.name.as_deref()) {
             Ok(name) => name,
             Err(error) => return Self::command_error(error.to_string()),
         };
@@ -232,10 +233,33 @@ impl LocalBackend {
     }
 
     pub(crate) fn start_cycle(&mut self, request: StartCycleRequest) -> LocalOutput {
+        self.start_cycle_with_provenance(request, None)
+    }
+
+    pub(crate) fn start_saved_recipe(
+        &mut self,
+        recipe: CycleRecipe,
+        reference: SavedRecipeReference,
+        execution_name: Option<String>,
+    ) -> LocalOutput {
+        self.start_cycle_with_provenance(
+            StartCycleRequest {
+                recipe,
+                name: execution_name,
+            },
+            Some(reference),
+        )
+    }
+
+    fn start_cycle_with_provenance(
+        &mut self,
+        request: StartCycleRequest,
+        saved_recipe: Option<SavedRecipeReference>,
+    ) -> LocalOutput {
         if let Err(error) = request.recipe.validate() {
             return Self::command_error(error.to_string());
         }
-        let name = match normalize_execution_name(request.name.as_deref()) {
+        let name = match normalize_optional_name(request.name.as_deref()) {
             Ok(name) => name,
             Err(error) => return Self::command_error(error.to_string()),
         };
@@ -261,6 +285,7 @@ impl LocalBackend {
             request.recipe,
             execution_id,
             name.clone(),
+            saved_recipe,
             Some(timestamp_utc()),
             Instant::now(),
         ) {
@@ -302,7 +327,7 @@ impl LocalBackend {
                 "cycle child runs cannot be renamed; rename the cycle instead".to_owned(),
             );
         }
-        let name = match normalize_execution_name(request.name.as_deref()) {
+        let name = match normalize_optional_name(request.name.as_deref()) {
             Ok(name) => name,
             Err(error) => return Self::command_error(error.to_string()),
         };
@@ -322,7 +347,7 @@ impl LocalBackend {
         if self.cycle.status().execution_id.as_deref() != Some(execution_id) {
             return Self::command_error("the requested cycle is not current".to_owned());
         }
-        self.cycle_name = match normalize_execution_name(request.name.as_deref()) {
+        self.cycle_name = match normalize_optional_name(request.name.as_deref()) {
             Ok(name) => name,
             Err(error) => return Self::command_error(error.to_string()),
         };
@@ -945,6 +970,37 @@ mod tests {
             rejected.events.as_slice(),
             [BackendEvent::CommandError(error)] if error.contains("cycle child")
         ));
+    }
+
+    #[test]
+    fn local_saved_recipe_start_captures_provenance_and_keeps_child_unnamed() {
+        let mut backend = connected_backend();
+        let recipe = recipe(vec![device_step(1000)]);
+        let reference = SavedRecipeReference {
+            id: "local-recipe-7".to_owned(),
+            name: "Capacity α".to_owned(),
+            revision: 3,
+        };
+
+        let started = backend.start_saved_recipe(
+            recipe.clone(),
+            reference.clone(),
+            Some(" Cell 4 ".to_owned()),
+        );
+        assert_eq!(started.sends.len(), 1);
+        let snapshot = snapshot(&started);
+        assert_eq!(snapshot.cycle.recipe.as_ref(), Some(&recipe));
+        assert_eq!(snapshot.cycle.saved_recipe.as_ref(), Some(&reference));
+        assert_eq!(snapshot.cycle.name.as_deref(), Some("Cell 4"));
+        assert_eq!(snapshot.current_run.name, None);
+        assert_eq!(
+            snapshot
+                .current_run
+                .cycle
+                .as_ref()
+                .map(|context| context.execution_id.as_str()),
+            snapshot.cycle.execution_id.as_deref()
+        );
     }
 
     #[test]
@@ -1592,6 +1648,7 @@ mod tests {
             .start(
                 recipe(vec![device_step(1000)]),
                 "test-cycle".to_owned(),
+                None,
                 None,
                 None,
                 Instant::now(),

@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crate::core::{
-    CycleRecipe, CycleState, CycleStatus, CycleStep, DeviceState, TestConfiguration, TestState,
-    TestStatus, ValidationError,
+    CycleRecipe, CycleState, CycleStatus, CycleStep, DeviceState, SavedRecipeReference,
+    TestConfiguration, TestState, TestStatus, ValidationError,
 };
 
 const RESTART_REASON: &str = "cycle interrupted by process restart";
@@ -117,6 +117,7 @@ impl CycleEngine {
         recipe: CycleRecipe,
         execution_id: String,
         name: Option<String>,
+        saved_recipe: Option<SavedRecipeReference>,
         started_at_utc: Option<String>,
         now: Instant,
     ) -> Result<Option<CycleAction>, ValidationError> {
@@ -133,6 +134,7 @@ impl CycleEngine {
             recipe: Some(recipe),
             execution_id: Some(execution_id),
             name,
+            saved_recipe,
             repeat_index: 0,
             step_index: 0,
             started_at_utc,
@@ -482,6 +484,7 @@ mod tests {
                 recipe,
                 "execution".to_owned(),
                 None,
+                None,
                 Some("timestamp".to_owned()),
                 now,
             )
@@ -511,6 +514,7 @@ mod tests {
                 .start(
                     recipe(vec![device_step(100)], 1),
                     "other".to_owned(),
+                    None,
                     None,
                     Some("timestamp".to_owned()),
                     now,
@@ -864,6 +868,11 @@ mod tests {
                 recipe(vec![device_step(100)], 1),
                 "execution".to_owned(),
                 Some("Formation cycle".to_owned()),
+                Some(SavedRecipeReference {
+                    id: "recipe-1".to_owned(),
+                    name: "Formation".to_owned(),
+                    revision: 7,
+                }),
                 Some("timestamp".to_owned()),
                 now,
             )
@@ -885,6 +894,14 @@ mod tests {
             Some("execution")
         );
         assert_eq!(recovered.status().name.as_deref(), Some("Formation cycle"));
+        assert_eq!(
+            recovered.status().saved_recipe,
+            Some(SavedRecipeReference {
+                id: "recipe-1".to_owned(),
+                name: "Formation".to_owned(),
+                revision: 7,
+            })
+        );
         assert_eq!(recovered.status().step_index, 0);
         assert_eq!(recovered.status().result.as_deref(), Some(RESTART_REASON));
         assert_eq!(recovered.pending_action(), None);

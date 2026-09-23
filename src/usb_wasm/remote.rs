@@ -2,7 +2,7 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
     DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, WebSocketEvent};
+use crate::core::{ApiCommand, AuthoritativeSnapshot, RecipeExport, SavedRecipe, WebSocketEvent};
 use crate::remote_backend::{
     COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, command_endpoint,
     publish_websocket,
@@ -46,14 +46,24 @@ pub(super) async fn remote_task(
                     futures::select! {
                         incoming = message => match incoming {
                             Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
-                                Ok(event) => {
-                                    if matches!(event, WebSocketEvent::Snapshot(_))
-                                        && !received_snapshot
-                                    {
+                                Ok(WebSocketEvent::RecipeLibrary(subscription_library)) => {
+                                    let recipes = match fetch_recipes().await {
+                                        Ok(recipes) => recipes,
+                                        Err(error) => {
+                                            event_tx.send(BackendEvent::CommandError(
+                                                format!("failed to refresh recipes: {error}"),
+                                            ));
+                                            subscription_library
+                                        }
+                                    };
+                                    event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                                    if !received_snapshot {
                                         received_snapshot = true;
                                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                                         send_connection(&event_tx, BackendConnectionStatus::Connected);
                                     }
+                                }
+                                Ok(event) => {
                                     publish_websocket(event, &event_tx);
                                 }
                                 Err(error) => log::error!("invalid server websocket event: {error}"),
@@ -74,6 +84,12 @@ pub(super) async fn remote_task(
                                 let _closed = writer.close().await;
                                 return;
                             }
+                            if !received_snapshot {
+                                event_tx.send(BackendEvent::CommandError(
+                                    "browser is synchronizing the remote recipe library; command was not sent".to_owned(),
+                                ));
+                                continue;
+                            }
                             match &command {
                                 BackendCommand::StartTest(request) => {
                                     publish_cycle_result(
@@ -87,6 +103,92 @@ pub(super) async fn remote_task(
                                         send_json("/api/cycle/start", request).await,
                                         &event_tx,
                                     );
+                                    continue;
+                                }
+                                BackendCommand::StartSavedRecipe { recipe_id, request } => {
+                                    publish_cycle_result(
+                                        send_json(
+                                            &format!("/api/recipes/{recipe_id}/start"),
+                                            request,
+                                        ).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::RefreshRecipes => {
+                                    match fetch_recipes().await {
+                                        Ok(recipes) => {
+                                            event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                                            event_tx.send(BackendEvent::CommandSucceeded);
+                                        }
+                                        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+                                    }
+                                    continue;
+                                }
+                                BackendCommand::CreateSavedRecipe(request) => {
+                                    publish_created_recipe_result(
+                                        send_json("/api/recipes", request).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::UpdateSavedRecipe { recipe_id, request } => {
+                                    let result = send_put_json(
+                                        &format!("/api/recipes/{recipe_id}"),
+                                        request,
+                                    ).await;
+                                    if result.as_ref().is_err_and(|error| error.contains("HTTP 409"))
+                                        && let Ok(recipes) = fetch_recipes().await
+                                    {
+                                        event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                                    }
+                                    publish_recipe_result(result, &event_tx);
+                                    continue;
+                                }
+                                BackendCommand::DeleteSavedRecipe { recipe_id, request } => {
+                                    let result: Result<SavedRecipe, String> = send_delete_json(
+                                        &format!("/api/recipes/{recipe_id}"),
+                                        request,
+                                    ).await;
+                                    match result {
+                                        Ok(recipe) => {
+                                            event_tx.send(BackendEvent::RecipeDeleted(recipe.id));
+                                            event_tx.send(BackendEvent::CommandSucceeded);
+                                        }
+                                        Err(error) => {
+                                            if error.contains("HTTP 409")
+                                                && let Ok(recipes) = fetch_recipes().await
+                                            {
+                                                event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                                            }
+                                            event_tx.send(BackendEvent::CommandError(error));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                BackendCommand::ImportRecipe(export) => {
+                                    publish_created_recipe_result(
+                                        send_json("/api/recipes/import", export).await,
+                                        &event_tx,
+                                    );
+                                    continue;
+                                }
+                                BackendCommand::ExportRecipe { recipe_id } => {
+                                    match get_json::<RecipeExport>(
+                                        &format!("/api/recipes/{recipe_id}/export"),
+                                    ).await {
+                                        Ok(export) => {
+                                            event_tx.send(BackendEvent::RecipeExported(export));
+                                            event_tx.send(BackendEvent::CommandSucceeded);
+                                        }
+                                        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+                                    }
+                                    continue;
+                                }
+                                BackendCommand::StartSavedRecipeSnapshot { .. } => {
+                                    event_tx.send(BackendEvent::CommandError(
+                                        "local saved recipe snapshot sent to remote backend".to_owned(),
+                                    ));
                                     continue;
                                 }
                                 BackendCommand::RenameRun { run_id, request } => {
@@ -173,10 +275,10 @@ fn publish_cycle_result(
     }
 }
 
-async fn send_json<T: serde::Serialize>(
+async fn send_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     endpoint: &str,
     body: &T,
-) -> Result<AuthoritativeSnapshot, String> {
+) -> Result<R, String> {
     let response = Request::post(endpoint)
         .header(COMMAND_HEADER, "1")
         .json(body)
@@ -184,7 +286,81 @@ async fn send_json<T: serde::Serialize>(
         .send()
         .await
         .map_err(|error| error.to_string())?;
-    decode_response(response).await
+    decode_json_response(response).await
+}
+
+async fn send_put_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    endpoint: &str,
+    body: &T,
+) -> Result<R, String> {
+    let response = Request::put(endpoint)
+        .header(COMMAND_HEADER, "1")
+        .json(body)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_json_response(response).await
+}
+
+async fn send_delete_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    endpoint: &str,
+    body: &T,
+) -> Result<R, String> {
+    let response = Request::delete(endpoint)
+        .header(COMMAND_HEADER, "1")
+        .json(body)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_json_response(response).await
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(endpoint: &str) -> Result<T, String> {
+    let response = Request::get(endpoint)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_json_response(response).await
+}
+
+async fn fetch_recipes() -> Result<Vec<SavedRecipe>, String> {
+    get_json("/api/recipes").await
+}
+
+fn publish_recipe_result(result: Result<SavedRecipe, String>, event_tx: &BackendEventSender) {
+    match result {
+        Ok(recipe) => {
+            event_tx.send(BackendEvent::RecipeUpsert(recipe));
+            event_tx.send(BackendEvent::CommandSucceeded);
+        }
+        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+    }
+}
+
+fn publish_created_recipe_result(
+    result: Result<SavedRecipe, String>,
+    event_tx: &BackendEventSender,
+) {
+    match result {
+        Ok(recipe) => {
+            event_tx.send(BackendEvent::RecipeCreated(recipe));
+            event_tx.send(BackendEvent::CommandSucceeded);
+        }
+        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+    }
+}
+
+async fn decode_json_response<T: serde::de::DeserializeOwned>(
+    response: gloo_net::http::Response,
+) -> Result<T, String> {
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status}: {body}"));
+    }
+    response.json().await.map_err(|error| error.to_string())
 }
 
 async fn send_stop_cycle() -> Result<AuthoritativeSnapshot, String> {

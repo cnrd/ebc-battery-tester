@@ -14,7 +14,7 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
     DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, WebSocketEvent};
+use crate::core::{ApiCommand, AuthoritativeSnapshot, RecipeExport, SavedRecipe, WebSocketEvent};
 use crate::remote_backend::{
     COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, RemoteUrls,
     publish_websocket,
@@ -38,6 +38,10 @@ pub(crate) fn spawn_backend(
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the worker owns its backend configuration and event sender"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reconnect loop keeps socket, command, and recipe resynchronization ordering together"
 )]
 fn remote_thread(
     urls: RemoteUrls,
@@ -66,9 +70,9 @@ fn remote_thread(
                 if let Err(error) = set_read_timeout(&mut socket, SOCKET_POLL_INTERVAL) {
                     publish_network_error(&event_tx, &error);
                 } else {
-                    let mut received_snapshot = false;
+                    let mut ready = false;
                     loop {
-                        if received_snapshot {
+                        if ready {
                             match command_rx.try_recv() {
                                 Ok(BackendCommand::Shutdown) | Err(TryRecvError::Closed) => {
                                     let _closed = socket.close(None);
@@ -87,14 +91,28 @@ fn remote_thread(
                         match socket.read() {
                             Ok(Message::Text(text)) => {
                                 match serde_json::from_str::<WebSocketEvent>(text.as_str()) {
+                                    Ok(WebSocketEvent::RecipeLibrary(subscription_library)) => {
+                                        let recipes = match fetch_recipes(&urls, &agent) {
+                                            Ok(recipes) => recipes,
+                                            Err(error) => {
+                                                publish_network_error(
+                                                    &event_tx,
+                                                    &format!("failed to refresh recipes: {error}"),
+                                                );
+                                                subscription_library
+                                            }
+                                        };
+                                        event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                                        ready = true;
+                                        connected_once = true;
+                                        reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+                                        event_tx.send(BackendEvent::BackendConnectionChanged(
+                                            BackendConnectionStatus::Connected,
+                                        ));
+                                    }
                                     Ok(event) => {
                                         if matches!(event, WebSocketEvent::Snapshot(_)) {
-                                            received_snapshot = true;
                                             connected_once = true;
-                                            reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
-                                            event_tx.send(BackendEvent::BackendConnectionChanged(
-                                                BackendConnectionStatus::Connected,
-                                            ));
                                         }
                                         publish_websocket(event, &event_tx);
                                     }
@@ -206,6 +224,10 @@ fn set_read_timeout(
     result.map_err(|error| format!("failed to configure WebSocket polling: {error}"))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive semantic command-to-HTTP mapping is clearest in one dispatcher"
+)]
 fn send_backend_command(
     command: BackendCommand,
     urls: &RemoteUrls,
@@ -231,6 +253,106 @@ fn send_backend_command(
             }));
             let result = send_json(&format!("{}/api/cycle/start", urls.base), request, agent);
             publish_command_result(result, event_tx);
+            return;
+        }
+        BackendCommand::StartSavedRecipe { recipe_id, request } => {
+            let result = send_json::<_, AuthoritativeSnapshot>(
+                &format!("{}/api/recipes/{recipe_id}/start", urls.base),
+                request,
+                agent,
+            );
+            publish_command_result(result, event_tx);
+            return;
+        }
+        BackendCommand::RefreshRecipes => {
+            match fetch_recipes(urls, agent) {
+                Ok(recipes) => {
+                    event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                    event_tx.send(BackendEvent::CommandSucceeded);
+                }
+                Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+            }
+            return;
+        }
+        BackendCommand::CreateSavedRecipe(request) => {
+            publish_created_recipe_result(
+                send_json(&format!("{}/api/recipes", urls.base), request, agent),
+                event_tx,
+            );
+            return;
+        }
+        BackendCommand::UpdateSavedRecipe { recipe_id, request } => {
+            let result = agent
+                .put(&format!("{}/api/recipes/{recipe_id}", urls.base))
+                .set(COMMAND_HEADER, "1")
+                .send_json(request)
+                .map_err(format_http_error)
+                .and_then(|response| {
+                    response
+                        .into_json::<SavedRecipe>()
+                        .map_err(|error| format!("invalid server response: {error}"))
+                });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.contains("HTTP 409"))
+                && let Ok(recipes) = fetch_recipes(urls, agent)
+            {
+                event_tx.send(BackendEvent::RecipeLibrary(recipes));
+            }
+            publish_recipe_result(result, event_tx);
+            return;
+        }
+        BackendCommand::DeleteSavedRecipe { recipe_id, request } => {
+            let result = agent
+                .delete(&format!("{}/api/recipes/{recipe_id}", urls.base))
+                .set(COMMAND_HEADER, "1")
+                .send_json(request)
+                .map_err(format_http_error)
+                .and_then(|response| {
+                    response
+                        .into_json::<SavedRecipe>()
+                        .map_err(|error| format!("invalid server response: {error}"))
+                });
+            match result {
+                Ok(recipe) => {
+                    event_tx.send(BackendEvent::RecipeDeleted(recipe.id));
+                    event_tx.send(BackendEvent::CommandSucceeded);
+                }
+                Err(error) => {
+                    if error.contains("HTTP 409")
+                        && let Ok(recipes) = fetch_recipes(urls, agent)
+                    {
+                        event_tx.send(BackendEvent::RecipeLibrary(recipes));
+                    }
+                    event_tx.send(BackendEvent::CommandError(error));
+                }
+            }
+            return;
+        }
+        BackendCommand::ImportRecipe(export) => {
+            publish_created_recipe_result(
+                send_json(&format!("{}/api/recipes/import", urls.base), export, agent),
+                event_tx,
+            );
+            return;
+        }
+        BackendCommand::ExportRecipe { recipe_id } => {
+            match get_json::<RecipeExport>(
+                &format!("{}/api/recipes/{recipe_id}/export", urls.base),
+                agent,
+            ) {
+                Ok(export) => {
+                    event_tx.send(BackendEvent::RecipeExported(export));
+                    event_tx.send(BackendEvent::CommandSucceeded);
+                }
+                Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+            }
+            return;
+        }
+        BackendCommand::StartSavedRecipeSnapshot { .. } => {
+            event_tx.send(BackendEvent::CommandError(
+                "local saved recipe snapshot sent to remote backend".to_owned(),
+            ));
             return;
         }
         BackendCommand::RenameRun { run_id, request } => {
@@ -307,11 +429,11 @@ fn publish_command_result(
     }
 }
 
-fn send_json<T: serde::Serialize>(
+fn send_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     url: &str,
     body: &T,
     agent: &ureq::Agent,
-) -> Result<AuthoritativeSnapshot, String> {
+) -> Result<R, String> {
     agent
         .post(url)
         .set(COMMAND_HEADER, "1")
@@ -319,6 +441,42 @@ fn send_json<T: serde::Serialize>(
         .map_err(format_http_error)?
         .into_json()
         .map_err(|error| format!("invalid server response: {error}"))
+}
+
+fn get_json<T: serde::de::DeserializeOwned>(url: &str, agent: &ureq::Agent) -> Result<T, String> {
+    agent
+        .get(url)
+        .call()
+        .map_err(format_http_error)?
+        .into_json()
+        .map_err(|error| format!("invalid server response: {error}"))
+}
+
+fn fetch_recipes(urls: &RemoteUrls, agent: &ureq::Agent) -> Result<Vec<SavedRecipe>, String> {
+    get_json(&format!("{}/api/recipes", urls.base), agent)
+}
+
+fn publish_recipe_result(result: Result<SavedRecipe, String>, event_tx: &BackendEventSender) {
+    match result {
+        Ok(recipe) => {
+            event_tx.send(BackendEvent::RecipeUpsert(recipe));
+            event_tx.send(BackendEvent::CommandSucceeded);
+        }
+        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+    }
+}
+
+fn publish_created_recipe_result(
+    result: Result<SavedRecipe, String>,
+    event_tx: &BackendEventSender,
+) {
+    match result {
+        Ok(recipe) => {
+            event_tx.send(BackendEvent::RecipeCreated(recipe));
+            event_tx.send(BackendEvent::CommandSucceeded);
+        }
+        Err(error) => event_tx.send(BackendEvent::CommandError(error)),
+    }
 }
 
 fn send_command(
@@ -407,7 +565,9 @@ mod tests {
 
     use super::*;
     use crate::core::{
-        CycleRecipe, RenameRequest, StartCycleRequest, StartTestRequest, TestConfiguration,
+        CreateSavedRecipeRequest, CycleRecipe, DeleteSavedRecipeRequest, RenameRequest,
+        StartCycleRequest, StartSavedRecipeRequest, StartTestRequest, TestConfiguration,
+        UpdateSavedRecipeRequest,
     };
 
     fn config() -> TestConfiguration {
@@ -419,6 +579,21 @@ mod tests {
     }
 
     fn capture_backend_request(command: BackendCommand) -> String {
+        let response_body = match &command {
+            BackendCommand::RefreshRecipes => serde_json::json!([]),
+            BackendCommand::CreateSavedRecipe(_)
+            | BackendCommand::UpdateSavedRecipe { .. }
+            | BackendCommand::DeleteSavedRecipe { .. }
+            | BackendCommand::ImportRecipe(_) => {
+                serde_json::to_value(saved_recipe("recipe-1", "Recipe", 2))
+                    .expect("serialize recipe response")
+            }
+            BackendCommand::ExportRecipe { .. } => {
+                serde_json::to_value(recipe_export()).expect("serialize recipe export response")
+            }
+            _ => serde_json::to_value(AuthoritativeSnapshot::default())
+                .expect("serialize response snapshot"),
+        };
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP test server");
         let address = listener.local_addr().expect("HTTP test server address");
         let server = std::thread::spawn(move || {
@@ -441,7 +616,7 @@ mod tests {
                     .lines()
                     .find_map(|line| line.strip_prefix("content-length: "))
                     .and_then(|value| value.parse::<usize>().ok())
-                    .expect("JSON Content-Length header");
+                    .unwrap_or(0);
                 break headers_end + 4 + content_length;
             };
             while request.len() < expected_len {
@@ -450,8 +625,7 @@ mod tests {
                 request.extend_from_slice(&chunk[..read]);
             }
 
-            let body = serde_json::to_string(&AuthoritativeSnapshot::default())
-                .expect("serialize response snapshot");
+            let body = serde_json::to_string(&response_body).expect("serialize HTTP response");
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -473,6 +647,32 @@ mod tests {
     fn request_body(request: &str) -> serde_json::Value {
         let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
         serde_json::from_str(body).expect("JSON request body")
+    }
+
+    fn saved_recipe(id: &str, name: &str, revision: u64) -> SavedRecipe {
+        SavedRecipe {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            recipe: CycleRecipe {
+                steps: Vec::new(),
+                repeat_count: 1,
+            },
+            revision,
+            created_at_utc: "created".to_owned(),
+            updated_at_utc: "updated".to_owned(),
+        }
+    }
+
+    fn recipe_export() -> RecipeExport {
+        RecipeExport {
+            format: "ebc-cycle-recipe".to_owned(),
+            version: 1,
+            name: "Imported".to_owned(),
+            recipe: CycleRecipe {
+                steps: Vec::new(),
+                repeat_count: 2,
+            },
+        }
     }
 
     #[test]
@@ -532,6 +732,79 @@ mod tests {
     }
 
     #[test]
+    fn recipe_commands_use_canonical_methods_routes_and_bodies() {
+        let request = capture_backend_request(BackendCommand::RefreshRecipes);
+        assert!(request.starts_with("GET /api/recipes HTTP/1.1\r\n"));
+        assert_eq!(request.split_once("\r\n\r\n").expect("HTTP headers").1, "");
+
+        let create = CreateSavedRecipeRequest {
+            name: "Created".to_owned(),
+            recipe: recipe_export().recipe,
+        };
+        let request = capture_backend_request(BackendCommand::CreateSavedRecipe(create.clone()));
+        assert!(request.starts_with("POST /api/recipes HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(create).expect("create body")
+        );
+
+        let update = UpdateSavedRecipeRequest {
+            name: "Updated".to_owned(),
+            recipe: recipe_export().recipe,
+            expected_revision: 1,
+        };
+        let request = capture_backend_request(BackendCommand::UpdateSavedRecipe {
+            recipe_id: "recipe-1".to_owned(),
+            request: update.clone(),
+        });
+        assert!(request.starts_with("PUT /api/recipes/recipe-1 HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(update).expect("update body")
+        );
+
+        let delete = DeleteSavedRecipeRequest {
+            expected_revision: 2,
+        };
+        let request = capture_backend_request(BackendCommand::DeleteSavedRecipe {
+            recipe_id: "recipe-1".to_owned(),
+            request: delete,
+        });
+        assert!(request.starts_with("DELETE /api/recipes/recipe-1 HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "expected_revision": 2 })
+        );
+
+        let start = StartSavedRecipeRequest {
+            execution_name: Some("Execution".to_owned()),
+        };
+        let request = capture_backend_request(BackendCommand::StartSavedRecipe {
+            recipe_id: "recipe-1".to_owned(),
+            request: start.clone(),
+        });
+        assert!(request.starts_with("POST /api/recipes/recipe-1/start HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(start).expect("start body")
+        );
+
+        let export = recipe_export();
+        let request = capture_backend_request(BackendCommand::ImportRecipe(export.clone()));
+        assert!(request.starts_with("POST /api/recipes/import HTTP/1.1\r\n"));
+        assert_eq!(
+            request_body(&request),
+            serde_json::to_value(export).expect("import body")
+        );
+
+        let request = capture_backend_request(BackendCommand::ExportRecipe {
+            recipe_id: "recipe-1".to_owned(),
+        });
+        assert!(request.starts_with("GET /api/recipes/recipe-1/export HTTP/1.1\r\n"));
+        assert_eq!(request.split_once("\r\n\r\n").expect("HTTP headers").1, "");
+    }
+
+    #[test]
     fn disconnected_commands_are_rejected_and_never_retained() {
         let (command_tx, mut command_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
@@ -570,6 +843,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the integration fixture serves WebSocket, initial recipe refresh, and command HTTP"
+    )]
     fn native_transport_receives_snapshot_and_sends_semantic_command() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .unwrap_or_else(|error| panic!("failed to bind test server: {error}"));
@@ -590,6 +867,34 @@ mod tests {
             websocket
                 .send(Message::Text(text.into()))
                 .unwrap_or_else(|error| panic!("failed to send Snapshot: {error}"));
+            let library = serde_json::to_string(&WebSocketEvent::RecipeLibrary(Vec::new()))
+                .unwrap_or_else(|error| panic!("failed to serialize recipe library: {error}"));
+            websocket
+                .send(Message::Text(library.into()))
+                .unwrap_or_else(|error| panic!("failed to send recipe library: {error}"));
+
+            let (mut recipe_http, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("failed to accept recipe refresh: {error}"));
+            recipe_http
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| panic!("failed to set HTTP timeout: {error}"));
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = recipe_http
+                    .read(&mut chunk)
+                    .unwrap_or_else(|error| panic!("failed to read recipe refresh: {error}"));
+                assert_ne!(read, 0, "recipe refresh ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.starts_with("get /api/recipes http/1.1\r\n"));
+            recipe_http
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                )
+                .unwrap_or_else(|error| panic!("failed to send recipe library: {error}"));
 
             let (mut http, _) = listener
                 .accept()
@@ -597,7 +902,6 @@ mod tests {
             http.set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap_or_else(|error| panic!("failed to set HTTP timeout: {error}"));
             let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
                 let read = http
                     .read(&mut chunk)

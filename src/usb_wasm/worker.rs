@@ -172,6 +172,32 @@ pub(super) async fn local_backend_task(
                             &event_tx,
                         ).await;
                     }
+                    BackendCommand::StartSavedRecipeSnapshot {
+                        recipe,
+                        reference,
+                        execution_name,
+                    } => {
+                        publish(
+                            backend.start_saved_recipe(recipe, reference, execution_name),
+                            &mut backend,
+                            &mut generation,
+                            &mut device,
+                            &mut out_endpoint_num,
+                            &mut stop_reading_tx,
+                            &event_tx,
+                        ).await;
+                    }
+                    BackendCommand::StartSavedRecipe { .. }
+                    | BackendCommand::RefreshRecipes
+                    | BackendCommand::CreateSavedRecipe(_)
+                    | BackendCommand::UpdateSavedRecipe { .. }
+                    | BackendCommand::DeleteSavedRecipe { .. }
+                    | BackendCommand::ImportRecipe(_)
+                    | BackendCommand::ExportRecipe { .. } => {
+                        event_tx.send(BackendEvent::CommandError(
+                            "remote recipe command sent to local backend".to_owned(),
+                        ));
+                    }
                     BackendCommand::RenameRun { run_id, request } => {
                         publish(
                             backend.rename_run(&run_id, request),

@@ -7,9 +7,11 @@ use crate::backend_client::BackendClient;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend_client::BackendTarget;
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, Capabilities, CurrentRunMetadata, CycleSample, CycleState,
-    CycleStatus, RenameRequest, Sample, ServerConnectionState, StartCycleRequest, StartTestRequest,
-    TestConfiguration, TestState, cycle_presentation_history,
+    ApiCommand, AuthoritativeSnapshot, Capabilities, CreateSavedRecipeRequest, CurrentRunMetadata,
+    CycleRecipe, CycleSample, CycleState, CycleStatus, DeleteSavedRecipeRequest, RecipeExport,
+    RenameRequest, Sample, SavedRecipe, SavedRecipeReference, ServerConnectionState,
+    StartCycleRequest, StartSavedRecipeRequest, StartTestRequest, TestConfiguration, TestState,
+    UpdateSavedRecipeRequest, cycle_presentation_history,
 };
 use crate::device::{self, ConnectionStatus};
 use crate::export::{LogDirection, LogEntry};
@@ -122,6 +124,7 @@ pub(crate) struct DeviceSession {
     pub(crate) test_state: TestState,
     pub(crate) cycle: CycleStatus,
     pub(crate) current_run: CurrentRunMetadata,
+    pub(crate) saved_recipes: Vec<SavedRecipe>,
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) command_error: Option<String>,
     transport_mode: TransportMode,
@@ -131,6 +134,8 @@ pub(crate) struct DeviceSession {
     last_remote_sequence: Option<u64>,
     cycle_execution_id: Option<String>,
     last_cycle_sequence: Option<u64>,
+    pending_recipe_export: Option<RecipeExport>,
+    pending_created_recipe: Option<SavedRecipe>,
 }
 
 impl Default for DeviceSession {
@@ -155,6 +160,7 @@ impl Default for DeviceSession {
             test_state: TestState::Idle,
             cycle: CycleStatus::default(),
             current_run: CurrentRunMetadata::default(),
+            saved_recipes: Vec::new(),
             log_entries: Vec::new(),
             command_error: None,
             transport_mode: TransportMode::Direct,
@@ -164,6 +170,8 @@ impl Default for DeviceSession {
             last_remote_sequence: None,
             cycle_execution_id: None,
             last_cycle_sequence: None,
+            pending_recipe_export: None,
+            pending_created_recipe: None,
         }
     }
 }
@@ -287,6 +295,106 @@ impl DeviceSession {
             return;
         }
         self.backend.command(BackendCommand::StartCycle(request));
+    }
+
+    pub(crate) fn start_saved_recipe(&mut self, recipe_id: String, execution_name: Option<String>) {
+        if !self.remote_command_available("saved recipe start") {
+            return;
+        }
+        self.backend.command(BackendCommand::StartSavedRecipe {
+            recipe_id,
+            request: StartSavedRecipeRequest { execution_name },
+        });
+    }
+
+    pub(crate) fn start_local_saved_recipe(
+        &self,
+        recipe: CycleRecipe,
+        reference: SavedRecipeReference,
+        execution_name: Option<String>,
+    ) {
+        self.backend
+            .command(BackendCommand::StartSavedRecipeSnapshot {
+                recipe,
+                reference,
+                execution_name,
+            });
+    }
+
+    pub(crate) fn create_saved_recipe(&mut self, request: CreateSavedRecipeRequest) {
+        if self.remote_command_available("saved recipe create") {
+            self.backend
+                .command(BackendCommand::CreateSavedRecipe(request));
+        }
+    }
+
+    pub(crate) fn update_saved_recipe(
+        &mut self,
+        recipe_id: String,
+        request: UpdateSavedRecipeRequest,
+    ) {
+        if self.remote_command_available("saved recipe update") {
+            self.backend
+                .command(BackendCommand::UpdateSavedRecipe { recipe_id, request });
+        }
+    }
+
+    pub(crate) fn delete_saved_recipe(
+        &mut self,
+        recipe_id: String,
+        request: DeleteSavedRecipeRequest,
+    ) {
+        if self.remote_command_available("saved recipe delete") {
+            self.backend
+                .command(BackendCommand::DeleteSavedRecipe { recipe_id, request });
+        }
+    }
+
+    pub(crate) fn import_recipe(&mut self, recipe: RecipeExport) {
+        if self.remote_command_available("recipe import") {
+            self.backend.command(BackendCommand::ImportRecipe(recipe));
+        }
+    }
+
+    pub(crate) fn export_recipe(&mut self, recipe_id: String) {
+        if self.remote_command_available("recipe export") {
+            self.backend
+                .command(BackendCommand::ExportRecipe { recipe_id });
+        }
+    }
+
+    pub(crate) fn refresh_recipes(&mut self) {
+        if self.remote_command_available("recipe refresh") {
+            self.backend.command(BackendCommand::RefreshRecipes);
+        }
+    }
+
+    pub(crate) fn take_recipe_export(&mut self) -> Option<RecipeExport> {
+        self.pending_recipe_export.take()
+    }
+
+    pub(crate) fn take_created_recipe(&mut self) -> Option<SavedRecipe> {
+        self.pending_created_recipe.take()
+    }
+
+    fn apply_recipe_upsert(&mut self, recipe: SavedRecipe) {
+        if let Some(existing) = self
+            .saved_recipes
+            .iter_mut()
+            .find(|existing| existing.id == recipe.id)
+        {
+            if recipe.revision >= existing.revision {
+                *existing = recipe;
+            }
+        } else {
+            self.saved_recipes.push(recipe);
+        }
+        self.saved_recipes.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
     }
 
     pub(crate) fn rename_current_run(&mut self, request: RenameRequest) {
@@ -527,6 +635,18 @@ impl DeviceSession {
                 BackendEvent::Update(state) => self.apply_state(state),
                 BackendEvent::Sample(sample) => self.apply_sample(sample),
                 BackendEvent::CycleSample(sample) => self.apply_cycle_sample(sample),
+                BackendEvent::RecipeLibrary(recipes) => self.saved_recipes = recipes,
+                BackendEvent::RecipeUpsert(recipe) => self.apply_recipe_upsert(recipe),
+                BackendEvent::RecipeCreated(recipe) => {
+                    self.apply_recipe_upsert(recipe.clone());
+                    self.pending_created_recipe = Some(recipe);
+                }
+                BackendEvent::RecipeDeleted(id) => {
+                    self.saved_recipes.retain(|recipe| recipe.id != id);
+                }
+                BackendEvent::RecipeExported(export) => {
+                    self.pending_recipe_export = Some(export);
+                }
                 BackendEvent::CommandSucceeded => self.command_error = None,
                 BackendEvent::CommandError(error) => self.command_error = Some(error),
                 BackendEvent::Diagnostic(event) => self.log_entries.push(LogEntry {
@@ -545,8 +665,17 @@ impl DeviceSession {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use tungstenite::Message;
+
     use super::*;
-    use crate::core::{CurrentRunMetadata, DeviceState, SnapshotUpdate, TestStatus};
+    use crate::core::{
+        CurrentRunMetadata, DeviceState, SnapshotUpdate, TestStatus, WebSocketEvent,
+    };
 
     #[test]
     fn semantic_snapshot_reconstructs_view_state() {
@@ -774,6 +903,146 @@ mod tests {
             select_wasm_transport("remote", "?transport=webusb"),
             TransportMode::Direct
         );
+    }
+
+    #[test]
+    fn recipe_events_replace_authoritatively_ignore_stale_upserts_and_delete_idempotently() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("failed to bind test server: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("failed to read test server address: {error}"));
+        let authoritative = saved_recipe("recipe-1", "Authoritative", 3);
+        let server_recipe = authoritative.clone();
+        let stale = saved_recipe("recipe-1", "Stale", 2);
+        let marker = saved_recipe("marker", "Marker", 1);
+        let final_marker = saved_recipe("final", "Final", 1);
+        let (send_events, receive_events) = mpsc::channel::<Vec<WebSocketEvent>>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("failed to accept WebSocket: {error}"));
+            let mut websocket = tungstenite::accept(stream)
+                .unwrap_or_else(|error| panic!("failed WebSocket handshake: {error}"));
+            send_websocket_event(
+                &mut websocket,
+                &WebSocketEvent::Snapshot(AuthoritativeSnapshot::default()),
+            );
+            send_websocket_event(&mut websocket, &WebSocketEvent::RecipeLibrary(Vec::new()));
+
+            let (mut http, _) = listener
+                .accept()
+                .unwrap_or_else(|error| panic!("failed to accept recipe GET: {error}"));
+            http.set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap_or_else(|error| panic!("failed to set HTTP timeout: {error}"));
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = http
+                    .read(&mut chunk)
+                    .unwrap_or_else(|error| panic!("failed to read recipe GET: {error}"));
+                assert_ne!(read, 0, "recipe GET ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/recipes HTTP/1.1\r\n"));
+            let body = serde_json::to_string(&vec![server_recipe])
+                .unwrap_or_else(|error| panic!("failed to serialize recipe library: {error}"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            http.write_all(response.as_bytes())
+                .unwrap_or_else(|error| panic!("failed to send recipe library: {error}"));
+
+            for events in receive_events {
+                for event in events {
+                    send_websocket_event(&mut websocket, &event);
+                }
+            }
+        });
+
+        let context = egui::Context::default();
+        let mut session = DeviceSession::new(
+            &context,
+            BackendTarget::Remote,
+            &format!("http://{address}"),
+        )
+        .unwrap_or_else(|error| panic!("failed to create remote session: {error}"));
+        session.saved_recipes = vec![saved_recipe("old", "Old", 9)];
+        wait_for_recipes(&mut session, &context, |recipes| {
+            recipes == [authoritative.clone()]
+        });
+
+        send_events
+            .send(vec![
+                WebSocketEvent::RecipeUpsert(stale),
+                WebSocketEvent::RecipeUpsert(marker.clone()),
+            ])
+            .unwrap_or_else(|error| panic!("failed to send upsert events: {error}"));
+        wait_for_recipes(&mut session, &context, |recipes| recipes.contains(&marker));
+        assert!(session.saved_recipes.contains(&authoritative));
+
+        send_events
+            .send(vec![
+                WebSocketEvent::RecipeDelete("recipe-1".to_owned()),
+                WebSocketEvent::RecipeDelete("recipe-1".to_owned()),
+                WebSocketEvent::RecipeUpsert(final_marker.clone()),
+            ])
+            .unwrap_or_else(|error| panic!("failed to send delete events: {error}"));
+        wait_for_recipes(&mut session, &context, |recipes| {
+            recipes.contains(&final_marker)
+        });
+        assert!(
+            !session
+                .saved_recipes
+                .iter()
+                .any(|recipe| recipe.id == "recipe-1")
+        );
+
+        drop(send_events);
+        drop(session);
+        assert!(server.join().is_ok(), "test server panicked");
+    }
+
+    fn saved_recipe(id: &str, name: &str, revision: u64) -> SavedRecipe {
+        SavedRecipe {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            recipe: CycleRecipe {
+                steps: Vec::new(),
+                repeat_count: 1,
+            },
+            revision,
+            created_at_utc: "created".to_owned(),
+            updated_at_utc: "updated".to_owned(),
+        }
+    }
+
+    fn send_websocket_event(
+        websocket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+        event: &WebSocketEvent,
+    ) {
+        let text = serde_json::to_string(&event)
+            .unwrap_or_else(|error| panic!("failed to serialize WebSocket event: {error}"));
+        websocket
+            .send(Message::Text(text.into()))
+            .unwrap_or_else(|error| panic!("failed to send WebSocket event: {error}"));
+    }
+
+    fn wait_for_recipes(
+        session: &mut DeviceSession,
+        context: &egui::Context,
+        condition: impl Fn(&[SavedRecipe]) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            session.consume_events(context);
+            if condition(&session.saved_recipes) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for recipe events");
     }
 
     fn sample(run_id: &str, sequence: u64, elapsed_seconds: u64) -> Sample {

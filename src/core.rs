@@ -10,14 +10,16 @@ use crate::device::{
     MIN_CHARGE_CUTOFF_CURRENT_MA, MIN_DISCHARGE_CURRENT_MA, MIN_POWER_W, MIN_VOLTAGE_MV,
 };
 
-pub const MAX_EXECUTION_NAME_CHARS: usize = 120;
+pub const MAX_NAME_CHARS: usize = 120;
+pub const RECIPE_EXPORT_FORMAT: &str = "ebc-battery-tester-recipe";
+pub const RECIPE_EXPORT_VERSION: u32 = 1;
 
-/// Trims and validates an optional user-facing execution name.
+/// Trims and validates an optional user-facing name.
 ///
 /// # Errors
 /// Returns an error when the name contains a control character or exceeds the
 /// maximum number of Unicode scalar values.
-pub fn normalize_execution_name(input: Option<&str>) -> Result<Option<String>, ValidationError> {
+pub fn normalize_optional_name(input: Option<&str>) -> Result<Option<String>, ValidationError> {
     if input.is_some_and(|name| name.chars().any(char::is_control)) {
         return Err(ValidationError {
             field: "name".to_owned(),
@@ -27,13 +29,25 @@ pub fn normalize_execution_name(input: Option<&str>) -> Result<Option<String>, V
     let Some(name) = input.map(str::trim).filter(|name| !name.is_empty()) else {
         return Ok(None);
     };
-    if name.chars().count() > MAX_EXECUTION_NAME_CHARS {
+    if name.chars().count() > MAX_NAME_CHARS {
         return Err(ValidationError {
             field: "name".to_owned(),
-            message: format!("must be at most {MAX_EXECUTION_NAME_CHARS} characters"),
+            message: format!("must be at most {MAX_NAME_CHARS} characters"),
         });
     }
     Ok(Some(name.to_owned()))
+}
+
+/// Trims and validates a required user-facing name.
+///
+/// # Errors
+/// Returns an error when the name is empty after trimming, contains a control
+/// character, or exceeds the maximum number of Unicode scalar values.
+pub fn normalize_required_name(input: &str) -> Result<String, ValidationError> {
+    normalize_optional_name(Some(input))?.ok_or_else(|| ValidationError {
+        field: "name".to_owned(),
+        message: "must not be empty".to_owned(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -255,6 +269,9 @@ pub enum WebSocketEvent {
     Update(SnapshotUpdate),
     Sample(Sample),
     CycleSample(CycleSample),
+    RecipeLibrary(Vec<SavedRecipe>),
+    RecipeUpsert(SavedRecipe),
+    RecipeDelete(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -279,7 +296,7 @@ pub struct RunSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TestConfiguration {
     DischargeConstantCurrent {
         current_ma: u16,
@@ -371,9 +388,87 @@ impl TestConfiguration {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CycleRecipe {
     pub steps: Vec<CycleStep>,
     pub repeat_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRecipe {
+    pub id: String,
+    pub name: String,
+    pub recipe: CycleRecipe,
+    pub revision: u64,
+    pub created_at_utc: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRecipeReference {
+    pub id: String,
+    pub name: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSavedRecipeRequest {
+    pub name: String,
+    pub recipe: CycleRecipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSavedRecipeRequest {
+    pub name: String,
+    pub recipe: CycleRecipe,
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteSavedRecipeRequest {
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSavedRecipeRequest {
+    #[serde(default)]
+    pub execution_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeExport {
+    pub format: String,
+    pub version: u32,
+    pub name: String,
+    pub recipe: CycleRecipe,
+}
+
+impl RecipeExport {
+    /// Validates the portable envelope and contained recipe.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported format or version, an invalid name,
+    /// or an invalid cycle recipe.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.format != RECIPE_EXPORT_FORMAT {
+            return Err(ValidationError {
+                field: "format".to_owned(),
+                message: format!("must be {RECIPE_EXPORT_FORMAT}"),
+            });
+        }
+        if self.version != RECIPE_EXPORT_VERSION {
+            return Err(ValidationError {
+                field: "version".to_owned(),
+                message: format!("must be {RECIPE_EXPORT_VERSION}"),
+            });
+        }
+        normalize_required_name(&self.name)?;
+        self.recipe.validate().map_err(|error| ValidationError {
+            field: format!("recipe.{}", error.field),
+            message: error.message,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,7 +528,7 @@ impl CycleRecipe {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CycleStep {
     Device {
         config: TestConfiguration,
@@ -474,6 +569,8 @@ pub struct CycleStatus {
     pub execution_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub saved_recipe: Option<SavedRecipeReference>,
     pub repeat_index: u32,
     pub step_index: usize,
     pub started_at_utc: Option<String>,
@@ -582,41 +679,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_optional_execution_names() {
-        assert_eq!(normalize_execution_name(None), Ok(None));
-        assert_eq!(normalize_execution_name(Some("")), Ok(None));
-        assert_eq!(normalize_execution_name(Some("   ")), Ok(None));
+    fn normalizes_optional_names_at_unicode_scalar_boundaries() {
+        assert_eq!(normalize_optional_name(None), Ok(None));
+        assert_eq!(normalize_optional_name(Some("")), Ok(None));
+        assert_eq!(normalize_optional_name(Some("   ")), Ok(None));
         assert_eq!(
-            normalize_execution_name(Some("  Cell α  ")),
+            normalize_optional_name(Some("  Cell α  ")),
             Ok(Some("Cell α".to_owned()))
         );
 
-        let maximum = "🪫".repeat(MAX_EXECUTION_NAME_CHARS);
+        let maximum = "🪫".repeat(MAX_NAME_CHARS);
         assert_eq!(
-            normalize_execution_name(Some(&maximum)),
+            normalize_optional_name(Some(&maximum)),
             Ok(Some(maximum.clone()))
         );
-        let too_long = "界".repeat(MAX_EXECUTION_NAME_CHARS + 1);
-        let error = normalize_execution_name(Some(&too_long)).expect_err("name is too long");
+        let too_long = "界".repeat(MAX_NAME_CHARS + 1);
+        let error = normalize_optional_name(Some(&too_long)).expect_err("name is too long");
         assert_eq!(error.field, "name");
         assert!(error.message.contains("120"));
     }
 
     #[test]
-    fn rejects_control_characters_but_not_duplicate_names() {
-        for name in ["line\nbreak", "column\tbreak", "nul\0byte"] {
-            let error = normalize_execution_name(Some(name)).expect_err("control character");
+    fn validates_required_names_and_rejects_controls_before_trimming() {
+        for name in ["line\nbreak", "column\tbreak", "nul\0byte", "\n valid "] {
+            let error = normalize_optional_name(Some(name)).expect_err("control character");
             assert_eq!(error.field, "name");
             assert!(error.message.contains("control"));
         }
 
         assert_eq!(
-            normalize_execution_name(Some("Repeated")),
-            Ok(Some("Repeated".to_owned()))
+            normalize_required_name("  Saved α  "),
+            Ok("Saved α".to_owned())
         );
         assert_eq!(
-            normalize_execution_name(Some("Repeated")),
-            Ok(Some("Repeated".to_owned()))
+            normalize_required_name(" ")
+                .expect_err("required name")
+                .field,
+            "name"
+        );
+
+        let maximum = "界".repeat(MAX_NAME_CHARS);
+        assert_eq!(normalize_required_name(&maximum), Ok(maximum));
+        let too_long = "a".repeat(MAX_NAME_CHARS + 1);
+        assert_eq!(
+            normalize_required_name(&too_long)
+                .expect_err("required name is too long")
+                .field,
+            "name"
         );
     }
 
@@ -695,6 +804,84 @@ mod tests {
             repeat_count: 1,
         };
         assert_eq!(maximum_rest.validate(), Ok(()));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn recipe_export_rejects_unsupported_envelopes_and_invalid_contents() {
+        let recipe = CycleRecipe {
+            steps: vec![CycleStep::Rest {
+                duration_seconds: 5,
+            }],
+            repeat_count: 1,
+        };
+        let mut export = RecipeExport {
+            format: RECIPE_EXPORT_FORMAT.to_owned(),
+            version: RECIPE_EXPORT_VERSION,
+            name: "Storage cycle".to_owned(),
+            recipe,
+        };
+        assert_eq!(export.validate(), Ok(()));
+
+        export.version = 0;
+        assert_eq!(export.validate().expect_err("old version").field, "version");
+        export.version = RECIPE_EXPORT_VERSION + 1;
+        assert_eq!(
+            export.validate().expect_err("future version").field,
+            "version"
+        );
+        export.version = RECIPE_EXPORT_VERSION;
+        export.format = "another-format".to_owned();
+        assert_eq!(export.validate().expect_err("wrong format").field, "format");
+        export.format = RECIPE_EXPORT_FORMAT.to_owned();
+        export.name = "   ".to_owned();
+        assert_eq!(export.validate().expect_err("empty name").field, "name");
+        export.name = "Storage cycle".to_owned();
+        export.recipe.repeat_count = 0;
+        assert_eq!(
+            export.validate().expect_err("invalid recipe").field,
+            "recipe.repeat_count"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn recipe_export_round_trips_without_saved_identity() {
+        let export = RecipeExport {
+            format: RECIPE_EXPORT_FORMAT.to_owned(),
+            version: RECIPE_EXPORT_VERSION,
+            name: "Storage cycle".to_owned(),
+            recipe: CycleRecipe {
+                steps: vec![CycleStep::Rest {
+                    duration_seconds: 5,
+                }],
+                repeat_count: 2,
+            },
+        };
+        let value = serde_json::to_value(&export).expect("serialize recipe export");
+        let object = value.as_object().expect("recipe export object");
+        assert_eq!(object.len(), 4);
+        for identity in ["id", "revision", "created_at_utc", "updated_at_utc"] {
+            assert!(!object.contains_key(identity));
+        }
+        assert_eq!(
+            serde_json::from_value::<RecipeExport>(value).expect("deserialize recipe export"),
+            export
+        );
+
+        let mut unknown = serde_json::to_value(&export).expect("serialize recipe export");
+        unknown
+            .as_object_mut()
+            .expect("recipe export object")
+            .insert("id".to_owned(), serde_json::json!("recipe-1"));
+        assert!(serde_json::from_value::<RecipeExport>(unknown).is_err());
+
+        let mut unknown_nested = serde_json::to_value(&export).expect("serialize recipe export");
+        unknown_nested["recipe"]
+            .as_object_mut()
+            .expect("recipe object")
+            .insert("future_logic".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<RecipeExport>(unknown_nested).is_err());
     }
 
     #[cfg(feature = "server")]
@@ -810,6 +997,7 @@ mod tests {
         )
         .expect("deserialize legacy cycle status");
         assert_eq!(status.name, None);
+        assert_eq!(status.saved_recipe, None);
     }
 
     #[cfg(feature = "server")]

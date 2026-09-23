@@ -5,8 +5,10 @@ use std::sync::Arc;
 use futures::channel::mpsc::UnboundedSender;
 
 use crate::core::{
-    ApiCommand, AuthoritativeSnapshot, CycleSample, RenameRequest, Sample, SnapshotUpdate,
-    StartCycleRequest, StartTestRequest, TestConfiguration,
+    ApiCommand, AuthoritativeSnapshot, CreateSavedRecipeRequest, CycleRecipe, CycleSample,
+    DeleteSavedRecipeRequest, RecipeExport, RenameRequest, Sample, SavedRecipe,
+    SavedRecipeReference, SnapshotUpdate, StartCycleRequest, StartSavedRecipeRequest,
+    StartTestRequest, TestConfiguration, UpdateSavedRecipeRequest,
 };
 use crate::device::UsbDeviceInfo;
 
@@ -19,6 +21,29 @@ pub(crate) enum BackendCommand {
     StartTest(StartTestRequest),
     Resume(TestConfiguration),
     StartCycle(StartCycleRequest),
+    StartSavedRecipe {
+        recipe_id: String,
+        request: StartSavedRecipeRequest,
+    },
+    StartSavedRecipeSnapshot {
+        recipe: CycleRecipe,
+        reference: SavedRecipeReference,
+        execution_name: Option<String>,
+    },
+    RefreshRecipes,
+    CreateSavedRecipe(CreateSavedRecipeRequest),
+    UpdateSavedRecipe {
+        recipe_id: String,
+        request: UpdateSavedRecipeRequest,
+    },
+    DeleteSavedRecipe {
+        recipe_id: String,
+        request: DeleteSavedRecipeRequest,
+    },
+    ImportRecipe(RecipeExport),
+    ExportRecipe {
+        recipe_id: String,
+    },
     RenameRun {
         run_id: String,
         request: RenameRequest,
@@ -74,6 +99,11 @@ pub(crate) enum BackendEvent {
     Update(BackendState),
     Sample(Sample),
     CycleSample(CycleSample),
+    RecipeLibrary(Vec<SavedRecipe>),
+    RecipeUpsert(SavedRecipe),
+    RecipeCreated(SavedRecipe),
+    RecipeDeleted(String),
+    RecipeExported(RecipeExport),
     CommandSucceeded,
     CommandError(String),
     Diagnostic(DiagnosticEvent),
@@ -115,6 +145,14 @@ pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
         BackendCommand::RefreshDevices
         | BackendCommand::StartTest(_)
         | BackendCommand::StartCycle(_)
+        | BackendCommand::StartSavedRecipe { .. }
+        | BackendCommand::StartSavedRecipeSnapshot { .. }
+        | BackendCommand::RefreshRecipes
+        | BackendCommand::CreateSavedRecipe(_)
+        | BackendCommand::UpdateSavedRecipe { .. }
+        | BackendCommand::DeleteSavedRecipe { .. }
+        | BackendCommand::ImportRecipe(_)
+        | BackendCommand::ExportRecipe { .. }
         | BackendCommand::RenameRun { .. }
         | BackendCommand::RenameCycle { .. }
         | BackendCommand::StopCycle

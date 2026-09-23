@@ -35,6 +35,121 @@ pub fn format_log(entries: &[LogEntry]) -> String {
     out
 }
 
+fn recipe_json(recipe: &crate::core::RecipeExport) -> Result<String, String> {
+    serde_json::to_string_pretty(recipe)
+        .map_err(|error| format!("could not encode recipe: {error}"))
+}
+
+fn recipe_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches([' ', '.']);
+    format!(
+        "{}.ebc-recipe.json",
+        if sanitized.is_empty() {
+            "recipe"
+        } else {
+            sanitized
+        }
+    )
+}
+
+fn parse_recipe(bytes: &[u8]) -> Result<crate::core::RecipeExport, String> {
+    let recipe: crate::core::RecipeExport = serde_json::from_slice(bytes)
+        .map_err(|error| format!("could not read recipe JSON: {error}"))?;
+    recipe
+        .validate()
+        .map_err(|error| format!("invalid recipe: {error}"))?;
+    Ok(recipe)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_recipe_from_file() -> Result<Option<crate::core::RecipeExport>, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Recipe JSON", &["json"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    parse_recipe(&bytes).map(Some)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_recipe_from_file()
+-> std::sync::mpsc::Receiver<Result<Option<crate::core::RecipeExport>, String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = match rfd::AsyncFileDialog::new()
+            .add_filter("Recipe JSON", &["json"])
+            .pick_file()
+            .await
+        {
+            Some(file) => parse_recipe(&file.read().await).map(Some),
+            None => Ok(None),
+        };
+        let _result = sender.send(result);
+    });
+    receiver
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_recipe_to_file(recipe: &crate::core::RecipeExport) -> Result<(), String> {
+    recipe
+        .validate()
+        .map_err(|error| format!("invalid recipe: {error}"))?;
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Recipe JSON", &["json"])
+        .set_file_name(recipe_filename(&recipe.name))
+        .save_file()
+    else {
+        return Ok(());
+    };
+    std::fs::write(&path, recipe_json(recipe)?)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save_recipe_to_file(recipe: &crate::core::RecipeExport) -> Result<(), String> {
+    use wasm_bindgen::JsCast as _;
+
+    recipe
+        .validate()
+        .map_err(|error| format!("invalid recipe: {error}"))?;
+    let content = recipe_json(recipe)?;
+    let window = web_sys::window().ok_or_else(|| "browser window is unavailable".to_owned())?;
+    let document = window
+        .document()
+        .ok_or_else(|| "browser document is unavailable".to_owned())?;
+    let array = js_sys::Array::new();
+    array.push(&wasm_bindgen::JsValue::from_str(&content));
+    let blob_opts = web_sys::BlobPropertyBag::new();
+    blob_opts.set_type("application/json");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&array, &blob_opts)
+        .map_err(|_error| "could not create recipe download".to_owned())?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|_error| "could not create recipe download URL".to_owned())?;
+    let anchor = document
+        .create_element("a")
+        .map_err(|_error| "could not create recipe download link".to_owned())?;
+    let anchor: web_sys::HtmlAnchorElement = anchor.unchecked_into();
+    anchor.set_href(&url);
+    anchor.set_download(&recipe_filename(&recipe.name));
+    anchor.click();
+    web_sys::Url::revoke_object_url(&url)
+        .map_err(|_error| "could not release recipe download URL".to_owned())?;
+    Ok(())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_log_to_file(entries: &[LogEntry]) {
     let content = format_log(entries);

@@ -27,6 +27,13 @@ pub(crate) fn publish_websocket(event: WebSocketEvent, event_tx: &BackendEventSe
         WebSocketEvent::Update(update) => publish_update(update, event_tx),
         WebSocketEvent::Sample(sample) => event_tx.send(BackendEvent::Sample(sample)),
         WebSocketEvent::CycleSample(sample) => event_tx.send(BackendEvent::CycleSample(sample)),
+        WebSocketEvent::RecipeLibrary(recipes) => {
+            event_tx.send(BackendEvent::RecipeLibrary(recipes));
+        }
+        WebSocketEvent::RecipeUpsert(recipe) => {
+            event_tx.send(BackendEvent::RecipeUpsert(recipe));
+        }
+        WebSocketEvent::RecipeDelete(id) => event_tx.send(BackendEvent::RecipeDeleted(id)),
     }
 }
 
@@ -96,8 +103,10 @@ impl RemoteUrls {
 
 #[cfg(test)]
 mod tests {
+    use futures::channel::mpsc;
+
     use super::*;
-    use crate::core::{CalibrationCommand, TestConfiguration};
+    use crate::core::{CalibrationCommand, CycleRecipe, SavedRecipe, TestConfiguration};
 
     fn config() -> TestConfiguration {
         TestConfiguration::DischargeConstantCurrent {
@@ -125,6 +134,47 @@ mod tests {
         }
         assert!(command_endpoint(ApiCommand::Start(config())).is_err());
         assert_eq!(COMMAND_HEADER, "X-EBC-Command");
+    }
+
+    #[test]
+    fn recipe_websocket_events_preserve_semantic_mapping() {
+        let (event_tx, mut event_rx) = mpsc::unbounded();
+        let event_tx = BackendEventSender::new(event_tx, || {});
+        let recipe = SavedRecipe {
+            id: "recipe-1".to_owned(),
+            name: "Recipe".to_owned(),
+            recipe: CycleRecipe {
+                steps: Vec::new(),
+                repeat_count: 1,
+            },
+            revision: 3,
+            created_at_utc: "created".to_owned(),
+            updated_at_utc: "updated".to_owned(),
+        };
+
+        publish_websocket(
+            WebSocketEvent::RecipeLibrary(vec![recipe.clone()]),
+            &event_tx,
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(BackendEvent::RecipeLibrary(recipes)) if recipes == vec![recipe.clone()]
+        ));
+
+        publish_websocket(WebSocketEvent::RecipeUpsert(recipe.clone()), &event_tx);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(BackendEvent::RecipeUpsert(actual)) if actual == recipe
+        ));
+
+        publish_websocket(
+            WebSocketEvent::RecipeDelete("recipe-1".to_owned()),
+            &event_tx,
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(BackendEvent::RecipeDeleted(id)) if id == "recipe-1"
+        ));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
