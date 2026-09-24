@@ -14,6 +14,7 @@ use crate::device::UsbDeviceInfo;
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendCommand {
+    History(HistoryRequest),
     RefreshDevices,
     Connect(usize),
     Disconnect,
@@ -57,6 +58,62 @@ pub(crate) enum BackendCommand {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum HistoryRequest {
+    RefreshRuns,
+    RefreshCycles,
+    LoadRun(String),
+    LoadCycle(String),
+    ExportRunCsv(String),
+    ExportCycleCsv(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DownloadedFile {
+    pub filename: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HistoryEvent {
+    Runs(Vec<crate::core::RunSummary>),
+    Cycles(Vec<crate::core::CycleSummary>),
+    RunLoaded(crate::core::RunHistory),
+    CycleLoaded(crate::core::CycleHistory),
+    FileExported(DownloadedFile),
+}
+
+impl HistoryRequest {
+    pub(crate) fn path(&self) -> String {
+        match self {
+            Self::RefreshRuns => "/api/runs".to_owned(),
+            Self::RefreshCycles => "/api/cycles".to_owned(),
+            Self::LoadRun(id) => format!("/api/runs/{id}"),
+            Self::LoadCycle(id) => format!("/api/cycles/{id}"),
+            Self::ExportRunCsv(id) => format!("/api/runs/{id}/history.csv"),
+            Self::ExportCycleCsv(id) => format!("/api/cycles/{id}/history.csv"),
+        }
+    }
+
+    pub(crate) fn decode(&self, bytes: Vec<u8>) -> Result<HistoryEvent, String> {
+        let result = match self {
+            Self::RefreshRuns => serde_json::from_slice(&bytes).map(HistoryEvent::Runs),
+            Self::RefreshCycles => serde_json::from_slice(&bytes).map(HistoryEvent::Cycles),
+            Self::LoadRun(_) => serde_json::from_slice(&bytes).map(HistoryEvent::RunLoaded),
+            Self::LoadCycle(_) => serde_json::from_slice(&bytes).map(HistoryEvent::CycleLoaded),
+            Self::ExportRunCsv(id) | Self::ExportCycleCsv(id) => {
+                return Ok(HistoryEvent::FileExported(DownloadedFile {
+                    filename: format!("{id}.csv"),
+                    content_type: "text/csv".to_owned(),
+                    bytes,
+                }));
+            }
+        };
+        result.map_err(|error| format!("invalid history response: {error}"))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BackendState {
     pub update: SnapshotUpdate,
 }
@@ -93,6 +150,13 @@ pub(crate) enum BackendConnectionStatus {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendEvent {
+    History(HistoryEvent),
+    HistoryError(String),
+    HistoryRenamed {
+        id: String,
+        cycle: bool,
+        name: Option<String>,
+    },
     DevicesUpdated(Vec<UsbDeviceInfo>),
     BackendConnectionChanged(BackendConnectionStatus),
     Snapshot(AuthoritativeSnapshot),
@@ -142,7 +206,8 @@ pub(crate) fn remote_api_commands(command: BackendCommand) -> Vec<ApiCommand> {
         BackendCommand::Disconnect => vec![ApiCommand::Disconnect],
         BackendCommand::Api(command) => vec![command],
         BackendCommand::Resume(_) => vec![ApiCommand::Resume],
-        BackendCommand::RefreshDevices
+        BackendCommand::History(_)
+        | BackendCommand::RefreshDevices
         | BackendCommand::StartTest(_)
         | BackendCommand::StartCycle(_)
         | BackendCommand::StartSavedRecipe { .. }

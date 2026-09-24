@@ -295,6 +295,42 @@ pub struct RunSummary {
     pub cycle: Option<CycleRunContext>,
 }
 
+/// Persistent execution metadata. Unknown legacy values remain absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleSummary {
+    pub execution_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub recipe: Option<CycleRecipe>,
+    #[serde(default)]
+    pub saved_recipe: Option<SavedRecipeReference>,
+    #[serde(default)]
+    pub started_at_utc: Option<String>,
+    #[serde(default)]
+    pub state: Option<CycleState>,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub elapsed_milliseconds: Option<u64>,
+    pub sample_count: usize,
+    pub child_run_count: usize,
+}
+
+/// Bounded presentation telemetry; raw CSV remains full resolution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunHistory {
+    pub summary: RunSummary,
+    pub samples: Vec<Sample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CycleHistory {
+    pub summary: CycleSummary,
+    pub samples: Vec<CycleSample>,
+    pub child_runs: Vec<RunSummary>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TestConfiguration {

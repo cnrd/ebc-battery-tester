@@ -26,14 +26,19 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::controller::{
     CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
 };
+mod history;
+#[cfg(test)]
+mod history_tests;
+
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CreateSavedRecipeRequest,
-    CurrentRunMetadata, CycleRecipe, CycleRunContext, CycleSample, CycleState, CycleStatus,
-    DeleteSavedRecipeRequest, RECIPE_EXPORT_FORMAT, RECIPE_EXPORT_VERSION, RecipeExport,
-    RenameRequest, RunSummary, Sample, SavedRecipe, SavedRecipeReference, ServerConnectionState,
-    SnapshotUpdate, StartCycleRequest, StartSavedRecipeRequest, StartTestRequest,
-    TestConfiguration, TestState, UpdateSavedRecipeRequest, WebSocketEvent,
-    cycle_presentation_history, normalize_optional_name, normalize_required_name,
+    CurrentRunMetadata, CycleHistory, CycleRecipe, CycleRunContext, CycleSample, CycleState,
+    CycleStatus, CycleSummary, DeleteSavedRecipeRequest, RECIPE_EXPORT_FORMAT,
+    RECIPE_EXPORT_VERSION, RecipeExport, RenameRequest, RunHistory, RunSummary, Sample,
+    SavedRecipe, SavedRecipeReference, ServerConnectionState, SnapshotUpdate, StartCycleRequest,
+    StartSavedRecipeRequest, StartTestRequest, TestConfiguration, TestState,
+    UpdateSavedRecipeRequest, WebSocketEvent, cycle_presentation_history, normalize_optional_name,
+    normalize_required_name,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
@@ -93,6 +98,9 @@ enum ActorRequest {
     CycleHistoryCsv,
     CycleCsv(String),
     Runs,
+    RunHistory(String),
+    Cycles,
+    CycleHistory(String),
     RunCsv(String),
     Recipes,
     CreateRecipe(CreateSavedRecipeRequest),
@@ -134,6 +142,10 @@ enum ActorResponse {
     ),
     History(Vec<Sample>),
     Runs(Vec<RunSummary>),
+    RunHistory(Result<Option<RunHistory>, String>),
+    Cycles(Result<Vec<CycleSummary>, String>),
+    CycleHistory(Result<Option<CycleHistory>, String>),
+    ArchivedExport(Result<Option<ExportDescriptor>, String>),
     Export(ExportDescriptor),
     Start(Result<AuthoritativeSnapshot, StartError>),
     Rename(Result<AuthoritativeSnapshot, RenameError>),
@@ -202,6 +214,7 @@ struct Persistence {
     current_cycle_id: Option<String>,
     current_cycle_name: Option<String>,
     next_cycle_sequence: u64,
+    raw_cycle_sample_count: usize,
     cycle_writer: Option<BufWriter<File>>,
     last_cycle_sync: Instant,
     recipes_dir: PathBuf,
@@ -238,6 +251,10 @@ struct CycleExecutionMetadata {
     saved_recipe: Option<SavedRecipeReference>,
     #[serde(alias = "started_at")]
     started_at_utc: Option<String>,
+    state: Option<CycleState>,
+    result: Option<String>,
+    elapsed_milliseconds: Option<u64>,
+    sample_count: Option<usize>,
 }
 
 impl Persistence {
@@ -286,6 +303,7 @@ impl Persistence {
             current_cycle_id: None,
             current_cycle_name: None,
             next_cycle_sequence: 0,
+            raw_cycle_sample_count: 0,
             cycle_writer: None,
             last_cycle_sync: Instant::now(),
             recipes_dir,
@@ -407,6 +425,7 @@ impl Persistence {
         self.next_cycle_sequence = cycle_history
             .last()
             .map_or(0, |sample| sample.sequence.saturating_add(1));
+        self.raw_cycle_sample_count = cycle_history.len();
         snapshot.cycle_history = cycle_history;
         Ok(())
     }
@@ -494,12 +513,23 @@ impl Persistence {
         {
             return Ok(None);
         }
-        if let Some(id) = &self.archived_run_id {
-            return Ok(self.runs.iter().find(|run| &run.id == id).cloned());
+        if let Some(id) = &self.archived_run_id
+            && let Some(summary) = self.runs.iter().find(|run| &run.id == id)
+            && (!matches!(
+                snapshot.test.state,
+                TestState::Completed | TestState::Stopped
+            ) || (summary.sample_count == self.raw_sample_count
+                && summary.state == snapshot.test.state
+                && summary.result == snapshot.test.result
+                && summary.elapsed_seconds == snapshot.test.elapsed_seconds))
+        {
+            return Ok(Some(summary.clone()));
         }
 
         self.flush_samples()?;
-        let id = if valid_run_id(&self.current_run_id) {
+        let id = if let Some(id) = &self.archived_run_id {
+            id.clone()
+        } else if valid_run_id(&self.current_run_id) {
             self.current_run_id.clone()
         } else {
             self.next_run_id(snapshot.test.started_at_utc.as_deref())
@@ -552,7 +582,11 @@ impl Persistence {
         fs::rename(&csv_temporary, &csv_path).map_err(|error| error.to_string())?;
         fs::rename(&json_temporary, &json_path).map_err(|error| error.to_string())?;
         sync_directory(&self.runs_dir)?;
-        self.runs.push(summary.clone());
+        if let Some(existing) = self.runs.iter_mut().find(|run| run.id == id) {
+            *existing = summary.clone();
+        } else {
+            self.runs.push(summary.clone());
+        }
         self.runs.sort_by(|left, right| right.id.cmp(&left.id));
         self.archived_run_id = Some(id);
         self.save_metadata(snapshot)?;
@@ -602,16 +636,12 @@ impl Persistence {
                 continue;
             }
             let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-            let summary: RunSummary = match serde_json::from_slice(&bytes) {
-                Ok(summary) => summary,
-                Err(error) => {
-                    log::warn!("ignoring invalid run summary {}: {error}", path.display());
-                    continue;
-                }
-            };
-            if summary.id == id {
-                runs.push(summary);
+            let summary: RunSummary = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid run summary {}: {error}", path.display()))?;
+            if summary.id != id {
+                return Err(format!("run summary id mismatch in {}", path.display()));
             }
+            runs.push(summary);
         }
         runs.sort_by(|left, right| right.id.cmp(&left.id));
         Ok(runs)
@@ -828,6 +858,10 @@ impl Persistence {
             recipe: Some(recipe),
             saved_recipe,
             started_at_utc: Some(started_at_utc),
+            state: Some(CycleState::Preparing),
+            result: None,
+            elapsed_milliseconds: Some(0),
+            sample_count: Some(0),
         };
         if let Err(error) = self.write_cycle_metadata(&metadata) {
             let cleanup = fs::remove_file(&path);
@@ -842,6 +876,7 @@ impl Persistence {
         self.current_cycle_id = Some(execution_id);
         self.current_cycle_name = name;
         self.next_cycle_sequence = 0;
+        self.raw_cycle_sample_count = 0;
         self.last_cycle_sync = Instant::now();
         Ok(())
     }
@@ -870,6 +905,7 @@ impl Persistence {
             self.flush_cycle_samples()?;
         }
         self.next_cycle_sequence = sample.sequence.saturating_add(1);
+        self.raw_cycle_sample_count = self.raw_cycle_sample_count.saturating_add(1);
         Ok(())
     }
 
@@ -919,11 +955,16 @@ impl Persistence {
         if !path.is_file() {
             return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-        let metadata: CycleExecutionMetadata =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let bytes = fs::read(&path).map_err(|error| {
+            format!("could not read cycle metadata {}: {error}", path.display())
+        })?;
+        let metadata: CycleExecutionMetadata = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid cycle metadata {}: {error}", path.display()))?;
         if metadata.execution_id != execution_id {
-            return Err("cycle metadata execution id mismatch".to_owned());
+            return Err(format!(
+                "cycle metadata execution id mismatch in {}",
+                path.display()
+            ));
         }
         Ok(Some(metadata))
     }
@@ -986,10 +1027,14 @@ impl Persistence {
     }
 
     fn load_samples(&self) -> Result<Vec<Sample>, String> {
-        if !self.samples_path.exists() {
+        Self::load_run_samples(&self.samples_path)
+    }
+
+    fn load_run_samples(path: &Path) -> Result<Vec<Sample>, String> {
+        if !path.exists() {
             return Ok(Vec::new());
         }
-        let bytes = fs::read(&self.samples_path).map_err(|error| error.to_string())?;
+        let bytes = fs::read(path).map_err(|error| error.to_string())?;
         let terminated = bytes.last() == Some(&b'\n');
         let text = String::from_utf8(bytes.clone()).map_err(|error| error.to_string())?;
         let mut lines = text.split_terminator('\n');
@@ -1012,12 +1057,12 @@ impl Persistence {
                         .map_or(0, |position| position + 1);
                     let file = OpenOptions::new()
                         .write(true)
-                        .open(&self.samples_path)
+                        .open(path)
                         .map_err(|error| error.to_string())?;
                     file.set_len(u64::try_from(length).map_err(|error| error.to_string())?)
                         .map_err(|error| error.to_string())?;
                     file.sync_all().map_err(|error| error.to_string())?;
-                    sync_parent(&self.samples_path)?;
+                    sync_parent(path)?;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -1026,7 +1071,7 @@ impl Persistence {
         if !terminated && rows.last().is_some_and(|line| parse_sample(line).is_ok()) {
             let mut file = OpenOptions::new()
                 .append(true)
-                .open(&self.samples_path)
+                .open(path)
                 .map_err(|error| error.to_string())?;
             file.write_all(b"\n").map_err(|error| error.to_string())?;
             file.sync_all().map_err(|error| error.to_string())?;
@@ -1515,6 +1560,7 @@ impl DeviceActor {
     ) -> Result<Self, String> {
         let mut persistence = Persistence::new(&config.data_dir)?;
         let mut snapshot = persistence.load()?;
+        persistence.recover_cycle_history(&mut snapshot)?;
         let controller = TestController::from_state(
             ControllerMode::Server,
             snapshot.device.clone(),
@@ -1612,12 +1658,28 @@ impl DeviceActor {
                 .persistence
                 .cycle_export(None)
                 .map(ActorResponse::Export),
-            ActorRequest::CycleCsv(id) => self
-                .persistence
-                .cycle_export(Some(&id))
-                .map(ActorResponse::Export),
+            ActorRequest::CycleCsv(id) => Ok(ActorResponse::ArchivedExport(
+                if self.persistence.cycle_path(&id).is_file() {
+                    self.persistence.cycle_export(Some(&id)).map(Some)
+                } else {
+                    Ok(None)
+                },
+            )),
+            ActorRequest::RunHistory(id) => {
+                Ok(ActorResponse::RunHistory(self.persistence.run_history(&id)))
+            }
+            ActorRequest::Cycles => Ok(ActorResponse::Cycles(self.cycle_summaries())),
+            ActorRequest::CycleHistory(id) => {
+                Ok(ActorResponse::CycleHistory(self.cycle_history(&id)))
+            }
             ActorRequest::Runs => Ok(ActorResponse::Runs(self.persistence.run_summaries())),
-            ActorRequest::RunCsv(id) => self.persistence.run_export(&id).map(ActorResponse::Export),
+            ActorRequest::RunCsv(id) => Ok(ActorResponse::ArchivedExport(
+                if self.persistence.runs.iter().any(|run| run.id == id) {
+                    self.persistence.run_export(&id).map(Some)
+                } else {
+                    Ok(None)
+                },
+            )),
             ActorRequest::Recipes => Ok(ActorResponse::Recipes(self.persistence.saved_recipes())),
             ActorRequest::CreateRecipe(request) => {
                 Ok(ActorResponse::Recipe(self.create_saved_recipe(request)))
@@ -1980,6 +2042,7 @@ impl DeviceActor {
         let previous_cycle_id = self.persistence.current_cycle_id.clone();
         let previous_cycle_name = self.persistence.current_cycle_name.clone();
         let previous_sequence = self.persistence.next_cycle_sequence;
+        let previous_sample_count = self.persistence.raw_cycle_sample_count;
         let started_at = Utc::now().to_rfc3339();
         let execution_id = format!("cycle-{}", started_at.replace([':', '.', '+'], "-"));
         self.persistence
@@ -2011,6 +2074,7 @@ impl DeviceActor {
             self.persistence.current_cycle_id = previous_cycle_id;
             self.persistence.current_cycle_name = previous_cycle_name;
             self.persistence.next_cycle_sequence = previous_sequence;
+            self.persistence.raw_cycle_sample_count = previous_sample_count;
             self.sync_controller_state();
             let csv_cleanup = fs::remove_file(self.persistence.cycle_path(&execution_id));
             let sidecar_cleanup =
@@ -2643,6 +2707,16 @@ impl DeviceActor {
         {
             log::error!("failed to flush inactive samples: {error}");
         }
+        if self.persistence.current_run_cycle.is_none()
+            && !self.persistence.current_run_id.is_empty()
+            && matches!(
+                self.snapshot.test.state,
+                TestState::Completed | TestState::Stopped
+            )
+            && let Err(error) = self.persistence.archive_current(&self.snapshot)
+        {
+            log::error!("failed to archive terminal manual run: {error}");
+        }
         let persistence_result = if !active {
             self.persist_and_publish()
         } else {
@@ -2778,6 +2852,9 @@ impl DeviceActor {
     }
 
     fn sync_controller_state(&mut self) {
+        if let Err(error) = self.persist_cycle_transition() {
+            log::error!("failed to persist cycle history transition: {error}");
+        }
         self.controller.update_elapsed();
         self.snapshot.device = self.controller.device().clone();
         self.snapshot.test = self.controller.test().clone();
@@ -2912,7 +2989,10 @@ fn api_router() -> Router<AppState> {
         .route("/cycle/history.csv", get(get_cycle_history_csv))
         .route("/cycles/{id}/history.csv", get(get_cycle_csv))
         .route("/runs", get(get_runs))
-        .route("/runs/{file}", get(get_run_csv))
+        .route("/runs/{id}", get(history::get_run_history))
+        .route("/runs/{id}/history.csv", get(get_run_csv))
+        .route("/cycles", get(history::get_cycles))
+        .route("/cycles/{id}", get(history::get_cycle_history))
         .route("/recipes", get(get_recipes).post(create_saved_recipe))
         .route("/recipes/import", post(import_saved_recipe))
         .route(
@@ -2921,8 +3001,8 @@ fn api_router() -> Router<AppState> {
         )
         .route("/recipes/{id}/export", get(export_saved_recipe))
         .route("/recipes/{id}/start", post(start_saved_recipe))
-        .route("/runs/{run_id}/name", post(rename_run))
-        .route("/cycles/{execution_id}/name", post(rename_cycle))
+        .route("/runs/{id}/name", post(rename_run))
+        .route("/cycles/{id}/name", post(rename_cycle))
         .route("/connect", post(connect))
         .route("/disconnect", post(disconnect))
         .route("/test/start", post(start_test))
@@ -3054,7 +3134,11 @@ async fn get_cycle_csv(
         return Err(ApiError::bad_request("invalid cycle execution id"));
     }
     match request(&state, ActorRequest::CycleCsv(id)).await? {
-        ActorResponse::Export(export) => export_response(export),
+        ActorResponse::ArchivedExport(Ok(Some(export))) => export_response(export),
+        ActorResponse::ArchivedExport(Ok(None)) => {
+            Err(ApiError::not_found("history CSV not found"))
+        }
+        ActorResponse::ArchivedExport(Err(error)) => Err(ApiError::internal(error)),
         _ => Err(ApiError::internal("unexpected actor response")),
     }
 }
@@ -3217,16 +3301,17 @@ fn recipe_api_error(error: RecipeError) -> ApiError {
 
 async fn get_run_csv(
     State(state): State<AppState>,
-    AxumPath(file): AxumPath<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
-    let id = file
-        .strip_suffix(".csv")
-        .ok_or_else(|| ApiError::bad_request("archived run path must end in .csv"))?;
-    if !valid_run_id(id) {
+    if !valid_run_id(&id) {
         return Err(ApiError::bad_request("invalid run id"));
     }
-    match request(&state, ActorRequest::RunCsv(id.to_owned())).await? {
-        ActorResponse::Export(export) => export_response(export),
+    match request(&state, ActorRequest::RunCsv(id)).await? {
+        ActorResponse::ArchivedExport(Ok(Some(export))) => export_response(export),
+        ActorResponse::ArchivedExport(Ok(None)) => {
+            Err(ApiError::not_found("history CSV not found"))
+        }
+        ActorResponse::ArchivedExport(Err(error)) => Err(ApiError::internal(error)),
         _ => Err(ApiError::internal("unexpected actor response")),
     }
 }
@@ -3696,7 +3781,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    fn mock_actor(name: &str) -> (DeviceActor, PathBuf) {
+    pub(super) fn mock_actor(name: &str) -> (DeviceActor, PathBuf) {
         let directory = temporary_directory(name);
         let (snapshot_tx, _) = broadcast::channel(16);
         let config = ServerConfig {
@@ -3723,7 +3808,7 @@ mod tests {
         receiver.blocking_recv().expect("actor returns response")
     }
 
-    fn read_export(mut export: ExportDescriptor) -> String {
+    pub(super) fn read_export(mut export: ExportDescriptor) -> String {
         let mut contents = String::new();
         (&mut export.file)
             .take(export.length)
@@ -3732,7 +3817,7 @@ mod tests {
         contents
     }
 
-    fn test_config() -> TestConfiguration {
+    pub(super) fn test_config() -> TestConfiguration {
         TestConfiguration::DischargeConstantCurrent {
             current_ma: 1000,
             cutoff_voltage_mv: 3000,
@@ -3740,14 +3825,14 @@ mod tests {
         }
     }
 
-    fn device_step() -> crate::core::CycleStep {
+    pub(super) fn device_step() -> crate::core::CycleStep {
         crate::core::CycleStep::Device {
             config: test_config(),
             completion: crate::core::CycleStepCompletion::Hardware,
         }
     }
 
-    fn cycle_recipe(
+    pub(super) fn cycle_recipe(
         steps: Vec<crate::core::CycleStep>,
         repeat_count: u32,
     ) -> crate::core::CycleRecipe {
@@ -3757,7 +3842,7 @@ mod tests {
         }
     }
 
-    fn unnamed_cycle(recipe: crate::core::CycleRecipe) -> StartCycleRequest {
+    pub(super) fn unnamed_cycle(recipe: crate::core::CycleRecipe) -> StartCycleRequest {
         StartCycleRequest { recipe, name: None }
     }
 
@@ -3773,7 +3858,7 @@ mod tests {
         }
     }
 
-    fn confirm_inactive(actor: &mut DeviceActor) {
+    pub(super) fn confirm_inactive(actor: &mut DeviceActor) {
         actor.snapshot.connection = ServerConnectionState::Connected;
         actor.controller.connection_established();
         actor.record_report(
@@ -3792,7 +3877,7 @@ mod tests {
         actor.write_failure = Some("injected serial write failure".to_owned());
     }
 
-    fn confirm_running(actor: &mut DeviceActor) {
+    pub(super) fn confirm_running(actor: &mut DeviceActor) {
         actor
             .start_test(test_config(), None, None)
             .expect("start test");
@@ -3814,7 +3899,7 @@ mod tests {
         assert!(!actor.snapshot.device.activity_known);
     }
 
-    fn numbered_sample(sequence: u64, voltage_mv: u16, current_ma: u16) -> Sample {
+    pub(super) fn numbered_sample(sequence: u64, voltage_mv: u16, current_ma: u16) -> Sample {
         Sample {
             run_id: "run-1".to_owned(),
             sequence,
@@ -3828,7 +3913,7 @@ mod tests {
         }
     }
 
-    fn numbered_cycle_sample(execution_id: &str, sequence: u64) -> CycleSample {
+    pub(super) fn numbered_cycle_sample(execution_id: &str, sequence: u64) -> CycleSample {
         CycleSample {
             execution_id: execution_id.to_owned(),
             sequence,

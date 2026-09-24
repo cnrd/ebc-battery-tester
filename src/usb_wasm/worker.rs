@@ -187,7 +187,8 @@ pub(super) async fn local_backend_task(
                             &event_tx,
                         ).await;
                     }
-                    BackendCommand::StartSavedRecipe { .. }
+                    BackendCommand::History(_)
+                    | BackendCommand::StartSavedRecipe { .. }
                     | BackendCommand::RefreshRecipes
                     | BackendCommand::CreateSavedRecipe(_)
                     | BackendCommand::UpdateSavedRecipe { .. }

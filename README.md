@@ -127,23 +127,82 @@ The server accepts these environment variables:
 
 Persist `/data`. `session.json` stores the current device/test metadata,
 including the current run name, and `samples.csv` stores current-run
-measurements. Before a fresh test replaces a
-meaningful current run, the server archives its metadata and CSV under
+measurements. Manual runs are archived as soon as a device report confirms
+Completed or Stopped, while their current graph and immutable run ID remain
+available. Continue resumes that same run; its next terminal report updates the
+same archive. Cycle children are archived when the next physical run begins,
+and the final child is archived when the cycle completes. Archives live under
 `/data/runs/<run-id>.json` and `/data/runs/<run-id>.csv`. Run IDs are sanitized
 UTC start timestamps with collision suffixes. `GET /api/runs` lists archived
-runs and `GET /api/runs/<run-id>.csv` downloads one archive. Current history
+runs and `GET /api/runs/<run-id>/history.csv` downloads one archive. Current history
 remains available from `GET /api/history.csv`.
 
 Cycle executions also retain an independent continuous telemetry stream under
 `/data/cycles/<execution-id>.csv`; `/data/cycles/<execution-id>.json` is its
 metadata sidecar and stores the execution ID/name, actual recipe snapshot,
-optional saved-recipe provenance, and start timestamp. Saved templates are
+optional saved-recipe provenance, start timestamp, and optional state, result,
+elapsed milliseconds, and full-resolution sample count. Summary metadata is
+written at Start and meaningful state transitions, including terminal states,
+not for each device report. Terminal durations remain fixed. Restart recovery
+marks nonterminal executions Interrupted with a restart reason and durable
+telemetry count; it never resumes them. Saved templates are
 stored independently under `/data/recipes/<recipe-id>.json`; no recipe CSVs are
 created. The telemetry includes
 normal mode reports from device steps, settling, rests, and repeat boundaries
 without changing the per-run sample files or metrics. The latest cycle is
 exported by `GET /api/cycle/history.csv`; a specific execution is exported by
 `GET /api/cycles/<execution-id>/history.csv`.
+
+The remote GUI's **History** window has **Cycles** and **Manual runs** views,
+a case-insensitive name/ID filter (also matching saved-recipe names), and a
+manual **Refresh** control. Lists load on demand and remain usable while the
+physical tester is disconnected or in error. Server connectivity is required.
+Manual runs exclude cycle children; children appear inside their parent cycle,
+ordered by repeat, step, then immutable run ID. Each child can be opened and
+exported independently. Manual and cycle execution names can be edited or
+cleared; cycle children remain unnamed and cannot be renamed.
+
+Run detail shows configuration, result, duration, capacity/energy, device
+identity, sample count, and voltage/current plots. Cycle detail includes the
+complete read-only recipe snapshot, saved-recipe ID/name/revision, whole-cycle
+plots, and child summaries. Historical telemetry has separate transient client
+state; browsing never replaces live telemetry or changes physical execution.
+Neither server history nor downloaded telemetry is serialized into GUI storage.
+Direct/native/WebUSB mode retains live telemetry and explains that persistent
+history requires a Remote connection to the server.
+
+`GET /api/runs` returns the existing `Vec<RunSummary>` physical-run resource,
+including cycle children. `GET /api/runs/{id}` returns
+`RunHistory { summary: RunSummary, samples: Vec<Sample> }`.
+`GET /api/cycles` returns `Vec<CycleSummary>`; `GET /api/cycles/{id}` returns
+`CycleHistory { summary: CycleSummary, samples: Vec<CycleSample>, child_runs: Vec<RunSummary> }`.
+Both detail sample arrays use the established 5000-point presentation limit,
+including first/last samples and bucket extrema. Raw CSV export retains every
+sample and uses `<immutable-id>.csv` filenames (native save dialog or browser
+download); server paths are never exposed. These resource routes replace the
+obsolete WIP `/api/runs/{id}.csv` route without a compatibility alias.
+
+`CycleSummary` has `execution_id: String`, `name: Option<String>`,
+`recipe: Option<CycleRecipe>`, `saved_recipe: Option<SavedRecipeReference>`,
+`started_at_utc: Option<String>`, `state: Option<CycleState>`,
+`result: Option<String>`, `elapsed_milliseconds: Option<u64>`,
+`sample_count: usize`, and `child_run_count: usize`. Optional fields deserialize
+with defaults. Sidecars add optional/defaulted `state`, `result`,
+`elapsed_milliseconds`, and `sample_count`; old files require no migration.
+Cycle lists are newest-first by known start timestamp, then execution ID;
+unknown timestamps sort last with deterministic ID ordering. Physical run lists
+retain their existing descending ID order. Current executing cycles use live
+authoritative status and monotonic elapsed time; terminal cycles use saved
+elapsed time or the last telemetry sample.
+
+Legacy cycle CSV files without a sidecar remain browsable, as do older minimal
+sidecars. Counts and fallback elapsed time come from telemetry; unknown recipe,
+provenance, start time, and terminal state remain unknown. Malformed metadata,
+ID mismatches, and corrupt complete CSV rows produce errors. Reads and renames
+do not regenerate telemetry or renumber samples; only the existing repair of
+an incomplete final CSV row may modify a file during loading. Lists, detail
+loads, renames, and exports emit no physical device commands. History deletion,
+pagination, comparison, and further graph analysis are outside this browser.
 
 The durable CSV retains the complete current run. Initial browser snapshots
 are limited to 5000 presentation samples, and the browser remains bounded to
@@ -423,7 +482,10 @@ All endpoints are under `/api`:
 | `GET` | `/api/history` | Measurement history as JSON |
 | `GET` | `/api/history.csv` | Measurement history as CSV |
 | `GET` | `/api/runs` | Archived run summaries |
-| `GET` | `/api/runs/{id}.csv` | Archived run CSV download |
+| `GET` | `/api/runs/{id}` | Run summary and bounded presentation samples |
+| `GET` | `/api/runs/{id}/history.csv` | Full-resolution archived run CSV |
+| `GET` | `/api/cycles` | Execution summaries, including the current cycle |
+| `GET` | `/api/cycles/{id}` | Cycle summary, bounded samples, and child run summaries |
 | `GET` | `/api/cycle/history.csv` | Current/latest full-resolution cycle telemetry |
 | `GET` | `/api/cycles/{id}/history.csv` | Cycle telemetry by execution ID |
 | `GET` | `/api/ws` | Snapshot/sample/cycle-sample WebSocket stream |

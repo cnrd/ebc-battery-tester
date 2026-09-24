@@ -54,6 +54,8 @@ pub struct MainApp {
     #[serde(skip)]
     log_window: ui::log_window::LogWindow,
     #[serde(skip)]
+    history_window: ui::history_window::HistoryWindow,
+    #[serde(skip)]
     about_window: ui::about_window::AboutWindow,
 }
 
@@ -146,6 +148,10 @@ impl eframe::App for MainApp {
                     self.calibrate_window.open = true;
                 }
                 ui.separator();
+                if ui.button("History").clicked() {
+                    self.history_window.open(&mut self.session);
+                }
+                ui.separator();
                 if ui.button("Log").clicked() {
                     self.log_window.open = !self.log_window.open;
                 }
@@ -182,6 +188,7 @@ impl eframe::App for MainApp {
         self.about_window.ui(ui);
         self.calibrate_window.ui(&mut self.session, ui);
         self.log_window.ui(&mut self.session, ui);
+        self.history_window.ui(&mut self.session, ui);
 
         if is_mobile_layout(ui.available_width()) {
             egui::ScrollArea::vertical().show(ui, |ui| {

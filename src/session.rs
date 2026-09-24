@@ -1,3 +1,5 @@
+mod history;
+
 use std::collections::BTreeSet;
 
 use crate::backend::{
@@ -116,6 +118,7 @@ pub(crate) struct DeviceSession {
     pub(crate) live_current_ma: u16,
     pub(crate) live_milli_ampere_hours: u64,
     pub(crate) live_energy_wh: f64,
+    pub(crate) history: history::HistoryState,
     pub(crate) samples: Vec<Sample>,
     pub(crate) cycle_samples: Vec<CycleSample>,
     pub(crate) current_device_mode: Option<device::DeviceMode>,
@@ -152,6 +155,7 @@ impl Default for DeviceSession {
             live_current_ma: 0,
             live_milli_ampere_hours: 0,
             live_energy_wh: 0.0,
+            history: history::HistoryState::default(),
             samples: Vec::new(),
             cycle_samples: Vec::new(),
             current_device_mode: None,
@@ -405,8 +409,7 @@ impl DeviceSession {
             self.command_error = Some("there is no current run to rename".to_owned());
             return;
         };
-        self.backend
-            .command(BackendCommand::RenameRun { run_id, request });
+        self.rename_run(run_id, request);
     }
 
     pub(crate) fn rename_current_cycle(&mut self, request: RenameRequest) {
@@ -417,10 +420,7 @@ impl DeviceSession {
             self.command_error = Some("there is no current cycle to rename".to_owned());
             return;
         };
-        self.backend.command(BackendCommand::RenameCycle {
-            execution_id,
-            request,
-        });
+        self.rename_cycle(execution_id, request);
     }
 
     fn remote_command_available(&mut self, description: &str) -> bool {
@@ -619,6 +619,14 @@ impl DeviceSession {
     pub(crate) fn consume_events(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.backend.try_event() {
             match event {
+                BackendEvent::History(event) => self.history.apply(event),
+                BackendEvent::HistoryError(error) => {
+                    self.history.pending_requests = self.history.pending_requests.saturating_sub(1);
+                    self.history.error = Some(error);
+                }
+                BackendEvent::HistoryRenamed { id, cycle, name } => {
+                    self.history.renamed(&id, cycle, name);
+                }
                 BackendEvent::DevicesUpdated(devices) => {
                     self.available_devices = devices;
                     if self.available_devices.len() == 1 {
@@ -630,7 +638,16 @@ impl DeviceSession {
                         self.selected_device_index = None;
                     }
                 }
-                BackendEvent::BackendConnectionChanged(status) => self.remote_status = status,
+                BackendEvent::BackendConnectionChanged(status) => {
+                    if status != BackendConnectionStatus::Connected
+                        && self.history.pending_requests > 0
+                    {
+                        self.history.pending_requests = 0;
+                        self.history.error =
+                            Some("Server disconnected. Reconnect and refresh history.".to_owned());
+                    }
+                    self.remote_status = status;
+                }
                 BackendEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
                 BackendEvent::Update(state) => self.apply_state(state),
                 BackendEvent::Sample(sample) => self.apply_sample(sample),

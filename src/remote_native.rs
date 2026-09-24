@@ -235,6 +235,14 @@ fn send_backend_command(
     event_tx: &BackendEventSender,
 ) {
     match &command {
+        BackendCommand::History(request) => {
+            let result = fetch_history(request, urls, agent);
+            event_tx.send(match result {
+                Ok(event) => BackendEvent::History(event),
+                Err(error) => BackendEvent::HistoryError(error),
+            });
+            return;
+        }
         BackendCommand::StartTest(request) => {
             event_tx.send(BackendEvent::Diagnostic(DiagnosticEvent {
                 direction: DiagnosticDirection::Out,
@@ -361,6 +369,14 @@ fn send_backend_command(
                 request,
                 agent,
             );
+            if result.is_ok() {
+                event_tx.send(BackendEvent::HistoryRenamed {
+                    id: run_id.clone(),
+                    cycle: false,
+                    name: crate::core::normalize_optional_name(request.name.as_deref())
+                        .unwrap_or_default(),
+                });
+            }
             publish_command_result(result, event_tx);
             return;
         }
@@ -373,6 +389,14 @@ fn send_backend_command(
                 request,
                 agent,
             );
+            if result.is_ok() {
+                event_tx.send(BackendEvent::HistoryRenamed {
+                    id: execution_id.clone(),
+                    cycle: true,
+                    name: crate::core::normalize_optional_name(request.name.as_deref())
+                        .unwrap_or_default(),
+                });
+            }
             publish_command_result(result, event_tx);
             return;
         }
@@ -414,6 +438,24 @@ fn send_backend_command(
             }
         }
     }
+}
+
+fn fetch_history(
+    request: &crate::backend::HistoryRequest,
+    urls: &RemoteUrls,
+    agent: &ureq::Agent,
+) -> Result<crate::backend::HistoryEvent, String> {
+    use std::io::Read as _;
+    let response = agent
+        .get(&format!("{}{}", urls.base, request.path()))
+        .call()
+        .map_err(format_http_error)?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    request.decode(bytes)
 }
 
 fn publish_command_result(
@@ -972,5 +1014,107 @@ mod tests {
         assert!(command_tx.unbounded_send(BackendCommand::Shutdown).is_ok());
         assert!(worker.join().is_ok(), "remote worker panicked");
         assert!(server.join().is_ok(), "test server panicked");
+    }
+    #[test]
+    fn history_transport_reads_canonical_routes_without_mutation_headers_and_decodes_responses() {
+        use crate::backend::{HistoryEvent, HistoryRequest};
+        let run = serde_json::json!({"id":"run-1", "archived_at_utc":"now", "state":"completed", "elapsed_seconds":1, "sample_count":0});
+        let cycle =
+            serde_json::json!({"execution_id":"cycle-1", "sample_count":0, "child_run_count":0});
+        let cases = [
+            (
+                HistoryRequest::RefreshRuns,
+                "/api/runs",
+                serde_json::to_vec(&vec![run.clone()]).expect("runs"),
+            ),
+            (
+                HistoryRequest::LoadRun("run-1".to_owned()),
+                "/api/runs/run-1",
+                serde_json::to_vec(&serde_json::json!({"summary":run,"samples":[]})).expect("run"),
+            ),
+            (
+                HistoryRequest::ExportRunCsv("run-1".to_owned()),
+                "/api/runs/run-1/history.csv",
+                b"original,run,csv\n".to_vec(),
+            ),
+            (
+                HistoryRequest::RefreshCycles,
+                "/api/cycles",
+                serde_json::to_vec(&vec![cycle.clone()]).expect("cycles"),
+            ),
+            (
+                HistoryRequest::LoadCycle("cycle-1".to_owned()),
+                "/api/cycles/cycle-1",
+                serde_json::to_vec(
+                    &serde_json::json!({"summary":cycle,"samples":[],"child_runs":[]}),
+                )
+                .expect("cycle"),
+            ),
+            (
+                HistoryRequest::ExportCycleCsv("cycle-1".to_owned()),
+                "/api/cycles/cycle-1/history.csv",
+                b"original,cycle,csv\n".to_vec(),
+            ),
+        ];
+        for (request, path, body) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("mock HTTP listener");
+            let address = listener.local_addr().expect("address");
+            let original = body.clone();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept GET");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).expect("read GET");
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("headers");
+                stream.write_all(&body).expect("response body");
+                String::from_utf8(request).expect("request text")
+            });
+            let urls = RemoteUrls::parse(&format!("http://{address}")).expect("URLs");
+            let (tx, mut rx) = mpsc::unbounded();
+            let sender = BackendEventSender::new(tx, || {});
+            send_backend_command(
+                BackendCommand::History(request),
+                &urls,
+                &ureq::agent(),
+                &sender,
+            );
+            let event = rx.try_recv().expect("history event");
+            match event {
+                BackendEvent::History(HistoryEvent::Runs(runs)) => assert_eq!(runs[0].id, "run-1"),
+                BackendEvent::History(HistoryEvent::RunLoaded(history)) => {
+                    assert_eq!(history.summary.id, "run-1");
+                }
+                BackendEvent::History(HistoryEvent::Cycles(cycles)) => {
+                    assert_eq!(cycles[0].execution_id, "cycle-1");
+                }
+                BackendEvent::History(HistoryEvent::CycleLoaded(history)) => {
+                    assert_eq!(history.summary.execution_id, "cycle-1");
+                }
+                BackendEvent::History(HistoryEvent::FileExported(file)) => {
+                    assert_eq!(file.bytes, original);
+                    assert!(matches!(
+                        file.filename.as_str(),
+                        "run-1.csv" | "cycle-1.csv"
+                    ));
+                    assert_eq!(file.content_type, "text/csv");
+                }
+                other => panic!("unexpected history response: {other:?}"),
+            }
+            let raw_request = worker.join().expect("HTTP worker");
+            assert!(raw_request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+            assert!(!raw_request.to_lowercase().contains("x-ebc-command"));
+        }
     }
 }

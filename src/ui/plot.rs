@@ -1,3 +1,4 @@
+use crate::core::{CycleSample, Sample};
 use crate::session::DeviceSession;
 use crate::ui::format_duration;
 use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoint, VPlacement};
@@ -19,15 +20,18 @@ pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
     }
 
     if show_cycle {
-        cycle_plot(session, ui);
+        cycle_samples_plot("cycle_data_plot", &session.cycle_samples, ui);
     } else {
-        physical_plot(session, ui);
+        physical_samples_plot("live_data_plot", &session.samples, ui);
     }
 }
 
-fn physical_plot(session: &DeviceSession, ui: &mut egui::Ui) {
-    let voltage_points: Vec<[f64; 2]> = session
-        .samples
+pub(crate) fn physical_samples_plot(
+    id: impl std::hash::Hash,
+    samples: &[Sample],
+    ui: &mut egui::Ui,
+) {
+    let voltage_points: Vec<[f64; 2]> = samples
         .iter()
         .map(|sample| {
             [
@@ -36,8 +40,7 @@ fn physical_plot(session: &DeviceSession, ui: &mut egui::Ui) {
             ]
         })
         .collect();
-    let current_points: Vec<[f64; 2]> = session
-        .samples
+    let current_points: Vec<[f64; 2]> = samples
         .iter()
         .map(|sample| {
             [
@@ -47,7 +50,7 @@ fn physical_plot(session: &DeviceSession, ui: &mut egui::Ui) {
         })
         .collect();
     let label_formatter = |_name: &str, point: &PlotPoint| {
-        let sample = session.samples.iter().min_by(|left, right| {
+        let sample = samples.iter().min_by(|left, right| {
             (left.elapsed_seconds as f64 - point.x)
                 .abs()
                 .total_cmp(&(right.elapsed_seconds as f64 - point.x).abs())
@@ -64,18 +67,15 @@ fn physical_plot(session: &DeviceSession, ui: &mut egui::Ui) {
             },
         )
     };
-    show_plot(
-        "live_data_plot",
-        voltage_points,
-        current_points,
-        label_formatter,
-        ui,
-    );
+    show_plot(id, voltage_points, current_points, label_formatter, ui);
 }
 
-fn cycle_plot(session: &DeviceSession, ui: &mut egui::Ui) {
-    let voltage_points: Vec<[f64; 2]> = session
-        .cycle_samples
+pub(crate) fn cycle_samples_plot(
+    id: impl std::hash::Hash,
+    samples: &[CycleSample],
+    ui: &mut egui::Ui,
+) {
+    let voltage_points: Vec<[f64; 2]> = samples
         .iter()
         .map(|sample| {
             [
@@ -84,8 +84,7 @@ fn cycle_plot(session: &DeviceSession, ui: &mut egui::Ui) {
             ]
         })
         .collect();
-    let current_points: Vec<[f64; 2]> = session
-        .cycle_samples
+    let current_points: Vec<[f64; 2]> = samples
         .iter()
         .map(|sample| {
             [
@@ -95,7 +94,7 @@ fn cycle_plot(session: &DeviceSession, ui: &mut egui::Ui) {
         })
         .collect();
     let label_formatter = |_name: &str, point: &PlotPoint| {
-        let sample = session.cycle_samples.iter().min_by(|left, right| {
+        let sample = samples.iter().min_by(|left, right| {
             (left.elapsed_milliseconds as f64 / 1000.0 - point.x)
                 .abs()
                 .total_cmp(&(right.elapsed_milliseconds as f64 / 1000.0 - point.x).abs())
@@ -116,17 +115,11 @@ fn cycle_plot(session: &DeviceSession, ui: &mut egui::Ui) {
             },
         )
     };
-    show_plot(
-        "cycle_data_plot",
-        voltage_points,
-        current_points,
-        label_formatter,
-        ui,
-    );
+    show_plot(id, voltage_points, current_points, label_formatter, ui);
 }
 
 fn show_plot(
-    id: &'static str,
+    id: impl std::hash::Hash,
     voltage_points: Vec<[f64; 2]>,
     current_points: Vec<[f64; 2]>,
     label_formatter: impl Fn(&str, &PlotPoint) -> String,

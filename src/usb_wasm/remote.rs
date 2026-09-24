@@ -91,6 +91,14 @@ pub(super) async fn remote_task(
                                 continue;
                             }
                             match &command {
+                                BackendCommand::History(request) => {
+                                    let result = fetch_history(request).await;
+                                    event_tx.send(match result {
+                                        Ok(event) => BackendEvent::History(event),
+                                        Err(error) => BackendEvent::HistoryError(error),
+                                    });
+                                    continue;
+                                }
                                 BackendCommand::StartTest(request) => {
                                     publish_cycle_result(
                                         send_json("/api/test/start", request).await,
@@ -192,19 +200,16 @@ pub(super) async fn remote_task(
                                     continue;
                                 }
                                 BackendCommand::RenameRun { run_id, request } => {
-                                    publish_cycle_result(
+                                    publish_rename_result(
                                         send_json(&format!("/api/runs/{run_id}/name"), request).await,
-                                        &event_tx,
+                                        run_id, false, request, &event_tx,
                                     );
                                     continue;
                                 }
                                 BackendCommand::RenameCycle { execution_id, request } => {
-                                    publish_cycle_result(
-                                        send_json(
-                                            &format!("/api/cycles/{execution_id}/name"),
-                                            request,
-                                        ).await,
-                                        &event_tx,
+                                    publish_rename_result(
+                                        send_json(&format!("/api/cycles/{execution_id}/name"), request).await,
+                                        execution_id, true, request, &event_tx,
                                     );
                                     continue;
                                 }
@@ -438,4 +443,38 @@ async fn send_command(command: ApiCommand) -> Result<AuthoritativeSnapshot, Stri
         return Err(format!("HTTP {status}: {body}"));
     }
     response.json().await.map_err(|error| error.to_string())
+}
+
+async fn fetch_history(
+    request: &crate::backend::HistoryRequest,
+) -> Result<crate::backend::HistoryEvent, String> {
+    let response = Request::get(&request.path())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.ok() {
+        return Err(format!(
+            "history request failed: HTTP {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+    request.decode(response.binary().await.map_err(|error| error.to_string())?)
+}
+
+fn publish_rename_result(
+    result: Result<AuthoritativeSnapshot, String>,
+    id: &str,
+    cycle: bool,
+    request: &crate::core::RenameRequest,
+    event_tx: &BackendEventSender,
+) {
+    if result.is_ok() {
+        event_tx.send(BackendEvent::HistoryRenamed {
+            id: id.to_owned(),
+            cycle,
+            name: crate::core::normalize_optional_name(request.name.as_deref()).unwrap_or_default(),
+        });
+    }
+    publish_cycle_result(result, event_tx);
 }

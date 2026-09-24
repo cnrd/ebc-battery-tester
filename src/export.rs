@@ -192,6 +192,55 @@ pub fn save_log_to_file(entries: &[LogEntry]) {
     web_sys::Url::revoke_object_url(&url).ok();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn save_downloaded_file(file: &crate::backend::DownloadedFile) -> Result<(), String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter(&file.content_type, &["csv"])
+        .set_file_name(&file.filename)
+        .save_file()
+    else {
+        return Ok(());
+    };
+    std::fs::write(&path, &file.bytes)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn save_downloaded_file(file: &crate::backend::DownloadedFile) -> Result<(), String> {
+    use wasm_bindgen::JsCast as _;
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| "browser document is unavailable".to_owned())?;
+    let parts = js_sys::Array::new();
+    parts.push(&js_sys::Uint8Array::from(file.bytes.as_slice()));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(&file.content_type);
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options)
+        .map_err(|_error| "could not create CSV download".to_owned())?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|_error| "could not create CSV download URL".to_owned())?;
+    let anchor: web_sys::HtmlAnchorElement = document
+        .create_element("a")
+        .map_err(|_error| "could not create download link".to_owned())?
+        .unchecked_into();
+    anchor.set_href(&url);
+    anchor.set_download(&file.filename);
+    let body = document
+        .body()
+        .ok_or_else(|| "browser document body is unavailable".to_owned())?;
+    body.append_child(&anchor)
+        .map_err(|_error| "could not attach download link".to_owned())?;
+    anchor.click();
+    anchor.remove();
+    // Browsers may consume the blob after click returns. Keep it alive until
+    // the download has had time to start, then release its backing memory.
+    wasm_bindgen_futures::spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(10_000).await;
+        let _released = web_sys::Url::revoke_object_url(&url);
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

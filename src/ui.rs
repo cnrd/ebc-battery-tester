@@ -1,6 +1,7 @@
 pub(crate) mod about_window;
 pub(crate) mod calibrate_window;
 pub(crate) mod control_panel;
+pub(crate) mod history_window;
 pub(crate) mod live_data;
 pub(crate) mod log_window;
 pub(crate) mod plot;

@@ -159,7 +159,8 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                     );
                 }
                 Ok(
-                    BackendCommand::StartSavedRecipe { .. }
+                    BackendCommand::History(_)
+                    | BackendCommand::StartSavedRecipe { .. }
                     | BackendCommand::RefreshRecipes
                     | BackendCommand::CreateSavedRecipe(_)
                     | BackendCommand::UpdateSavedRecipe { .. }
