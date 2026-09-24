@@ -13,7 +13,7 @@ use crate::core::{
     CycleRecipe, CycleSample, CycleState, CycleStatus, DeleteSavedRecipeRequest, RecipeExport,
     RenameRequest, Sample, SavedRecipe, SavedRecipeReference, ServerConnectionState,
     StartCycleRequest, StartSavedRecipeRequest, StartTestRequest, TestConfiguration, TestState,
-    UpdateSavedRecipeRequest, cycle_presentation_history,
+    UpdateSavedRecipeRequest, cycle_presentation_history, power_microwatts,
 };
 use crate::device::{self, ConnectionStatus};
 use crate::export::{LogDirection, LogEntry};
@@ -57,7 +57,7 @@ fn compact_samples(samples: &mut Vec<Sample>, limit: usize) {
         samples.extend(last);
         return;
     }
-    let bucket_count = (limit - 2) / 4;
+    let bucket_count = (limit - 2) / 6;
     if bucket_count == 0 {
         let Some(last) = samples.pop() else {
             return;
@@ -95,7 +95,23 @@ fn compact_samples(samples: &mut Vec<Sample>, limit: usize) {
         );
         selected.insert(
             indices
+                .clone()
                 .max_by_key(|index| samples[*index].current_ma)
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .clone()
+                .min_by_key(|index| {
+                    power_microwatts(samples[*index].voltage_mv, samples[*index].current_ma)
+                })
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .max_by_key(|index| {
+                    power_microwatts(samples[*index].voltage_mv, samples[*index].current_ma)
+                })
                 .unwrap_or(start),
         );
     }
@@ -122,6 +138,8 @@ pub(crate) struct DeviceSession {
     pub(crate) samples: Vec<Sample>,
     pub(crate) cycle_samples: Vec<CycleSample>,
     pub(crate) current_device_mode: Option<device::DeviceMode>,
+    /// Snapshot metadata for plotting only; physical state stays backend-owned.
+    pub(crate) current_test_config: Option<TestConfiguration>,
     pub(crate) activity_known: bool,
     pub(crate) mode_on: bool,
     pub(crate) test_state: TestState,
@@ -159,6 +177,7 @@ impl Default for DeviceSession {
             samples: Vec::new(),
             cycle_samples: Vec::new(),
             current_device_mode: None,
+            current_test_config: None,
             activity_known: false,
             mode_on: false,
             test_state: TestState::Idle,
@@ -548,6 +567,7 @@ impl DeviceSession {
             .unwrap_or(0);
         self.live_energy_wh = update.test.energy_wh;
         self.current_device_mode = update.device.mode;
+        self.current_test_config = update.test.config;
         self.activity_known = update.device.activity_known;
         self.mode_on = update.device.active;
         self.test_state = update.test.state;
@@ -906,6 +926,27 @@ mod tests {
                 .iter()
                 .any(|sample| sample.voltage_mv == u16::MAX)
         );
+    }
+
+    #[test]
+    fn physical_compaction_preserves_distinct_power_peak() {
+        let mut samples: Vec<_> = (0..12)
+            .map(|sequence| sample("run", sequence, sequence))
+            .collect();
+        samples[2].voltage_mv = 9_000;
+        samples[2].current_ma = 100;
+        samples[3].voltage_mv = 5_000;
+        samples[3].current_ma = 5_000;
+        samples[4].voltage_mv = 100;
+        samples[4].current_ma = 9_000;
+
+        compact_samples(&mut samples, 8);
+        let sequences: Vec<_> = samples.iter().map(|sample| sample.sequence).collect();
+        assert!(samples.len() <= 8);
+        assert_eq!(sequences.first(), Some(&0));
+        assert_eq!(sequences.last(), Some(&11));
+        assert!(sequences.contains(&3));
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

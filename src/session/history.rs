@@ -3,12 +3,16 @@
 use super::DeviceSession;
 use crate::backend::{BackendCommand, DownloadedFile, HistoryEvent, HistoryRequest};
 use crate::core::{CycleHistory, CycleSummary, RenameRequest, RunHistory, RunSummary};
+use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub(crate) struct HistoryState {
     pub runs: Vec<RunSummary>,
     pub cycles: Vec<CycleSummary>,
     pub loaded_run: Option<RunHistory>,
+    /// Bounded histories for the transient comparison; keyed by immutable run ID.
+    pub comparison_cache: BTreeMap<String, RunHistory>,
+    pub comparison_ids: Vec<String>,
     pub loaded_cycle: Option<CycleHistory>,
     pub selected_run: Option<String>,
     pub selected_cycle: Option<String>,
@@ -25,7 +29,11 @@ impl HistoryState {
             HistoryEvent::Cycles(cycles) => self.cycles = cycles,
             HistoryEvent::RunLoaded(history) => {
                 if self.selected_run.as_deref() == Some(history.summary.id.as_str()) {
-                    self.loaded_run = Some(history);
+                    self.loaded_run = Some(history.clone());
+                }
+                if self.comparison_ids.contains(&history.summary.id) {
+                    self.comparison_cache
+                        .insert(history.summary.id.clone(), history);
                 }
             }
             HistoryEvent::CycleLoaded(history) => {
@@ -47,7 +55,7 @@ impl HistoryState {
             if let Some(history) = &mut self.loaded_cycle
                 && history.summary.execution_id == id
             {
-                history.summary.name = name;
+                history.summary.name = name.clone();
             }
         } else {
             for summary in &mut self.runs {
@@ -58,6 +66,9 @@ impl HistoryState {
             if let Some(history) = &mut self.loaded_run
                 && history.summary.id == id
             {
+                history.summary.name = name.clone();
+            }
+            if let Some(history) = self.comparison_cache.get_mut(id) {
                 history.summary.name = name;
             }
         }
@@ -65,6 +76,49 @@ impl HistoryState {
 }
 
 impl DeviceSession {
+    pub(crate) fn add_comparison_run(&mut self, id: &str) -> bool {
+        if self
+            .history
+            .comparison_ids
+            .iter()
+            .any(|selected| selected == id)
+        {
+            return false;
+        }
+        if self.history.comparison_ids.len() == 4 {
+            return false;
+        }
+        self.history.comparison_ids.push(id.to_owned());
+        if let Some(history) = self
+            .history
+            .loaded_run
+            .as_ref()
+            .filter(|h| h.summary.id == id)
+        {
+            self.history
+                .comparison_cache
+                .insert(id.to_owned(), history.clone());
+        } else {
+            self.comparison_request_run(id.to_owned());
+        }
+        true
+    }
+
+    pub(crate) fn remove_comparison_run(&mut self, id: &str) {
+        self.history
+            .comparison_ids
+            .retain(|selected| selected != id);
+        self.history.comparison_cache.remove(id);
+    }
+
+    fn comparison_request_run(&mut self, id: String) {
+        if self.remote_command_available("history") {
+            self.history.pending_requests += 1;
+            self.backend
+                .command(BackendCommand::History(HistoryRequest::LoadRun(id)));
+        }
+    }
+
     pub(crate) fn history_request(&mut self, request: HistoryRequest) {
         if !self.is_remote() {
             return;
@@ -101,6 +155,10 @@ impl DeviceSession {
         if let Some(id) = selected_run {
             self.history_request(HistoryRequest::LoadRun(id));
         }
+        self.history.comparison_cache.clear();
+        for id in self.history.comparison_ids.clone() {
+            self.comparison_request_run(id);
+        }
     }
 
     pub(crate) fn rename_run(&mut self, run_id: String, request: RenameRequest) {
@@ -125,7 +183,8 @@ impl DeviceSession {
 mod tests {
     use super::*;
     use crate::core::{
-        AuthoritativeSnapshot, CurrentRunMetadata, CycleRunContext, CycleState, CycleStatus, Sample,
+        AuthoritativeSnapshot, Capabilities, CurrentRunMetadata, CycleRunContext, CycleState,
+        CycleStatus, Sample, TestConfiguration, TestStatus,
     };
 
     fn run(id: &str) -> RunSummary {
@@ -166,6 +225,18 @@ mod tests {
             test_energy_wh: 0.1,
         };
         let snapshot = AuthoritativeSnapshot {
+            test: TestStatus {
+                config: Some(TestConfiguration::DischargeConstantCurrent {
+                    current_ma: 1000,
+                    cutoff_voltage_mv: 3000,
+                    cutoff_time_min: 10,
+                }),
+                ..TestStatus::default()
+            },
+            capabilities: Capabilities {
+                start: true,
+                ..Capabilities::default()
+            },
             current_run: CurrentRunMetadata {
                 id: Some("live".to_owned()),
                 name: Some("Live".to_owned()),
@@ -181,6 +252,7 @@ mod tests {
             ..AuthoritativeSnapshot::default()
         };
         session.apply_snapshot(snapshot.clone());
+        session.history.comparison_ids.push("old".to_owned());
         session.history.selected_run = Some("old".to_owned());
         session.history.selected_cycle = Some("old-cycle".to_owned());
         let mut child = run("child");
@@ -254,6 +326,12 @@ mod tests {
         assert_eq!(session.cycle_samples, snapshot.cycle_history);
         assert_eq!(session.current_run, snapshot.current_run);
         assert_eq!(session.cycle, snapshot.cycle);
+        assert_eq!(session.current_test_config, snapshot.test.config);
+        assert_eq!(session.capabilities, snapshot.capabilities);
+        assert!(session.history.comparison_cache.contains_key("old"));
+        session.remove_comparison_run("old");
+        assert_eq!(session.samples, snapshot.history);
+        assert_eq!(session.current_test_config, snapshot.test.config);
     }
 
     #[test]
@@ -264,5 +342,27 @@ mod tests {
         assert_eq!(session.history.pending_requests, 0);
         assert!(session.history.selected_run.is_none());
         assert!(session.command_error.is_none());
+    }
+
+    #[test]
+    fn comparison_selection_is_ordered_bounded_and_cache_accepts_out_of_order_responses() {
+        let mut session = DeviceSession::default();
+        for id in ["a", "b", "c", "d"] {
+            assert!(session.add_comparison_run(id));
+        }
+        assert!(!session.add_comparison_run("b"));
+        assert!(!session.add_comparison_run("e"));
+        for id in ["a", "c", "b", "d"] {
+            session.history.apply(HistoryEvent::RunLoaded(RunHistory {
+                summary: run(id),
+                samples: Vec::new(),
+            }));
+        }
+        assert_eq!(session.history.comparison_cache.len(), 4);
+        assert_eq!(session.history.comparison_ids, ["a", "b", "c", "d"]);
+        session.remove_comparison_run("a");
+        assert_eq!(session.history.comparison_ids[0], "b");
+        assert!(!session.history.comparison_cache.contains_key("a"));
+        assert!(session.add_comparison_run("e"));
     }
 }

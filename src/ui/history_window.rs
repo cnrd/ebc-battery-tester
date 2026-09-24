@@ -10,6 +10,7 @@ enum View {
     #[default]
     Cycles,
     ManualRuns,
+    Comparison,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub(crate) struct HistoryWindow {
     detail: Detail,
     filter: String,
     name_draft: Option<String>,
+    run_plot: plot::PlotOptions,
+    cycle_plot: plot::PlotOptions,
+    comparison_plot: plot::PlotOptions,
 }
 
 fn manual_matches(run: &RunSummary, filter: &str) -> bool {
@@ -92,7 +96,14 @@ impl HistoryWindow {
             let runs = ui
                 .selectable_value(&mut self.view, View::ManualRuns, "Manual runs")
                 .clicked();
-            if cycles || runs {
+            let comparison = ui
+                .selectable_value(
+                    &mut self.view,
+                    View::Comparison,
+                    format!("Comparison ({})", session.history.comparison_ids.len()),
+                )
+                .clicked();
+            if cycles || runs || comparison {
                 self.detail = Detail::List;
                 self.name_draft = None;
             }
@@ -151,7 +162,11 @@ impl HistoryWindow {
                 return;
             }
         }
-        self.history_list(session, ui);
+        if self.view == View::Comparison {
+            self.comparison(session, ui);
+        } else {
+            self.history_list(session, ui);
+        }
     }
 
     fn history_list(&mut self, session: &mut DeviceSession, ui: &mut egui::Ui) {
@@ -185,6 +200,7 @@ impl HistoryWindow {
                                 .unwrap_or("Start time unknown"),
                         );
                         run_metrics(&run, ui);
+                        comparison_button(&run.id, session, ui);
                     });
                 }
             }
@@ -214,6 +230,7 @@ impl HistoryWindow {
                     });
                 }
             }
+            View::Comparison => {}
         }
     }
 
@@ -273,6 +290,7 @@ impl HistoryWindow {
             ));
         }
         run_metrics(run, ui);
+        comparison_button(&run.id, session, ui);
         if let Some(model) = &run.model {
             ui.label(format!("Model: {model}"));
         }
@@ -286,8 +304,15 @@ impl HistoryWindow {
             session.history_request(HistoryRequest::ExportRunCsv(run.id.clone()));
         }
         ui.weak("Plots use bounded presentation samples. CSV contains full resolution telemetry.");
+        plot::physical_controls(&mut self.run_plot, ui);
         ui.allocate_ui(egui::vec2(ui.available_width(), 280.0), |ui| {
-            plot::physical_samples_plot(("history_run", &run.id), &history.samples, ui);
+            plot::physical_samples_plot(
+                ("history_run", &run.id),
+                &history.samples,
+                run.config,
+                self.run_plot,
+                ui,
+            );
         });
     }
 
@@ -341,8 +366,15 @@ impl HistoryWindow {
             }
         });
         ui.weak("Plots use bounded presentation samples. CSV contains full resolution telemetry.");
+        plot::metric_controls(&mut self.cycle_plot, ui);
+        ui.label("X axis: Time");
         ui.allocate_ui(egui::vec2(ui.available_width(), 280.0), |ui| {
-            plot::cycle_samples_plot(("history_cycle", &cycle.execution_id), &history.samples, ui);
+            plot::cycle_samples_plot(
+                ("history_cycle", &cycle.execution_id),
+                &history.samples,
+                self.cycle_plot.metric,
+                ui,
+            );
         });
         ui.heading("Child physical runs");
         if history.child_runs.is_empty() {
@@ -365,8 +397,238 @@ impl HistoryWindow {
                 }
                 ui.small(&run.id);
                 run_metrics(run, ui);
+                comparison_button(&run.id, session, ui);
             });
         }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "comparison cards and graph share one transient view"
+    )]
+    fn comparison(&mut self, session: &mut DeviceSession, ui: &mut egui::Ui) {
+        let ids = session.history.comparison_ids.clone();
+        if ids.is_empty() {
+            ui.label("Add physical runs from Manual runs or a cycle's child runs to compare them.");
+            return;
+        }
+        ui.heading("Physical run comparison");
+        ui.weak(
+            "The first selected run is the baseline. Selection and loaded curves are temporary.",
+        );
+        let summaries: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                session
+                    .history
+                    .runs
+                    .iter()
+                    .find(|run| &run.id == id)
+                    .or_else(|| {
+                        session
+                            .history
+                            .loaded_cycle
+                            .as_ref()?
+                            .child_runs
+                            .iter()
+                            .find(|run| &run.id == id)
+                    })
+                    .or_else(|| {
+                        session
+                            .history
+                            .comparison_cache
+                            .get(id)
+                            .map(|history| &history.summary)
+                    })
+                    .cloned()
+            })
+            .collect();
+        let baseline = summaries.iter().find(|run| run.id == ids[0]);
+        if summaries.iter().any(|run| run.config.is_none()) {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Configuration unavailable for one or more legacy runs.",
+            );
+        }
+        if let Some(first) = summaries.first() {
+            if summaries.iter().any(|run| run.config != first.config) {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "Selected runs use different test configurations.",
+                );
+            }
+            if summaries
+                .iter()
+                .any(|run| config_mode(run.config) != config_mode(first.config))
+            {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "Selected runs contain different operation modes.",
+                );
+            }
+        }
+        for (index, id) in ids.iter().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(if index == 0 {
+                        "Baseline"
+                    } else {
+                        "Selected run"
+                    });
+                    if ui.button("Remove").clicked() {
+                        session.remove_comparison_run(id);
+                    }
+                });
+                if let Some(run) = summaries.iter().find(|run| &run.id == id) {
+                    ui.label(run.name.as_deref().unwrap_or("Physical run"));
+                    ui.small(&run.id);
+                    if let Some(context) = &run.cycle {
+                        let cycle_name = session
+                            .history
+                            .cycles
+                            .iter()
+                            .find(|cycle| cycle.execution_id == context.execution_id)
+                            .and_then(|cycle| cycle.name.as_deref());
+                        ui.label(format!(
+                            "Cycle {} · Repeat {} / Step {}",
+                            cycle_name.unwrap_or(&context.execution_id),
+                            context.repeat_index + 1,
+                            context.step_index + 1
+                        ));
+                        ui.small(&context.execution_id);
+                    }
+                    ui.label(
+                        run.config
+                            .map_or_else(|| "Configuration unavailable".to_owned(), configuration),
+                    );
+                    let mode = config_mode(run.config)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            session
+                                .history
+                                .comparison_cache
+                                .get(id)
+                                .and_then(|history| history.samples.first())
+                                .map(|sample| sample.mode.to_string())
+                        })
+                        .unwrap_or_else(|| "Unavailable".to_owned());
+                    ui.label(format!("Mode: {mode}"));
+                    ui.label(format!(
+                        "Duration: {}",
+                        format_duration(run.elapsed_seconds as f64)
+                    ));
+                    ui.label(format!(
+                        "Capacity: {}",
+                        run.capacity_mah
+                            .map_or_else(|| "Unavailable".to_owned(), |v| format!("{v} mAh"))
+                    ));
+                    ui.label(format!("Energy: {:.6} Wh", run.energy_wh));
+                    if index > 0
+                        && let Some(base) = baseline
+                    {
+                        ui.label(format!(
+                            "Capacity Δ: {}",
+                            capacity_delta(base.capacity_mah, run.capacity_mah)
+                        ));
+                        ui.label(format!(
+                            "Energy Δ: {}",
+                            energy_delta(base.energy_wh, run.energy_wh)
+                        ));
+                    }
+                } else {
+                    ui.label("Summary loading; use Refresh to retry if this persists.");
+                }
+                if !session.history.comparison_cache.contains_key(id) {
+                    ui.label(if session.history.pending_requests > 0 {
+                        "Curve loading…"
+                    } else {
+                        "Curve unavailable; use Refresh to retry."
+                    });
+                }
+            });
+        }
+        if ids.len() < 2 {
+            ui.label("Add at least one more physical run to see an overlay.");
+            return;
+        }
+        plot::physical_controls(&mut self.comparison_plot, ui);
+        let curves: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                session
+                    .history
+                    .comparison_cache
+                    .get(id)
+                    .map(|history| (id.as_str(), history.samples.as_slice()))
+            })
+            .collect();
+        ui.weak("Curves use bounded presentation samples. Duration, capacity and energy above use authoritative run summaries.");
+        if curves.len() < ids.len() && session.history.pending_requests > 0 {
+            ui.spinner();
+        }
+        ui.allocate_ui(egui::vec2(ui.available_width(), 280.0), |ui| {
+            plot::comparison_plot(("comparison", &ids), &curves, self.comparison_plot, ui);
+        });
+    }
+}
+
+fn comparison_button(id: &str, session: &mut DeviceSession, ui: &mut egui::Ui) {
+    if session
+        .history
+        .comparison_ids
+        .iter()
+        .any(|selected| selected == id)
+    {
+        if ui.button("Remove from comparison").clicked() {
+            session.remove_comparison_run(id);
+        }
+    } else {
+        let enabled = session.history.comparison_ids.len() < 4;
+        if ui
+            .add_enabled(enabled, egui::Button::new("Add to comparison"))
+            .clicked()
+        {
+            session.add_comparison_run(id);
+        }
+        if !enabled {
+            ui.weak("Maximum: 4 runs");
+        }
+    }
+}
+
+fn config_mode(config: Option<TestConfiguration>) -> Option<&'static str> {
+    match config {
+        Some(TestConfiguration::DischargeConstantCurrent { .. }) => Some("CC"),
+        Some(TestConfiguration::DischargeConstantPower { .. }) => Some("CP"),
+        Some(TestConfiguration::ChargeConstantVoltage { .. }) => Some("CV"),
+        None => None,
+    }
+}
+
+// Presentation samples are bounded, so exact deltas must use RunSummary fields.
+fn capacity_delta(base: Option<u64>, value: Option<u64>) -> String {
+    match (base, value) {
+        (Some(base), Some(value)) => {
+            let delta = i128::from(value) - i128::from(base);
+            if base == 0 {
+                format!("{delta:+} mAh (percentage unavailable)")
+            } else {
+                format!(
+                    "{delta:+} mAh ({:+.2}%)",
+                    delta as f64 / base as f64 * 100.0
+                )
+            }
+        }
+        _ => "Unavailable".to_owned(),
+    }
+}
+
+fn energy_delta(base: f64, value: f64) -> String {
+    let delta = value - base;
+    if base == 0.0 {
+        format!("{delta:+.6} Wh (percentage unavailable)")
+    } else {
+        format!("{delta:+.6} Wh ({:+.2}%)", delta / base * 100.0)
     }
 }
 
@@ -458,6 +720,47 @@ fn configuration(config: TestConfiguration) -> String {
 mod tests {
     use super::*;
     use crate::core::{CycleRunContext, SavedRecipeReference};
+
+    #[test]
+    fn summary_deltas_handle_sign_missing_and_zero_baseline() {
+        assert_eq!(capacity_delta(Some(100), Some(125)), "+25 mAh (+25.00%)");
+        assert_eq!(capacity_delta(Some(100), Some(75)), "-25 mAh (-25.00%)");
+        assert_eq!(capacity_delta(Some(100), Some(100)), "+0 mAh (+0.00%)");
+        assert_eq!(capacity_delta(None, Some(100)), "Unavailable");
+        assert_eq!(
+            capacity_delta(Some(0), Some(10)),
+            "+10 mAh (percentage unavailable)"
+        );
+        assert_eq!(energy_delta(10.0, 9.5), "-0.500000 Wh (-5.00%)");
+        assert_eq!(
+            energy_delta(0.0, 1.0),
+            "+1.000000 Wh (percentage unavailable)"
+        );
+    }
+
+    #[test]
+    fn configuration_mode_warnings_can_distinguish_modes_and_missing_legacy_data() {
+        let cc = Some(TestConfiguration::DischargeConstantCurrent {
+            current_ma: 1000,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 10,
+        });
+        let cc_other = Some(TestConfiguration::DischargeConstantCurrent {
+            current_ma: 2000,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 10,
+        });
+        let cp = Some(TestConfiguration::DischargeConstantPower {
+            power_w: 5,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 10,
+        });
+        assert_eq!(cc, cc);
+        assert_ne!(cc, cc_other);
+        assert_eq!(config_mode(cc), config_mode(cc_other));
+        assert_ne!(config_mode(cc), config_mode(cp));
+        assert_eq!(config_mode(None), None);
+    }
 
     #[test]
     fn top_level_history_filters_manual_runs_and_searches_names_ids_and_provenance() {

@@ -86,6 +86,11 @@ pub struct CycleSample {
     pub test_energy_wh: f64,
 }
 
+/// Exact power product in microwatts, suitable for ordering power extrema.
+pub(crate) fn power_microwatts(voltage_mv: u16, current_ma: u16) -> u64 {
+    u64::from(voltage_mv) * u64::from(current_ma)
+}
+
 pub(crate) fn cycle_presentation_history(
     samples: &[CycleSample],
     limit: usize,
@@ -96,7 +101,7 @@ pub(crate) fn cycle_presentation_history(
     if limit < 2 {
         return samples.last().cloned().into_iter().collect();
     }
-    let bucket_count = (limit - 2) / 4;
+    let bucket_count = (limit - 2) / 6;
     if bucket_count == 0 {
         return vec![samples[0].clone(), samples[samples.len() - 1].clone()];
     }
@@ -129,7 +134,23 @@ pub(crate) fn cycle_presentation_history(
         );
         selected.insert(
             indices
+                .clone()
                 .max_by_key(|index| samples[*index].current_ma)
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .clone()
+                .min_by_key(|index| {
+                    power_microwatts(samples[*index].voltage_mv, samples[*index].current_ma)
+                })
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .max_by_key(|index| {
+                    power_microwatts(samples[*index].voltage_mv, samples[*index].current_ma)
+                })
                 .unwrap_or(start),
         );
     }
@@ -713,6 +734,44 @@ fn cutoff_time(value: u16) -> Result<(), ValidationError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_presentation_preserves_distinct_power_peak() {
+        let mut samples: Vec<_> = (0..12)
+            .map(|sequence| CycleSample {
+                execution_id: "cycle".to_owned(),
+                sequence,
+                timestamp_utc: String::new(),
+                elapsed_milliseconds: sequence * 250,
+                repeat_index: 0,
+                step_index: 0,
+                cycle_state: CycleState::RunningStep,
+                test_state: TestState::Running,
+                mode: DeviceMode::DischargeConstantCurrent,
+                activity_known: true,
+                active: true,
+                voltage_mv: 4_000,
+                current_ma: 1_000,
+                device_capacity_mah: 0,
+                test_capacity_mah: Some(0),
+                test_energy_wh: 0.0,
+            })
+            .collect();
+        samples[2].voltage_mv = 9_000;
+        samples[2].current_ma = 100;
+        samples[3].voltage_mv = 5_000;
+        samples[3].current_ma = 5_000;
+        samples[4].voltage_mv = 100;
+        samples[4].current_ma = 9_000;
+
+        let presented = cycle_presentation_history(&samples, 8);
+        let sequences: Vec<_> = presented.iter().map(|sample| sample.sequence).collect();
+        assert!(presented.len() <= 8);
+        assert_eq!(sequences.first(), Some(&0));
+        assert_eq!(sequences.last(), Some(&11));
+        assert!(sequences.contains(&3));
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 
     #[test]
     fn normalizes_optional_names_at_unicode_scalar_boundaries() {

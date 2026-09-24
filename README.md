@@ -153,7 +153,8 @@ without changing the per-run sample files or metrics. The latest cycle is
 exported by `GET /api/cycle/history.csv`; a specific execution is exported by
 `GET /api/cycles/<execution-id>/history.csv`.
 
-The remote GUI's **History** window has **Cycles** and **Manual runs** views,
+The remote GUI's **History** window has **Cycles**, **Manual runs**, and
+**Comparison** views,
 a case-insensitive name/ID filter (also matching saved-recipe names), and a
 manual **Refresh** control. Lists load on demand and remain usable while the
 physical tester is disconnected or in error. Server connectivity is required.
@@ -163,9 +164,18 @@ exported independently. Manual and cycle execution names can be edited or
 cleared; cycle children remain unnamed and cannot be renamed.
 
 Run detail shows configuration, result, duration, capacity/energy, device
-identity, sample count, and voltage/current plots. Cycle detail includes the
+identity, sample count, and selectable Voltage, Current, or derived Power plots.
+Physical plots support Time, Capacity (mAh), or Energy (Wh) on the X axis and
+show relevant configuration reference lines. Live physical plots have the same
+selectors. Whole-cycle live and history plots support those three metrics with
+Time as the only X axis. Cycle detail includes the
 complete read-only recipe snapshot, saved-recipe ID/name/revision, whole-cycle
-plots, and child summaries. Historical telemetry has separate transient client
+plots, and child summaries. Manual and cycle child physical runs can be added
+to a transient comparison of up to four runs. The first selected run is the
+baseline; signed capacity and energy differences use authoritative archived
+`RunSummary` values, including when plotted curves are downsampled. Different
+configuration or mode selections show informational warnings. Historical
+telemetry has separate transient client
 state; browsing never replaces live telemetry or changes physical execution.
 Neither server history nor downloaded telemetry is serialized into GUI storage.
 Direct/native/WebUSB mode retains live telemetry and explains that persistent
@@ -177,7 +187,8 @@ including cycle children. `GET /api/runs/{id}` returns
 `GET /api/cycles` returns `Vec<CycleSummary>`; `GET /api/cycles/{id}` returns
 `CycleHistory { summary: CycleSummary, samples: Vec<CycleSample>, child_runs: Vec<RunSummary> }`.
 Both detail sample arrays use the established 5000-point presentation limit,
-including first/last samples and bucket extrema. Raw CSV export retains every
+including first/last samples and voltage, current, and power bucket extrema.
+Raw CSV export retains every
 sample and uses `<immutable-id>.csv` filenames (native save dialog or browser
 download); server paths are never exposed. These resource routes replace the
 obsolete WIP `/api/runs/{id}.csv` route without a compatibility alias.
@@ -201,13 +212,14 @@ provenance, start time, and terminal state remain unknown. Malformed metadata,
 ID mismatches, and corrupt complete CSV rows produce errors. Reads and renames
 do not regenerate telemetry or renumber samples; only the existing repair of
 an incomplete final CSV row may modify a file during loading. Lists, detail
-loads, renames, and exports emit no physical device commands. History deletion,
-pagination, comparison, and further graph analysis are outside this browser.
+loads, renames, comparisons, and exports emit no physical device commands.
+History deletion, pagination, and advanced battery-health analysis are outside
+this browser.
 
 The durable CSV retains the complete current run. Initial browser snapshots
 are limited to 5000 presentation samples, and the browser remains bounded to
 5000 points for the lifetime of the page. Incremental deterministic compaction
-keeps the first and latest samples plus voltage/current extrema from time
+keeps the first and latest samples plus voltage/current/power extrema from time
 buckets. This affects only browser memory and plotting; raw current and archived
 CSV downloads remain complete. Export requests flush and sync the current CSV,
 capture its durable byte length, and then stream only that prefix from an

@@ -38,7 +38,7 @@ use crate::core::{
     SavedRecipe, SavedRecipeReference, ServerConnectionState, SnapshotUpdate, StartCycleRequest,
     StartSavedRecipeRequest, StartTestRequest, TestConfiguration, TestState,
     UpdateSavedRecipeRequest, WebSocketEvent, cycle_presentation_history, normalize_optional_name,
-    normalize_required_name,
+    normalize_required_name, power_microwatts,
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
@@ -1419,7 +1419,7 @@ fn presentation_history(samples: &[Sample], limit: usize) -> Vec<Sample> {
     if limit < 2 {
         return samples.last().cloned().into_iter().collect();
     }
-    let bucket_count = (limit - 2) / 4;
+    let bucket_count = (limit - 2) / 6;
     if bucket_count == 0 {
         return vec![samples[0].clone(), samples[samples.len() - 1].clone()];
     }
@@ -1452,7 +1452,23 @@ fn presentation_history(samples: &[Sample], limit: usize) -> Vec<Sample> {
         );
         selected.insert(
             indices
+                .clone()
                 .max_by_key(|index| samples[*index].current_ma)
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .clone()
+                .min_by_key(|index| {
+                    power_microwatts(samples[*index].voltage_mv, samples[*index].current_ma)
+                })
+                .unwrap_or(start),
+        );
+        selected.insert(
+            indices
+                .max_by_key(|index| {
+                    power_microwatts(samples[*index].voltage_mv, samples[*index].current_ma)
+                })
                 .unwrap_or(start),
         );
     }
@@ -4888,6 +4904,27 @@ mod tests {
         for expected in [0, 3, 7, 12, 17, 19] {
             assert!(sequences.contains(&expected));
         }
+    }
+
+    #[test]
+    fn physical_presentation_preserves_distinct_power_peak() {
+        let mut samples: Vec<_> = (0..12)
+            .map(|sequence| numbered_sample(sequence, 4_000, 1_000))
+            .collect();
+        samples[2].voltage_mv = 9_000;
+        samples[2].current_ma = 100;
+        samples[3].voltage_mv = 5_000;
+        samples[3].current_ma = 5_000;
+        samples[4].voltage_mv = 100;
+        samples[4].current_ma = 9_000;
+
+        let presented = presentation_history(&samples, 8);
+        let sequences: Vec<_> = presented.iter().map(|sample| sample.sequence).collect();
+        assert!(presented.len() <= 8);
+        assert_eq!(sequences.first(), Some(&0));
+        assert_eq!(sequences.last(), Some(&11));
+        assert!(sequences.contains(&3));
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
