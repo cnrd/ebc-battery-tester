@@ -858,6 +858,40 @@ Do not repeat real charge/discharge tests merely to validate unrelated UI or met
 
 ---
 
+# Agent workflow and subagents
+
+For substantial tasks, use subagents to keep the primary agent context focused.
+
+Prefer delegating self-contained work such as:
+
+- repository exploration and locating relevant code paths;
+- reviewing existing behavior and invariants;
+- investigating tests and fixtures;
+- checking API/client parity;
+- independent code review after implementation;
+- running or analyzing broad verification/build matrices;
+- investigating a specific suspected bug or edge case.
+
+The primary agent should retain responsibility for:
+
+- understanding the user's requested scope;
+- architectural decisions;
+- integrating findings from subagents;
+- resolving conflicting findings;
+- making or coordinating the final implementation;
+- final diff review;
+- final completion report.
+
+Avoid loading large amounts of exploratory output into the primary context when a subagent can investigate and return a concise summary with file/line references.
+
+Do not use subagents mechanically for trivial or narrowly scoped changes where delegation would add more overhead than value.
+
+When multiple subagents are used, give them non-overlapping responsibilities where practical.
+
+Avoid having multiple agents independently edit the same files unless explicitly coordinating those edits. Prefer subagents for investigation and review, and keep conflicting implementation ownership centralized.
+
+---
+
 # Scope discipline
 
 For every task:
