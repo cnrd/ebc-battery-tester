@@ -976,6 +976,7 @@ mod tests {
         let final_marker = saved_recipe("final", "Final", 1);
         let (send_events, receive_events) = mpsc::channel::<Vec<WebSocketEvent>>();
         let server = std::thread::spawn(move || {
+            serve_machine_api_info(&listener);
             let (stream, _) = listener
                 .accept()
                 .unwrap_or_else(|error| panic!("failed to accept WebSocket: {error}"));
@@ -1059,6 +1060,28 @@ mod tests {
         drop(send_events);
         drop(session);
         assert!(server.join().is_ok(), "test server panicked");
+    }
+
+    fn serve_machine_api_info(listener: &TcpListener) {
+        let (mut discovery, _) = listener
+            .accept()
+            .unwrap_or_else(|error| panic!("accept discovery: {error}"));
+        discovery
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap_or_else(|error| panic!("discovery timeout: {error}"));
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = discovery
+                .read(&mut buffer)
+                .unwrap_or_else(|error| panic!("read discovery: {error}"));
+            assert_ne!(count, 0, "discovery ended before headers");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        assert!(String::from_utf8_lossy(&request).starts_with("GET /api/info HTTP/1.1\r\n"));
+        let body = serde_json::to_string(&crate::core::MachineApiInfo::current())
+            .unwrap_or_else(|error| panic!("serialize discovery: {error}"));
+        write!(discovery, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap_or_else(|error| panic!("send discovery: {error}"));
     }
 
     fn saved_recipe(id: &str, name: &str, revision: u64) -> SavedRecipe {

@@ -138,13 +138,6 @@ pub(crate) enum BackendConnectionStatus {
     Connecting,
     Connected,
     Reconnecting,
-    #[cfg_attr(
-        all(not(target_arch = "wasm32"), not(test)),
-        expect(
-            dead_code,
-            reason = "native reconnect failures retain reconnecting status"
-        )
-    )]
     Error(String),
 }
 

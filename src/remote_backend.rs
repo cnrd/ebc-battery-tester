@@ -3,6 +3,13 @@
 use crate::backend::{BackendEvent, BackendEventSender, BackendState};
 use crate::core::{ApiCommand, SnapshotUpdate, WebSocketEvent};
 
+/// Discovery failures distinguish reconnectable network errors from incompatible servers.
+#[derive(Debug)]
+pub(crate) enum DiscoveryError {
+    Transient(String),
+    Incompatible(String),
+}
+
 pub(crate) const COMMAND_HEADER: &str = "X-EBC-Command";
 pub(crate) const INITIAL_RECONNECT_DELAY_MS: u64 = 1_000;
 pub(crate) const MAX_RECONNECT_DELAY_MS: u64 = 15_000;

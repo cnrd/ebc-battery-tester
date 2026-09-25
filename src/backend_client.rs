@@ -154,3 +154,42 @@ fn retire_worker(worker: JoinHandle<()>) {
         log::error!("backend reaper stopped before worker could be joined");
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[expect(
+    clippy::expect_used,
+    reason = "direct initialization tests should fail fast"
+)]
+mod tests {
+    use super::{BackendClient, BackendTarget};
+
+    #[test]
+    fn local_initialization_does_not_validate_or_contact_remote_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind HTTP sentinel");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking sentinel");
+        let remote_url = format!(
+            "http://{}",
+            listener.local_addr().expect("sentinel address")
+        );
+        for url in ["not a remote URL", remote_url.as_str()] {
+            let mut client =
+                BackendClient::new(&egui::Context::default(), BackendTarget::Local, url)
+                    .expect("direct mode must initialize independently of remote discovery");
+            assert!(!client.is_remote());
+            // Initialization and shutdown alone neither enumerate nor open serial devices.
+            client.shutdown();
+            client
+                .worker
+                .take()
+                .expect("local worker")
+                .join()
+                .expect("local worker shuts down");
+        }
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+}

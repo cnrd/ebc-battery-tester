@@ -2,10 +2,13 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
     DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, RecipeExport, SavedRecipe, WebSocketEvent};
+use crate::core::{
+    ApiCommand, AuthoritativeSnapshot, MACHINE_API_INVALID_INFO, MACHINE_API_UNAVAILABLE_INFO,
+    MachineApiInfo, RecipeExport, SavedRecipe, WebSocketEvent, validate_machine_api,
+};
 use crate::remote_backend::{
-    COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, command_endpoint,
-    publish_websocket,
+    COMMAND_HEADER, DiscoveryError, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS,
+    command_endpoint, publish_websocket,
 };
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
@@ -35,7 +38,18 @@ pub(super) async fn remote_task(
                 return;
             }
         };
-        match WebSocket::open(&url) {
+        let Some(discovery) = discover_while_disconnected(&mut command_rx, &event_tx).await else {
+            return;
+        };
+        let connection = match discovery {
+            Ok(()) => WebSocket::open(&url).map_err(|error| error.to_string()),
+            Err(DiscoveryError::Transient(error)) => Err(error),
+            Err(DiscoveryError::Incompatible(error)) => {
+                send_connection(&event_tx, BackendConnectionStatus::Error(error));
+                return;
+            }
+        };
+        match connection {
             Ok(socket) => {
                 let (mut writer, mut reader) = socket.split();
                 let mut received_snapshot = false;
@@ -240,7 +254,10 @@ pub(super) async fn remote_task(
                     }
                 }
             }
-            Err(error) => log::warn!("failed to open server websocket: {error}"),
+            Err(error) => {
+                log::warn!("failed to connect remote server: {error}");
+                event_tx.send(BackendEvent::CommandError(error));
+            }
         }
         send_connection(&event_tx, BackendConnectionStatus::Reconnecting);
         let timeout = TimeoutFuture::new(reconnect_delay_ms as u32).fuse();
@@ -268,6 +285,55 @@ pub(super) async fn remote_task(
         }
         reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
     }
+}
+
+async fn discover_while_disconnected(
+    command_rx: &mut UnboundedReceiver<BackendCommand>,
+    event_tx: &BackendEventSender,
+) -> Option<Result<(), DiscoveryError>> {
+    let discovery = discover_machine_api().fuse();
+    futures::pin_mut!(discovery);
+    loop {
+        let command = command_rx.next().fuse();
+        futures::pin_mut!(command);
+        futures::select_biased! {
+            command = command => match command {
+                Some(BackendCommand::Shutdown) | None => return None,
+                Some(command) => {
+                    let error = "browser is verifying remote compatibility; command was not sent".to_owned();
+                    if let BackendCommand::History(request) = command {
+                        event_tx.send(BackendEvent::HistoryResult { request, result: Err(error) });
+                    } else {
+                        event_tx.send(BackendEvent::CommandError(error));
+                    }
+                }
+            },
+            result = discovery => return Some(result),
+        }
+    }
+}
+
+async fn discover_machine_api() -> Result<(), DiscoveryError> {
+    let response = Request::get("/api/info").send().await.map_err(|error| {
+        DiscoveryError::Transient(format!("{MACHINE_API_UNAVAILABLE_INFO} {error}"))
+    })?;
+    if !response.ok() {
+        return Err(DiscoveryError::Incompatible(
+            MACHINE_API_UNAVAILABLE_INFO.to_owned(),
+        ));
+    }
+    let info = response
+        .json::<MachineApiInfo>()
+        .await
+        .map_err(|_error| DiscoveryError::Incompatible(MACHINE_API_INVALID_INFO.to_owned()))?;
+    validate_machine_api(&info).map_err(|error| DiscoveryError::Incompatible(error.to_string()))?;
+    log::info!(
+        "connected to {} {} machine API v{}",
+        info.service,
+        info.server_version,
+        info.api_version
+    );
+    Ok(())
 }
 
 fn publish_cycle_result(

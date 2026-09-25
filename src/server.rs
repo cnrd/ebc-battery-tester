@@ -33,7 +33,7 @@ mod history_tests;
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CreateSavedRecipeRequest,
     CurrentRunMetadata, CycleHistory, CycleRecipe, CycleRunContext, CycleSample, CycleState,
-    CycleStatus, CycleSummary, DeleteSavedRecipeRequest, RECIPE_EXPORT_FORMAT,
+    CycleStatus, CycleSummary, DeleteSavedRecipeRequest, MachineApiInfo, RECIPE_EXPORT_FORMAT,
     RECIPE_EXPORT_VERSION, RecipeExport, RenameRequest, RunHistory, RunSummary, Sample,
     SavedRecipe, SavedRecipeReference, ServerConnectionState, SnapshotUpdate, StartCycleRequest,
     StartSavedRecipeRequest, StartTestRequest, TestConfiguration, TestState,
@@ -2999,6 +2999,7 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
 
 fn api_router() -> Router<AppState> {
     Router::new()
+        .route("/info", get(get_info))
         .route("/status", get(get_status))
         .route("/history", get(get_history))
         .route("/history.csv", get(get_history_csv))
@@ -3110,6 +3111,10 @@ async fn start_command(
         }
         _ => Err(ApiError::internal("unexpected actor response")),
     }
+}
+
+async fn get_info() -> Json<MachineApiInfo> {
+    Json(MachineApiInfo::current())
 }
 
 async fn get_status(
@@ -3694,6 +3699,123 @@ impl IntoResponse for ApiError {
 )]
 mod tests {
     use super::*;
+
+    async fn fetch_machine_info(actor_tx: std_mpsc::Sender<ActorMessage>) -> MachineApiInfo {
+        use std::future::IntoFuture as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP listener");
+        let address = listener.local_addr().expect("address");
+        let router = Router::new()
+            .nest("/api", api_router())
+            .with_state(AppState {
+                actor_tx,
+                allowed_origin: None,
+            });
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect HTTP");
+        // Discovery is a read: deliberately omit X-EBC-Command.
+        stream
+            .write_all(
+                format!("GET /api/info HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("GET info");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("discovery must not wait for an actor")
+            .expect("response");
+        server.abort();
+        let _stopped = server.await;
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("headers");
+        let headers = String::from_utf8_lossy(&response[..split]);
+        assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+        assert!(headers.contains("application/json"), "{headers}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response[split + 4..]).expect("info JSON");
+        assert_eq!(body.as_object().expect("info object").len(), 4);
+        serde_json::from_value(body).expect("machine API info shape")
+    }
+
+    #[tokio::test]
+    async fn machine_info_is_available_without_actor_or_mutation_header() {
+        use crate::core::{
+            CAP_CYCLES_STOP, CAP_RECIPES_EVENTS, CAP_RECIPES_LIST, CAP_RECIPES_START,
+            CAP_STATE_STATUS, CAP_STATE_WEBSOCKET, MACHINE_API_SERVICE, MACHINE_API_VERSION,
+        };
+
+        let (actor_tx, actor_rx) = std_mpsc::channel();
+        drop(actor_rx);
+        let info = fetch_machine_info(actor_tx).await;
+        assert_eq!(info.service, MACHINE_API_SERVICE);
+        assert_eq!(info.api_version, MACHINE_API_VERSION);
+        assert_eq!(info.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            info.capabilities,
+            [
+                CAP_CYCLES_STOP,
+                CAP_RECIPES_EVENTS,
+                CAP_RECIPES_LIST,
+                CAP_RECIPES_START,
+                CAP_STATE_STATUS,
+                CAP_STATE_WEBSOCKET,
+            ]
+        );
+        assert!(info.capabilities.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn machine_info_is_identical_across_actor_states_and_construction_modes() {
+        let expected = MachineApiInfo::current();
+        for scenario in [
+            "normal-disconnected",
+            "mock-disconnected",
+            "mock-idle",
+            "mock-active",
+        ] {
+            let directory = temporary_directory(scenario);
+            let (snapshot_tx, _) = broadcast::channel(16);
+            let config = ServerConfig {
+                http_addr: "127.0.0.1:0".parse().expect("test address"),
+                serial_port: "/dev/null".to_owned(),
+                data_dir: directory.clone(),
+                mock: scenario != "normal-disconnected",
+                static_dir: directory.clone(),
+            };
+            // Construct normal mode without opening any serial device.
+            let mut actor = DeviceActor::new(config, snapshot_tx).expect("create actor");
+            if matches!(scenario, "mock-idle" | "mock-active") {
+                confirm_inactive(&mut actor);
+            }
+            if scenario == "mock-active" {
+                confirm_running(&mut actor);
+            }
+            let before = actor.current_snapshot();
+            actor.sent_frames.clear();
+            let (actor_tx, actor_rx) = std_mpsc::channel();
+            let worker = thread::spawn(move || {
+                while let Ok(message) = actor_rx.recv() {
+                    actor.handle_message(message);
+                }
+                actor
+            });
+            assert_eq!(fetch_machine_info(actor_tx).await, expected, "{scenario}");
+            let mut actor = worker.join().expect("actor stopped");
+            assert_eq!(actor.current_snapshot(), before, "{scenario}");
+            assert!(actor.sent_frames.is_empty(), "{scenario}");
+            drop(actor);
+            fs::remove_dir_all(directory).expect("remove test directory");
+        }
+    }
 
     fn temporary_directory(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

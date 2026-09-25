@@ -394,6 +394,78 @@ The available protocol documentation is ambiguous about serial parity. This
 project preserves the known-working odd-parity implementation; deployment work
 does not change protocol behavior.
 
+## Machine API discovery and compatibility
+
+Remote clients first request `GET /api/info`, without a mutation header. This
+version-neutral endpoint returns static metadata directly from the running
+binary, even when the tester is disconnected or the device actor is unavailable:
+
+```json
+{
+  "service": "ebc-battery-tester",
+  "server_version": "0.5.0",
+  "api_version": 1,
+  "capabilities": [
+    "cycles.stop",
+    "recipes.events",
+    "recipes.list",
+    "recipes.start",
+    "state.status",
+    "state.websocket"
+  ]
+}
+```
+
+`service` identifies EBC Battery Tester. `server_version` is the informational
+application/package release; clients must **not** use it for feature detection.
+`api_version` is the machine API **major compatibility version**, independent of
+application releases. `capabilities` is a sorted, unique array of strings for
+additive feature discovery.
+
+Clients should check the service identifier, require a supported API major,
+check capability membership for features they need, and ignore unknown
+capability strings and optional JSON fields. Native remote and remote WASM GUIs
+validate service and API major before opening their state WebSocket. Missing or
+malformed discovery, a wrong service, or an unsupported major produces a clear
+connection error without starting synchronization. Local/direct USB and WebUSB
+operation do not use HTTP discovery.
+
+The initial external-integration v1 contract covers this surface:
+
+| Endpoint | Capability | Meaning |
+| --- | --- | --- |
+| `GET /api/info` | Discovery itself | Service identity and compatibility handshake |
+| `GET /api/status` | `state.status` | Authoritative current snapshot |
+| `GET /api/ws` | `state.websocket` | Authoritative state and telemetry event stream |
+| `GET /api/recipes` | `recipes.list` | Authoritative saved-recipe library |
+| WebSocket recipe events | `recipes.events` | Initial library, recipe upserts and deletions |
+| `POST /api/recipes/{id}/start` | `recipes.start` | Start by immutable saved-recipe ID, capturing a server-resolved recipe/provenance snapshot |
+| `POST /api/cycle/stop` | `cycles.stop` | Explicitly stop the server-owned cycle execution |
+
+The WebSocket initially sends `Snapshot`, then `RecipeLibrary`; subsequent
+state, sample, cycle-sample and recipe events maintain authoritative client
+views. Clients must tolerate compatible event variants they do not recognize.
+Mutating endpoints still require `X-EBC-Command: 1` and the existing origin
+policy. The saved-recipe start body accepts an optional `execution_name`.
+Other existing routes remain available, but are not implicitly part of this
+initial external-integration compatibility commitment.
+
+`/api/info` capabilities mean “this implementation supports this integration
+feature.” `/api/status` → `capabilities` instead means “this operation is
+currently allowed by authoritative device/controller state.” Static support
+never changes with connection, test, cycle, or calibration state. The server
+still decides whether each requested operation is currently legal.
+
+A new machine API major is required when a change incompatibly removes a
+required route or WebSocket event semantic, changes an existing contract field's
+type or meaning, changes an existing request body, or changes a command's
+semantics so a v1 client cannot safely use it. Adding optional JSON fields,
+routes, capability strings, safely ignorable WebSocket event variants, or new
+features discoverable by capability does not require a major bump. Application
+releases may change freely while the compatible machine API remains v1.
+`/api/info` remains the version-neutral handshake even for future majors; there
+is no `/api/v1/` route tree.
+
 ## API outline
 
 Saved recipes are reusable editable templates with immutable installation-local
@@ -495,6 +567,7 @@ All endpoints are under `/api`:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `GET` | `/api/info` | Static machine API identity, version and capabilities |
 | `GET` | `/api/status` | Current authoritative snapshot |
 | `GET` | `/api/history` | Measurement history as JSON |
 | `GET` | `/api/history.csv` | Measurement history as CSV |

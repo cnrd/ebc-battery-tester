@@ -14,6 +14,89 @@ pub const MAX_NAME_CHARS: usize = 120;
 pub const RECIPE_EXPORT_FORMAT: &str = "ebc-battery-tester-recipe";
 pub const RECIPE_EXPORT_VERSION: u32 = 1;
 
+pub const MACHINE_API_SERVICE: &str = "ebc-battery-tester";
+/// Major compatibility version of the documented machine contract, not the release.
+pub const MACHINE_API_VERSION: u32 = 1;
+pub const CAP_STATE_STATUS: &str = "state.status";
+pub const CAP_STATE_WEBSOCKET: &str = "state.websocket";
+pub const CAP_RECIPES_LIST: &str = "recipes.list";
+pub const CAP_RECIPES_EVENTS: &str = "recipes.events";
+pub const CAP_RECIPES_START: &str = "recipes.start";
+pub const CAP_CYCLES_STOP: &str = "cycles.stop";
+pub const MACHINE_API_INVALID_INFO: &str = "Server returned invalid machine API information.";
+pub const MACHINE_API_UNAVAILABLE_INFO: &str =
+    "The remote server does not provide compatible machine API information.";
+
+/// Static implementation support, separate from runtime operation permissions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineApiInfo {
+    pub service: String,
+    pub server_version: String,
+    pub api_version: u32,
+    /// Open string vocabulary: clients must tolerate unknown future capabilities.
+    pub capabilities: Vec<String>,
+}
+
+impl MachineApiInfo {
+    /// Discovery metadata for this binary; never reads device or persisted state.
+    pub fn current() -> Self {
+        let capabilities = BTreeSet::from([
+            CAP_STATE_STATUS,
+            CAP_STATE_WEBSOCKET,
+            CAP_RECIPES_LIST,
+            CAP_RECIPES_EVENTS,
+            CAP_RECIPES_START,
+            CAP_CYCLES_STOP,
+        ])
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        Self {
+            service: MACHINE_API_SERVICE.to_owned(),
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_version: MACHINE_API_VERSION,
+            capabilities,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachineApiCompatibilityError {
+    WrongService,
+    UnsupportedVersion { server_version: u32 },
+}
+
+impl std::fmt::Display for MachineApiCompatibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongService => write!(f, "Remote endpoint is not an EBC Battery Tester server."),
+            Self::UnsupportedVersion { server_version } => write!(
+                f,
+                "Server machine API version {server_version} is unsupported; this client supports version {MACHINE_API_VERSION}."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MachineApiCompatibilityError {}
+
+/// Validate remote service identity and major compatibility before synchronization.
+/// Release versions are informational; optional features use capability membership.
+///
+/// # Errors
+/// Returns an error for another service or an unsupported machine API major.
+pub fn validate_machine_api(info: &MachineApiInfo) -> Result<(), MachineApiCompatibilityError> {
+    if info.service != MACHINE_API_SERVICE {
+        return Err(MachineApiCompatibilityError::WrongService);
+    }
+    if info.api_version != MACHINE_API_VERSION {
+        return Err(MachineApiCompatibilityError::UnsupportedVersion {
+            server_version: info.api_version,
+        });
+    }
+    Ok(())
+}
+
 /// Trims and validates an optional user-facing name.
 ///
 /// # Errors
@@ -734,6 +817,80 @@ fn cutoff_time(value: u16) -> Result<(), ValidationError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_api_info_is_canonical() {
+        let info = MachineApiInfo::current();
+        assert_eq!(info.service, MACHINE_API_SERVICE);
+        assert_eq!(info.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.api_version, 1);
+        assert_eq!(
+            info.capabilities,
+            [
+                CAP_CYCLES_STOP,
+                CAP_RECIPES_EVENTS,
+                CAP_RECIPES_LIST,
+                CAP_RECIPES_START,
+                CAP_STATE_STATUS,
+                CAP_STATE_WEBSOCKET,
+            ]
+        );
+        assert!(info.capabilities.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn machine_api_validation_checks_identity_and_major_only() {
+        let mut info = MachineApiInfo::current();
+        assert_eq!(validate_machine_api(&info), Ok(()));
+        info.server_version = "future informational release".to_owned();
+        info.capabilities.clear();
+        assert_eq!(validate_machine_api(&info), Ok(()));
+        for service in ["another-service", ""] {
+            info.service = service.to_owned();
+            assert_eq!(
+                validate_machine_api(&info),
+                Err(MachineApiCompatibilityError::WrongService)
+            );
+        }
+        info.service = MACHINE_API_SERVICE.to_owned();
+        info.api_version = 2;
+        let error = validate_machine_api(&info).expect_err("unsupported major");
+        assert_eq!(
+            error,
+            MachineApiCompatibilityError::UnsupportedVersion { server_version: 2 }
+        );
+        assert_eq!(
+            error.to_string(),
+            "Server machine API version 2 is unsupported; this client supports version 1."
+        );
+    }
+
+    #[test]
+    fn machine_api_accepts_unknown_capabilities_and_optional_fields() {
+        let info: MachineApiInfo = serde_json::from_value(serde_json::json!({
+            "service": MACHINE_API_SERVICE,
+            "server_version": "99.0.0",
+            "api_version": MACHINE_API_VERSION,
+            "capabilities": [CAP_STATE_STATUS, "future.unknown.feature"],
+            "future_optional_field": true
+        }))
+        .expect("open vocabulary and additive fields");
+        assert_eq!(validate_machine_api(&info), Ok(()));
+        assert_eq!(info.capabilities[1], "future.unknown.feature");
+    }
+
+    #[test]
+    fn machine_api_required_fields_and_types_are_explicit() {
+        let info = serde_json::to_value(MachineApiInfo::current()).expect("serialize info");
+        for field in ["service", "server_version", "api_version", "capabilities"] {
+            let mut missing = info.clone();
+            missing.as_object_mut().expect("object").remove(field);
+            assert!(serde_json::from_value::<MachineApiInfo>(missing).is_err());
+        }
+        let mut invalid = info;
+        invalid["capabilities"] = serde_json::json!({CAP_STATE_STATUS: true});
+        assert!(serde_json::from_value::<MachineApiInfo>(invalid).is_err());
+    }
 
     #[test]
     fn cycle_presentation_preserves_distinct_power_peak() {

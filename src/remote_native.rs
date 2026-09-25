@@ -14,9 +14,12 @@ use crate::backend::{
     BackendCommand, BackendConnectionStatus, BackendEvent, BackendEventSender, DiagnosticDirection,
     DiagnosticEvent, remote_api_commands,
 };
-use crate::core::{ApiCommand, AuthoritativeSnapshot, RecipeExport, SavedRecipe, WebSocketEvent};
+use crate::core::{
+    ApiCommand, AuthoritativeSnapshot, MACHINE_API_INVALID_INFO, MACHINE_API_UNAVAILABLE_INFO,
+    MachineApiInfo, RecipeExport, SavedRecipe, WebSocketEvent, validate_machine_api,
+};
 use crate::remote_backend::{
-    COMMAND_HEADER, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, RemoteUrls,
+    COMMAND_HEADER, DiscoveryError, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, RemoteUrls,
     publish_websocket,
 };
 
@@ -65,7 +68,17 @@ fn remote_thread(
             },
         ));
         attempted_connection = true;
-        match connect_websocket(&urls) {
+        let connection = match discover_machine_api(&urls, &agent) {
+            Ok(()) => connect_websocket(&urls),
+            Err(DiscoveryError::Transient(error)) => Err(error),
+            Err(DiscoveryError::Incompatible(error)) => {
+                event_tx.send(BackendEvent::BackendConnectionChanged(
+                    BackendConnectionStatus::Error(error),
+                ));
+                return;
+            }
+        };
+        match connection {
             Ok(mut socket) => {
                 if let Err(error) = set_read_timeout(&mut socket, SOCKET_POLL_INTERVAL) {
                     publish_network_error(&event_tx, &error);
@@ -159,6 +172,31 @@ fn remote_thread(
         }
         reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
     }
+}
+
+fn discover_machine_api(urls: &RemoteUrls, agent: &ureq::Agent) -> Result<(), DiscoveryError> {
+    let response = agent
+        .get(&format!("{}/api/info", urls.base))
+        .call()
+        .map_err(|error| match error {
+            ureq::Error::Status(_, _) => {
+                DiscoveryError::Incompatible(MACHINE_API_UNAVAILABLE_INFO.to_owned())
+            }
+            ureq::Error::Transport(error) => {
+                DiscoveryError::Transient(format!("{MACHINE_API_UNAVAILABLE_INFO} {error}"))
+            }
+        })?;
+    let info = response
+        .into_json::<MachineApiInfo>()
+        .map_err(|_error| DiscoveryError::Incompatible(MACHINE_API_INVALID_INFO.to_owned()))?;
+    validate_machine_api(&info).map_err(|error| DiscoveryError::Incompatible(error.to_string()))?;
+    log::info!(
+        "connected to {} {} machine API v{}",
+        info.service,
+        info.server_version,
+        info.api_version
+    );
+    Ok(())
 }
 
 fn connect_websocket(urls: &RemoteUrls) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
@@ -612,6 +650,108 @@ mod tests {
         StartTestRequest, TestConfiguration, UpdateSavedRecipeRequest,
     };
 
+    fn serve_discovery(listener: &TcpListener, status: &str, body: &str) {
+        let (mut stream, _) = listener.accept().expect("accept discovery");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).expect("read discovery");
+            assert_ne!(count, 0);
+            request.extend_from_slice(&buffer[..count]);
+        }
+        let request = String::from_utf8(request).expect("HTTP request");
+        assert!(request.starts_with("GET /api/info HTTP/1.1\r\n"));
+        assert!(!request.to_ascii_lowercase().contains("x-ebc-command"));
+        write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("discovery response");
+    }
+
+    #[test]
+    fn incompatible_discovery_stops_setup_without_websocket_or_commands() {
+        let valid = serde_json::to_value(MachineApiInfo::current()).expect("info");
+        let mut wrong_service = valid.clone();
+        wrong_service["service"] = serde_json::json!("another-service");
+        let mut wrong_version = valid;
+        wrong_version["api_version"] = serde_json::json!(crate::core::MACHINE_API_VERSION + 1);
+        let cases = [
+            (
+                "404 Not Found",
+                "missing".to_owned(),
+                MACHINE_API_UNAVAILABLE_INFO.to_owned(),
+            ),
+            (
+                "500 Internal Server Error",
+                "failed".to_owned(),
+                MACHINE_API_UNAVAILABLE_INFO.to_owned(),
+            ),
+            (
+                "200 OK",
+                "not JSON".to_owned(),
+                MACHINE_API_INVALID_INFO.to_owned(),
+            ),
+            (
+                "200 OK",
+                "{}".to_owned(),
+                MACHINE_API_INVALID_INFO.to_owned(),
+            ),
+            (
+                "200 OK",
+                wrong_service.to_string(),
+                "Remote endpoint is not an EBC Battery Tester server.".to_owned(),
+            ),
+            (
+                "200 OK",
+                wrong_version.to_string(),
+                format!(
+                    "Server machine API version {} is unsupported; this client supports version {}.",
+                    crate::core::MACHINE_API_VERSION + 1,
+                    crate::core::MACHINE_API_VERSION
+                ),
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+            let urls = RemoteUrls::parse(&format!(
+                "http://{}",
+                listener.local_addr().expect("address")
+            ))
+            .expect("URLs");
+            let (command_tx, command_rx) = mpsc::unbounded();
+            let (event_tx, mut event_rx) = mpsc::unbounded();
+            let worker = spawn_backend(urls, command_rx, BackendEventSender::new(event_tx, || {}))
+                .expect("worker");
+            serve_discovery(&listener, status, &body);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut failure = None;
+            while Instant::now() < deadline && failure.is_none() {
+                match event_rx.try_recv() {
+                    Ok(BackendEvent::BackendConnectionChanged(BackendConnectionStatus::Error(
+                        error,
+                    ))) => failure = Some(error),
+                    Ok(
+                        BackendEvent::BackendConnectionChanged(BackendConnectionStatus::Connected)
+                        | BackendEvent::Snapshot(_)
+                        | BackendEvent::RecipeLibrary(_),
+                    ) => panic!("incompatible server accepted"),
+                    Err(TryRecvError::Closed) => break,
+                    _ => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            let _shutdown = command_tx.unbounded_send(BackendCommand::Shutdown);
+            worker.join().expect("worker exits after rejection");
+            assert_eq!(failure.as_deref(), Some(expected.as_str()));
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+                "normal synchronization must not start after rejection"
+            );
+        }
+    }
+
     fn config() -> TestConfiguration {
         TestConfiguration::DischargeConstantCurrent {
             current_ma: 1000,
@@ -898,6 +1038,8 @@ mod tests {
         let snapshot = AuthoritativeSnapshot::default();
         let response_snapshot = snapshot.clone();
         let server = std::thread::spawn(move || {
+            let body = serde_json::to_string(&MachineApiInfo::current()).expect("info");
+            serve_discovery(&listener, "200 OK", &body);
             let (websocket_stream, _) = listener
                 .accept()
                 .unwrap_or_else(|error| panic!("failed to accept WebSocket: {error}"));
