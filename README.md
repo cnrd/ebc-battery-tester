@@ -158,6 +158,9 @@ The remote GUI's **History** window has **Cycles**, **Manual runs**, and
 a case-insensitive name/ID filter (also matching saved-recipe names), and a
 manual **Refresh** control. Lists load on demand and remain usable while the
 physical tester is disconnected or in error. Server connectivity is required.
+Refresh keeps previously loaded lists, details, and comparison curves visible
+while new data loads. Loading and failed requests are shown with specific retry
+controls; repeated in-flight requests are coalesced.
 Manual runs exclude cycle children; children appear inside their parent cycle,
 ordered by repeat, step, then immutable run ID. Each child can be opened and
 exported independently. Manual and cycle execution names can be edited or
@@ -172,7 +175,9 @@ Time as the only X axis. Cycle detail includes the
 complete read-only recipe snapshot, saved-recipe ID/name/revision, whole-cycle
 plots, and child summaries. Manual and cycle child physical runs can be added
 to a transient comparison of up to four runs. The first selected run is the
-baseline; signed capacity and energy differences use authoritative archived
+baseline and can be reassigned. Comparison curve labels prefer run names and
+cycle context, with immutable IDs resolving duplicates. Signed capacity and
+energy differences use authoritative archived
 `RunSummary` values, including when plotted curves are downsampled. Different
 configuration or mode selections show informational warnings. Historical
 telemetry has separate transient client

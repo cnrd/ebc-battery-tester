@@ -639,10 +639,8 @@ impl DeviceSession {
     pub(crate) fn consume_events(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.backend.try_event() {
             match event {
-                BackendEvent::History(event) => self.history.apply(event),
-                BackendEvent::HistoryError(error) => {
-                    self.history.pending_requests = self.history.pending_requests.saturating_sub(1);
-                    self.history.error = Some(error);
+                BackendEvent::HistoryResult { request, result } => {
+                    self.history.apply_result(request, result);
                 }
                 BackendEvent::HistoryRenamed { id, cycle, name } => {
                     self.history.renamed(&id, cycle, name);
@@ -660,11 +658,12 @@ impl DeviceSession {
                 }
                 BackendEvent::BackendConnectionChanged(status) => {
                     if status != BackendConnectionStatus::Connected
-                        && self.history.pending_requests > 0
+                        && !self.history.pending.is_empty()
                     {
-                        self.history.pending_requests = 0;
-                        self.history.error =
-                            Some("Server disconnected. Reconnect and refresh history.".to_owned());
+                        self.history.disconnect();
+                    }
+                    if status == BackendConnectionStatus::Connected {
+                        self.history.connection_error = None;
                     }
                     self.remote_status = status;
                 }

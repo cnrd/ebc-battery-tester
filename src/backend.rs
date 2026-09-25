@@ -57,7 +57,7 @@ pub(crate) enum BackendCommand {
     Shutdown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum HistoryRequest {
     RefreshRuns,
     RefreshCycles,
@@ -150,8 +150,10 @@ pub(crate) enum BackendConnectionStatus {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendEvent {
-    History(HistoryEvent),
-    HistoryError(String),
+    HistoryResult {
+        request: HistoryRequest,
+        result: Result<HistoryEvent, String>,
+    },
     HistoryRenamed {
         id: String,
         cycle: bool,

@@ -3,7 +3,7 @@
 use super::DeviceSession;
 use crate::backend::{BackendCommand, DownloadedFile, HistoryEvent, HistoryRequest};
 use crate::core::{CycleHistory, CycleSummary, RenameRequest, RunHistory, RunSummary};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Default)]
 pub(crate) struct HistoryState {
@@ -16,14 +16,54 @@ pub(crate) struct HistoryState {
     pub loaded_cycle: Option<CycleHistory>,
     pub selected_run: Option<String>,
     pub selected_cycle: Option<String>,
-    pub pending_export: Option<DownloadedFile>,
-    pub error: Option<String>,
-    pub pending_requests: usize,
+    pub pending_exports: VecDeque<(HistoryRequest, DownloadedFile)>,
+    pub pending: BTreeSet<HistoryRequest>,
+    pub errors: BTreeMap<HistoryRequest, String>,
+    pub connection_error: Option<String>,
 }
 
 impl HistoryState {
-    pub(super) fn apply(&mut self, event: HistoryEvent) {
-        self.pending_requests = self.pending_requests.saturating_sub(1);
+    pub(super) fn apply_result(
+        &mut self,
+        request: HistoryRequest,
+        result: Result<HistoryEvent, String>,
+    ) {
+        // Ignore completions from a request cancelled by disconnect.
+        if !self.pending.remove(&request) {
+            return;
+        }
+        let event = match result {
+            Ok(event) => {
+                self.errors.remove(&request);
+                event
+            }
+            Err(error) => {
+                self.errors.insert(request, error);
+                return;
+            }
+        };
+        let matches_request = match (&request, &event) {
+            (HistoryRequest::RefreshRuns, HistoryEvent::Runs(_))
+            | (HistoryRequest::RefreshCycles, HistoryEvent::Cycles(_))
+            | (
+                HistoryRequest::ExportRunCsv(_) | HistoryRequest::ExportCycleCsv(_),
+                HistoryEvent::FileExported(_),
+            ) => true,
+            (HistoryRequest::LoadRun(id), HistoryEvent::RunLoaded(history)) => {
+                *id == history.summary.id
+            }
+            (HistoryRequest::LoadCycle(id), HistoryEvent::CycleLoaded(history)) => {
+                *id == history.summary.execution_id
+            }
+            _ => false,
+        };
+        if !matches_request {
+            self.errors.insert(
+                request,
+                "History response did not match the requested record.".to_owned(),
+            );
+            return;
+        }
         match event {
             HistoryEvent::Runs(runs) => self.runs = runs,
             HistoryEvent::Cycles(cycles) => self.cycles = cycles,
@@ -41,8 +81,26 @@ impl HistoryState {
                     self.loaded_cycle = Some(history);
                 }
             }
-            HistoryEvent::FileExported(file) => self.pending_export = Some(file),
+            HistoryEvent::FileExported(file) => self.pending_exports.push_back((request, file)),
         }
+    }
+
+    pub(super) fn disconnect(&mut self) {
+        for request in std::mem::take(&mut self.pending) {
+            self.errors.insert(
+                request,
+                "Server disconnected. Reconnect and retry.".to_owned(),
+            );
+        }
+        self.connection_error =
+            Some("Server disconnected. Reconnect to refresh history.".to_owned());
+    }
+
+    pub(crate) fn pending(&self, request: &HistoryRequest) -> bool {
+        self.pending.contains(request)
+    }
+    pub(crate) fn error(&self, request: &HistoryRequest) -> Option<&str> {
+        self.errors.get(request).map(String::as_str)
     }
 
     pub(super) fn renamed(&mut self, id: &str, cycle: bool, name: Option<String>) {
@@ -76,6 +134,23 @@ impl HistoryState {
 }
 
 impl DeviceSession {
+    pub(crate) fn clear_comparison(&mut self) {
+        self.history.comparison_ids.clear();
+        self.history.comparison_cache.clear();
+    }
+
+    pub(crate) fn use_comparison_baseline(&mut self, id: &str) {
+        if let Some(index) = self
+            .history
+            .comparison_ids
+            .iter()
+            .position(|selected| selected == id)
+        {
+            self.history.comparison_ids.remove(index);
+            self.history.comparison_ids.insert(0, id.to_owned());
+        }
+    }
+
     pub(crate) fn add_comparison_run(&mut self, id: &str) -> bool {
         if self
             .history
@@ -99,7 +174,7 @@ impl DeviceSession {
                 .comparison_cache
                 .insert(id.to_owned(), history.clone());
         } else {
-            self.comparison_request_run(id.to_owned());
+            self.queue_history_request(HistoryRequest::LoadRun(id.to_owned()));
         }
         true
     }
@@ -111,38 +186,47 @@ impl DeviceSession {
         self.history.comparison_cache.remove(id);
     }
 
-    fn comparison_request_run(&mut self, id: String) {
-        if self.remote_command_available("history") {
-            self.history.pending_requests += 1;
-            self.backend
-                .command(BackendCommand::History(HistoryRequest::LoadRun(id)));
+    fn queue_history_request(&mut self, request: HistoryRequest) {
+        if self.history.pending(&request) {
+            return;
         }
+        if !self.remote_command_available("history") {
+            self.history.errors.insert(
+                request,
+                self.command_error
+                    .clone()
+                    .unwrap_or_else(|| "History is unavailable while disconnected.".to_owned()),
+            );
+            return;
+        }
+        self.history.errors.remove(&request);
+        self.history.connection_error = None;
+        self.history.pending.insert(request.clone());
+        self.backend.command(BackendCommand::History(request));
     }
 
     pub(crate) fn history_request(&mut self, request: HistoryRequest) {
         if !self.is_remote() {
             return;
         }
-        if !self.remote_command_available("history") {
-            self.history.error.clone_from(&self.command_error);
-            return;
-        }
         match &request {
             HistoryRequest::LoadRun(id) => {
-                self.history.selected_run = Some(id.clone());
-                self.history.loaded_run = None;
+                if self.history.selected_run.as_deref() != Some(id) {
+                    self.history.selected_run = Some(id.clone());
+                    self.history.loaded_run = None;
+                }
             }
             HistoryRequest::LoadCycle(id) => {
-                self.history.selected_cycle = Some(id.clone());
-                self.history.loaded_cycle = None;
-                self.history.selected_run = None;
-                self.history.loaded_run = None;
+                if self.history.selected_cycle.as_deref() != Some(id) {
+                    self.history.selected_cycle = Some(id.clone());
+                    self.history.loaded_cycle = None;
+                    self.history.selected_run = None;
+                    self.history.loaded_run = None;
+                }
             }
             _ => {}
         }
-        self.history.error = None;
-        self.history.pending_requests += 1;
-        self.backend.command(BackendCommand::History(request));
+        self.queue_history_request(request);
     }
 
     pub(crate) fn refresh_history(&mut self) {
@@ -155,9 +239,8 @@ impl DeviceSession {
         if let Some(id) = selected_run {
             self.history_request(HistoryRequest::LoadRun(id));
         }
-        self.history.comparison_cache.clear();
         for id in self.history.comparison_ids.clone() {
-            self.comparison_request_run(id);
+            self.queue_history_request(HistoryRequest::LoadRun(id));
         }
     }
 
@@ -193,6 +276,218 @@ mod tests {
             "elapsed_seconds": 10, "sample_count": 1
         }))
         .expect("run fixture")
+    }
+
+    fn receive(history: &mut HistoryState, request: HistoryRequest, event: HistoryEvent) {
+        history.pending.insert(request.clone());
+        history.apply_result(request, Ok(event));
+    }
+
+    fn remote_session() -> DeviceSession {
+        let mut session = DeviceSession::default();
+        session.transport_mode = crate::session::TransportMode::Remote;
+        session.remote_status = crate::backend::BackendConnectionStatus::Connected;
+        session
+    }
+
+    #[test]
+    fn correlated_requests_coalesce_fail_retry_and_keep_unrelated_pending() {
+        let mut session = remote_session();
+        let runs = HistoryRequest::RefreshRuns;
+        let cycles = HistoryRequest::RefreshCycles;
+        session.history_request(runs.clone());
+        session.history_request(runs.clone());
+        session.history_request(cycles.clone());
+        assert_eq!(session.history.pending.len(), 2);
+        session
+            .history
+            .apply_result(runs.clone(), Err("offline".to_owned()));
+        assert!(!session.history.pending(&runs));
+        assert!(session.history.pending(&cycles));
+        assert_eq!(session.history.error(&runs), Some("offline"));
+        session.history_request(runs.clone());
+        assert!(session.history.pending(&runs));
+        assert_eq!(session.history.error(&runs), None);
+        session
+            .history
+            .apply_result(runs.clone(), Ok(HistoryEvent::Runs(vec![run("a")])));
+        assert!(!session.history.pending(&runs));
+        assert!(session.history.pending(&cycles));
+        assert_eq!(session.history.runs[0].id, "a");
+    }
+
+    #[test]
+    fn distinct_completed_exports_are_queued_without_overwriting() {
+        let mut history = HistoryState::default();
+        for request in [
+            HistoryRequest::ExportRunCsv("a".to_owned()),
+            HistoryRequest::ExportCycleCsv("b".to_owned()),
+        ] {
+            let filename = format!("{request:?}.csv");
+            receive(
+                &mut history,
+                request,
+                HistoryEvent::FileExported(DownloadedFile {
+                    filename,
+                    content_type: "text/csv".to_owned(),
+                    bytes: Vec::new(),
+                }),
+            );
+        }
+        assert_eq!(history.pending_exports.len(), 2);
+        assert_ne!(
+            history.pending_exports[0].1.filename,
+            history.pending_exports[1].1.filename
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_loaded_detail_and_comparison_cache_through_failure_and_success() {
+        let mut session = remote_session();
+        let old = RunHistory {
+            summary: run("a"),
+            samples: Vec::new(),
+        };
+        session.history.selected_run = Some("a".to_owned());
+        session.history.loaded_run = Some(old.clone());
+        session.history.comparison_ids.push("a".to_owned());
+        session
+            .history
+            .comparison_cache
+            .insert("a".to_owned(), old.clone());
+        session.refresh_history();
+        let request = HistoryRequest::LoadRun("a".to_owned());
+        assert_eq!(session.history.loaded_run, Some(old.clone()));
+        assert_eq!(session.history.comparison_cache["a"], old);
+        assert_eq!(session.history.pending.len(), 3); // lists plus one coalesced run load
+        session
+            .history
+            .apply_result(request.clone(), Err("offline".to_owned()));
+        assert_eq!(
+            session
+                .history
+                .loaded_run
+                .as_ref()
+                .map(|h| h.summary.id.as_str()),
+            Some("a")
+        );
+        assert!(session.history.comparison_cache.contains_key("a"));
+        assert_eq!(session.history.error(&request), Some("offline"));
+        session.history_request(request.clone());
+        let mut replacement = run("a");
+        replacement.capacity_mah = Some(42);
+        session.history.apply_result(
+            request,
+            Ok(HistoryEvent::RunLoaded(RunHistory {
+                summary: replacement,
+                samples: Vec::new(),
+            })),
+        );
+        assert_eq!(
+            session
+                .history
+                .loaded_run
+                .as_ref()
+                .and_then(|h| h.summary.capacity_mah),
+            Some(42)
+        );
+        assert_eq!(
+            session.history.comparison_cache["a"].summary.capacity_mah,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn selection_change_and_disconnect_preserve_old_cache_but_not_wrong_detail() {
+        let mut session = remote_session();
+        session.history.selected_run = Some("a".to_owned());
+        session.history.loaded_run = Some(RunHistory {
+            summary: run("a"),
+            samples: Vec::new(),
+        });
+        session.history_request(HistoryRequest::LoadRun("b".to_owned()));
+        assert!(session.history.loaded_run.is_none());
+        let request = HistoryRequest::LoadRun("b".to_owned());
+        assert!(session.history.pending(&request));
+        session.history.apply_result(
+            request.clone(),
+            Ok(HistoryEvent::RunLoaded(RunHistory {
+                summary: run("b"),
+                samples: Vec::new(),
+            })),
+        );
+        assert_eq!(
+            session
+                .history
+                .loaded_run
+                .as_ref()
+                .map(|h| h.summary.id.as_str()),
+            Some("b")
+        );
+        session.history.comparison_ids.push("b".to_owned());
+        session.history.comparison_cache.insert(
+            "b".to_owned(),
+            session.history.loaded_run.clone().expect("loaded"),
+        );
+        session.history_request(HistoryRequest::LoadRun("b".to_owned()));
+        session.history.disconnect();
+        assert!(session.history.pending.is_empty());
+        assert!(session.history.comparison_cache.contains_key("b"));
+        assert_eq!(session.history.comparison_ids, ["b"]);
+        assert!(session.history.error(&request).is_some());
+        session.history.apply_result(
+            request,
+            Ok(HistoryEvent::RunLoaded(RunHistory {
+                summary: run("stale"),
+                samples: Vec::new(),
+            })),
+        );
+        assert_eq!(
+            session
+                .history
+                .loaded_run
+                .as_ref()
+                .map(|h| h.summary.id.as_str()),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn cycle_refresh_keeps_detail_and_new_selection_clears_it() {
+        let mut session = remote_session();
+        let summary: CycleSummary = serde_json::from_value(
+            serde_json::json!({"execution_id":"cycle-a","sample_count":0,"child_run_count":0}),
+        )
+        .expect("cycle");
+        session.history.selected_cycle = Some("cycle-a".to_owned());
+        session.history.loaded_cycle = Some(CycleHistory {
+            summary,
+            samples: Vec::new(),
+            child_runs: Vec::new(),
+        });
+        session.history_request(HistoryRequest::LoadCycle("cycle-a".to_owned()));
+        assert!(session.history.loaded_cycle.is_some());
+        session.history_request(HistoryRequest::LoadCycle("cycle-b".to_owned()));
+        assert!(session.history.loaded_cycle.is_none());
+        assert!(
+            session
+                .history
+                .pending(&HistoryRequest::LoadCycle("cycle-b".to_owned()))
+        );
+    }
+
+    #[test]
+    fn baseline_reorder_and_clear_do_not_request_telemetry() {
+        let mut session = remote_session();
+        session.history.comparison_ids = vec!["a".into(), "b".into(), "c".into()];
+        session.use_comparison_baseline("b");
+        assert_eq!(session.history.comparison_ids, ["b", "a", "c"]);
+        assert!(session.history.pending.is_empty());
+        session.remove_comparison_run("b");
+        assert_eq!(session.history.comparison_ids[0], "a");
+        session.clear_comparison();
+        assert!(session.history.comparison_ids.is_empty());
+        assert!(session.history.comparison_cache.is_empty());
     }
 
     #[test]
@@ -262,23 +557,33 @@ mod tests {
             step_index: 2,
         });
         let summary: CycleSummary = serde_json::from_value(serde_json::json!({ "execution_id": "old-cycle", "sample_count": 1, "child_run_count": 1 })).expect("cycle summary");
-        session
-            .history
-            .apply(HistoryEvent::Runs(vec![run("old"), child.clone()]));
-        session
-            .history
-            .apply(HistoryEvent::Cycles(vec![summary.clone()]));
-        session.history.apply(HistoryEvent::RunLoaded(RunHistory {
-            summary: run("old"),
-            samples: vec![sample.clone()],
-        }));
-        session
-            .history
-            .apply(HistoryEvent::CycleLoaded(CycleHistory {
+        receive(
+            &mut session.history,
+            HistoryRequest::RefreshRuns,
+            HistoryEvent::Runs(vec![run("old"), child.clone()]),
+        );
+        receive(
+            &mut session.history,
+            HistoryRequest::RefreshCycles,
+            HistoryEvent::Cycles(vec![summary.clone()]),
+        );
+        receive(
+            &mut session.history,
+            HistoryRequest::LoadRun("old".to_owned()),
+            HistoryEvent::RunLoaded(RunHistory {
+                summary: run("old"),
+                samples: vec![sample.clone()],
+            }),
+        );
+        receive(
+            &mut session.history,
+            HistoryRequest::LoadCycle("old-cycle".to_owned()),
+            HistoryEvent::CycleLoaded(CycleHistory {
                 summary,
                 samples: vec![cycle_sample.clone()],
                 child_runs: vec![child],
-            }));
+            }),
+        );
         session
             .history
             .renamed("old", false, Some("Renamed".to_owned()));
@@ -308,10 +613,14 @@ mod tests {
             Some("Renamed cycle")
         );
         // An older response arriving after selection changed cannot replace the selection.
-        session.history.apply(HistoryEvent::RunLoaded(RunHistory {
-            summary: run("stale"),
-            samples: Vec::new(),
-        }));
+        receive(
+            &mut session.history,
+            HistoryRequest::LoadRun("stale".to_owned()),
+            HistoryEvent::RunLoaded(RunHistory {
+                summary: run("stale"),
+                samples: Vec::new(),
+            }),
+        );
         assert_eq!(
             session
                 .history
@@ -329,9 +638,31 @@ mod tests {
         assert_eq!(session.current_test_config, snapshot.test.config);
         assert_eq!(session.capabilities, snapshot.capabilities);
         assert!(session.history.comparison_cache.contains_key("old"));
+        // History-only refreshes, failures, exports, and baseline edits must not
+        // replace the independently authoritative live snapshot.
+        session.history.comparison_ids.push("child".to_owned());
+        session.use_comparison_baseline("child");
+        session.history.pending.insert(HistoryRequest::RefreshRuns);
+        session.history.apply_result(
+            HistoryRequest::RefreshRuns,
+            Err("temporary failure".to_owned()),
+        );
+        session
+            .history
+            .pending
+            .insert(HistoryRequest::ExportRunCsv("old".to_owned()));
+        session.history.apply_result(
+            HistoryRequest::ExportRunCsv("old".to_owned()),
+            Err("temporary export failure".to_owned()),
+        );
         session.remove_comparison_run("old");
+        session.clear_comparison();
         assert_eq!(session.samples, snapshot.history);
+        assert_eq!(session.cycle_samples, snapshot.cycle_history);
+        assert_eq!(session.current_run, snapshot.current_run);
+        assert_eq!(session.cycle, snapshot.cycle);
         assert_eq!(session.current_test_config, snapshot.test.config);
+        assert_eq!(session.capabilities, snapshot.capabilities);
     }
 
     #[test]
@@ -339,7 +670,7 @@ mod tests {
         let mut session = DeviceSession::default();
         session.refresh_history();
         session.history_request(HistoryRequest::LoadRun("old".to_owned()));
-        assert_eq!(session.history.pending_requests, 0);
+        assert!(session.history.pending.is_empty());
         assert!(session.history.selected_run.is_none());
         assert!(session.command_error.is_none());
     }
@@ -353,10 +684,14 @@ mod tests {
         assert!(!session.add_comparison_run("b"));
         assert!(!session.add_comparison_run("e"));
         for id in ["a", "c", "b", "d"] {
-            session.history.apply(HistoryEvent::RunLoaded(RunHistory {
-                summary: run(id),
-                samples: Vec::new(),
-            }));
+            receive(
+                &mut session.history,
+                HistoryRequest::LoadRun(id.to_owned()),
+                HistoryEvent::RunLoaded(RunHistory {
+                    summary: run(id),
+                    samples: Vec::new(),
+                }),
+            );
         }
         assert_eq!(session.history.comparison_cache.len(), 4);
         assert_eq!(session.history.comparison_ids, ["a", "b", "c", "d"]);

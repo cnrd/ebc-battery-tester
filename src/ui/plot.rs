@@ -1,7 +1,7 @@
 //! Presentation-only views of bounded telemetry. Final run metrics come from `RunSummary`.
 use crate::core::{CycleSample, Sample, TestConfiguration, power_microwatts};
 use crate::session::DeviceSession;
-use crate::ui::format_duration;
+use crate::ui::{format_cycle_state, format_duration, format_test_state};
 use egui_plot::{AxisHints, HLine, Legend, Line, Plot, PlotPoint};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -113,30 +113,38 @@ pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
     if show_cycle {
         metric_controls(&mut options, ui);
         ui.label("X axis: Time");
-        cycle_samples_plot(
-            (
-                "live_cycle",
-                session.cycle.execution_id.as_deref(),
+        if session.cycle_samples.is_empty() {
+            ui.weak("No whole-cycle telemetry samples are available.");
+        } else {
+            cycle_samples_plot(
+                (
+                    "live_cycle",
+                    session.cycle.execution_id.as_deref(),
+                    options.metric,
+                ),
+                &session.cycle_samples,
                 options.metric,
-            ),
-            &session.cycle_samples,
-            options.metric,
-            ui,
-        );
+                ui,
+            );
+        }
     } else {
         physical_controls(&mut options, ui);
-        physical_samples_plot(
-            (
-                "live_run",
-                session.samples.last().map(|sample| sample.run_id.as_str()),
-                options.metric,
-                options.x_axis,
-            ),
-            &session.samples,
-            session.current_test_config,
-            options,
-            ui,
-        );
+        if session.samples.is_empty() {
+            ui.weak("No physical-run telemetry samples are available yet.");
+        } else {
+            physical_samples_plot(
+                (
+                    "live_run",
+                    session.samples.last().map(|sample| sample.run_id.as_str()),
+                    options.metric,
+                    options.x_axis,
+                ),
+                &session.samples,
+                session.current_test_config,
+                options,
+                ui,
+            );
+        }
     }
     ui.data_mut(|data| data.insert_temp(options_id, options));
 }
@@ -228,6 +236,10 @@ pub(crate) fn physical_samples_plot(
     options: PlotOptions,
     ui: &mut egui::Ui,
 ) {
+    if samples.is_empty() {
+        ui.weak("No telemetry samples are available for this run.");
+        return;
+    }
     let points = physical_points(samples, options);
     let label_formatter = |_name: &str, point: &PlotPoint| {
         samples
@@ -251,6 +263,7 @@ pub(crate) fn physical_samples_plot(
         options.metric.label(),
         options.x_axis == PhysicalXAxis::Time,
         label_formatter,
+        !references.is_empty(),
         ui,
         |plot_ui| {
             plot_ui.line(Line::new("run", points).name(options.metric.label()));
@@ -283,6 +296,10 @@ pub(crate) fn cycle_samples_plot(
     metric: PlotMetric,
     ui: &mut egui::Ui,
 ) {
+    if samples.is_empty() {
+        ui.weak("No whole-cycle telemetry samples are available.");
+        return;
+    }
     let points = cycle_points(samples, metric);
     let label_formatter = |_name: &str, point: &PlotPoint| {
         samples
@@ -300,15 +317,15 @@ pub(crate) fn cycle_samples_plot(
             })
             .map_or_else(String::new, |s| {
                 format!(
-                    "{}\n{:.3} V\n{:.3} A\n{:.3} W\nRepeat {} / Step {}\n{:?} / {:?}{}{}",
+                    "{}\n{:.3} V\n{:.3} A\n{:.3} W\nRepeat {} / Step {}\n{} / {}{}{}",
                     format_duration(s.elapsed_milliseconds as f64 / 1000.0),
                     f64::from(s.voltage_mv) / 1000.0,
                     f64::from(s.current_ma) / 1000.0,
                     power_w(s.voltage_mv, s.current_ma),
                     s.repeat_index + 1,
                     s.step_index + 1,
-                    s.cycle_state,
-                    s.test_state,
+                    format_cycle_state(s.cycle_state),
+                    format_test_state(&s.test_state),
                     s.test_capacity_mah
                         .map_or_else(String::new, |v| format!("\n{v} mAh")),
                     if s.test_capacity_mah.is_some() {
@@ -325,35 +342,45 @@ pub(crate) fn cycle_samples_plot(
         metric.label(),
         true,
         label_formatter,
+        false,
         ui,
         |plot_ui| plot_ui.line(Line::new("cycle", points).name(metric.label())),
     );
 }
 
+pub(crate) struct ComparisonCurve<'a> {
+    pub key: &'a str,
+    pub label: &'a str,
+    pub samples: &'a [Sample],
+}
+
 pub(crate) fn comparison_plot(
     id: impl std::hash::Hash,
-    runs: &[(&str, &[Sample])],
+    runs: &[ComparisonCurve<'_>],
     options: PlotOptions,
     ui: &mut egui::Ui,
 ) {
     let label_formatter = |name: &str, point: &PlotPoint| {
         runs.iter()
-            .find(|(label, _)| *label == name)
-            .and_then(|(_, samples)| {
-                samples.iter().min_by(|a, b| {
-                    let distance = |s: &Sample| {
-                        (
-                            (options.x_axis.value(s) - point.x).abs(),
-                            (options.metric.value(s.voltage_mv, s.current_ma) - point.y).abs(),
-                        )
-                    };
-                    distance(a)
-                        .partial_cmp(&distance(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            .find(|run| run.label == name || run.key == name)
+            .and_then(|run| {
+                run.samples
+                    .iter()
+                    .min_by(|a, b| {
+                        let distance = |s: &Sample| {
+                            (
+                                (options.x_axis.value(s) - point.x).abs(),
+                                (options.metric.value(s.voltage_mv, s.current_ma) - point.y).abs(),
+                            )
+                        };
+                        distance(a)
+                            .partial_cmp(&distance(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|sample| (run, sample))
             })
-            .map_or_else(String::new, |sample| {
-                format!("{name}\n{}", physical_tooltip(sample))
+            .map_or_else(String::new, |(run, sample)| {
+                format!("{}\n{}\n{}", run.label, run.key, physical_tooltip(sample))
             })
     };
     graph(
@@ -362,21 +389,29 @@ pub(crate) fn comparison_plot(
         options.metric.label(),
         options.x_axis == PhysicalXAxis::Time,
         label_formatter,
+        true,
         ui,
         |plot_ui| {
-            for (label, samples) in runs {
-                plot_ui.line(Line::new(*label, physical_points(samples, options)).name(*label));
+            for run in runs {
+                plot_ui.line(
+                    Line::new(run.key, physical_points(run.samples, options)).name(run.label),
+                );
             }
         },
     );
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "plot axis, legend, and drawing inputs are explicit"
+)]
 fn graph(
     id: impl std::hash::Hash,
     x_label: &str,
     y_label: &str,
     time_axis: bool,
     label_formatter: impl Fn(&str, &PlotPoint) -> String,
+    show_legend: bool,
     ui: &mut egui::Ui,
     draw: impl FnOnce(&mut egui_plot::PlotUi<'_>),
 ) {
@@ -384,12 +419,14 @@ fn graph(
     if time_axis {
         x = x.formatter(|mark, _| format_duration(mark.value));
     }
-    Plot::new(id)
-        .legend(Legend::default())
+    let mut plot = Plot::new(id)
         .label_formatter(label_formatter)
         .custom_x_axes(vec![x])
-        .custom_y_axes(vec![AxisHints::new_y().label(y_label)])
-        .show(ui, draw);
+        .custom_y_axes(vec![AxisHints::new_y().label(y_label)]);
+    if show_legend {
+        plot = plot.legend(Legend::default());
+    }
+    plot.show(ui, draw);
 }
 
 #[cfg(test)]

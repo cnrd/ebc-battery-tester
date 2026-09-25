@@ -85,18 +85,18 @@ pub(super) async fn remote_task(
                                 return;
                             }
                             if !received_snapshot {
-                                event_tx.send(BackendEvent::CommandError(
-                                    "browser is synchronizing the remote recipe library; command was not sent".to_owned(),
-                                ));
+                                let error = "browser is synchronizing the remote recipe library; command was not sent".to_owned();
+                                if let BackendCommand::History(request) = &command {
+                                    event_tx.send(BackendEvent::HistoryResult { request: request.clone(), result: Err(error) });
+                                } else {
+                                    event_tx.send(BackendEvent::CommandError(error));
+                                }
                                 continue;
                             }
                             match &command {
                                 BackendCommand::History(request) => {
                                     let result = fetch_history(request).await;
-                                    event_tx.send(match result {
-                                        Ok(event) => BackendEvent::History(event),
-                                        Err(error) => BackendEvent::HistoryError(error),
-                                    });
+                                    event_tx.send(BackendEvent::HistoryResult { request: request.clone(), result });
                                     continue;
                                 }
                                 BackendCommand::StartTest(request) => {

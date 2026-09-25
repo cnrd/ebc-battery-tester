@@ -237,9 +237,9 @@ fn send_backend_command(
     match &command {
         BackendCommand::History(request) => {
             let result = fetch_history(request, urls, agent);
-            event_tx.send(match result {
-                Ok(event) => BackendEvent::History(event),
-                Err(error) => BackendEvent::HistoryError(error),
+            event_tx.send(BackendEvent::HistoryResult {
+                request: request.clone(),
+                result,
             });
             return;
         }
@@ -1016,6 +1016,10 @@ mod tests {
         assert!(server.join().is_ok(), "test server panicked");
     }
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise every canonical history route in one fixture"
+    )]
     fn history_transport_reads_canonical_routes_without_mutation_headers_and_decodes_responses() {
         use crate::backend::{HistoryEvent, HistoryRequest};
         let run = serde_json::json!({"id":"run-1", "archived_at_utc":"now", "state":"completed", "elapsed_seconds":1, "sample_count":0});
@@ -1085,31 +1089,36 @@ mod tests {
             let (tx, mut rx) = mpsc::unbounded();
             let sender = BackendEventSender::new(tx, || {});
             send_backend_command(
-                BackendCommand::History(request),
+                BackendCommand::History(request.clone()),
                 &urls,
                 &ureq::agent(),
                 &sender,
             );
             let event = rx.try_recv().expect("history event");
             match event {
-                BackendEvent::History(HistoryEvent::Runs(runs)) => assert_eq!(runs[0].id, "run-1"),
-                BackendEvent::History(HistoryEvent::RunLoaded(history)) => {
-                    assert_eq!(history.summary.id, "run-1");
-                }
-                BackendEvent::History(HistoryEvent::Cycles(cycles)) => {
-                    assert_eq!(cycles[0].execution_id, "cycle-1");
-                }
-                BackendEvent::History(HistoryEvent::CycleLoaded(history)) => {
-                    assert_eq!(history.summary.execution_id, "cycle-1");
-                }
-                BackendEvent::History(HistoryEvent::FileExported(file)) => {
-                    assert_eq!(file.bytes, original);
-                    assert!(matches!(
-                        file.filename.as_str(),
-                        "run-1.csv" | "cycle-1.csv"
-                    ));
-                    assert_eq!(file.content_type, "text/csv");
-                }
+                BackendEvent::HistoryResult {
+                    request: response_request,
+                    result,
+                } if response_request == request => match result.expect("history result") {
+                    HistoryEvent::Runs(runs) => assert_eq!(runs[0].id, "run-1"),
+                    HistoryEvent::RunLoaded(history) => {
+                        assert_eq!(history.summary.id, "run-1");
+                    }
+                    HistoryEvent::Cycles(cycles) => {
+                        assert_eq!(cycles[0].execution_id, "cycle-1");
+                    }
+                    HistoryEvent::CycleLoaded(history) => {
+                        assert_eq!(history.summary.execution_id, "cycle-1");
+                    }
+                    HistoryEvent::FileExported(file) => {
+                        assert_eq!(file.bytes, original);
+                        assert!(matches!(
+                            file.filename.as_str(),
+                            "run-1.csv" | "cycle-1.csv"
+                        ));
+                        assert_eq!(file.content_type, "text/csv");
+                    }
+                },
                 other => panic!("unexpected history response: {other:?}"),
             }
             let raw_request = worker.join().expect("HTTP worker");
