@@ -3113,8 +3113,11 @@ async fn start_command(
     }
 }
 
-async fn get_info() -> Json<MachineApiInfo> {
-    Json(MachineApiInfo::current())
+async fn get_info() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(MachineApiInfo::current()),
+    )
 }
 
 async fn get_status(
@@ -3740,6 +3743,12 @@ mod tests {
         let headers = String::from_utf8_lossy(&response[..split]);
         assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
         assert!(headers.contains("application/json"), "{headers}");
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")),
+            "{headers}"
+        );
         let body: serde_json::Value =
             serde_json::from_slice(&response[split + 4..]).expect("info JSON");
         assert_eq!(body.as_object().expect("info object").len(), 4);

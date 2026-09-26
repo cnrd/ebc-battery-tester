@@ -1,13 +1,66 @@
 //! Shared semantic mapping for browser and native remote clients.
 
 use crate::backend::{BackendEvent, BackendEventSender, BackendState};
-use crate::core::{ApiCommand, SnapshotUpdate, WebSocketEvent};
+use crate::core::{ApiCommand, MACHINE_API_UNAVAILABLE_INFO, SnapshotUpdate, WebSocketEvent};
 
 /// Discovery failures distinguish reconnectable network errors from incompatible servers.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DiscoveryError {
     Transient(String),
     Incompatible(String),
+}
+
+/// One HTTP discovery policy for native and browser transports.
+pub(crate) fn check_discovery_status(status: u16) -> Result<(), DiscoveryError> {
+    match status {
+        200..=299 => Ok(()),
+        408 | 425 | 429 | 500..=599 => Err(DiscoveryError::Transient(format!(
+            "Machine API discovery temporarily failed with HTTP {status}."
+        ))),
+        404 | 405 => Err(DiscoveryError::Incompatible(
+            MACHINE_API_UNAVAILABLE_INFO.to_owned(),
+        )),
+        _ => Err(DiscoveryError::Incompatible(format!(
+            "Machine API discovery was rejected with HTTP {status}."
+        ))),
+    }
+}
+
+/// Unknown event tags are compatible extensions; invalid known events remain errors.
+pub(crate) fn decode_websocket_event(
+    text: &str,
+) -> Result<Option<WebSocketEvent>, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        event: String,
+    }
+    let envelope: Envelope = serde_json::from_str(text)?;
+    match envelope.event.as_str() {
+        "snapshot" | "update" | "sample" | "cycle_sample" | "recipe_library" | "recipe_upsert"
+        | "recipe_delete" => serde_json::from_str(text).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Required initial resources, tracked independently of their arrival order.
+#[derive(Default)]
+pub(crate) struct RemoteSynchronization {
+    received_snapshot: bool,
+    received_recipe_library: bool,
+}
+
+impl RemoteSynchronization {
+    pub(crate) fn observe(&mut self, event: &WebSocketEvent) {
+        match event {
+            WebSocketEvent::Snapshot(_) => self.received_snapshot = true,
+            WebSocketEvent::RecipeLibrary(_) => self.received_recipe_library = true,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.received_snapshot && self.received_recipe_library
+    }
 }
 
 pub(crate) const COMMAND_HEADER: &str = "X-EBC-Command";
@@ -109,11 +162,161 @@ impl RemoteUrls {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "protocol tests should fail fast")]
 mod tests {
     use futures::channel::mpsc;
 
     use super::*;
     use crate::core::{CalibrationCommand, CycleRecipe, SavedRecipe, TestConfiguration};
+
+    #[test]
+    fn discovery_status_policy_is_shared_and_precise() {
+        for status in [200, 201, 204, 299] {
+            assert_eq!(check_discovery_status(status), Ok(()));
+        }
+        for status in [400, 401, 403, 404, 405, 301] {
+            assert!(
+                matches!(
+                    check_discovery_status(status),
+                    Err(DiscoveryError::Incompatible(_))
+                ),
+                "HTTP {status}"
+            );
+        }
+        for status in [408, 425, 429, 500, 502, 503, 504, 599] {
+            assert!(
+                matches!(
+                    check_discovery_status(status),
+                    Err(DiscoveryError::Transient(_))
+                ),
+                "HTTP {status}"
+            );
+        }
+    }
+
+    fn known_events() -> Vec<WebSocketEvent> {
+        use crate::core::{AuthoritativeSnapshot, CycleSample, CycleState, Sample, TestState};
+        let snapshot = AuthoritativeSnapshot::default();
+        let recipe = SavedRecipe {
+            id: "recipe".to_owned(),
+            name: "Recipe".to_owned(),
+            recipe: CycleRecipe {
+                steps: Vec::new(),
+                repeat_count: 1,
+            },
+            revision: 1,
+            created_at_utc: String::new(),
+            updated_at_utc: String::new(),
+        };
+        let sample = Sample {
+            run_id: "run".to_owned(),
+            sequence: 0,
+            timestamp_utc: String::new(),
+            elapsed_seconds: 0,
+            voltage_mv: 4000,
+            current_ma: 1000,
+            capacity_mah: 0,
+            energy_wh: 0.0,
+            mode: crate::device::DeviceMode::DischargeConstantCurrent,
+        };
+        let cycle_sample = CycleSample {
+            execution_id: "cycle".to_owned(),
+            sequence: 0,
+            timestamp_utc: String::new(),
+            elapsed_milliseconds: 0,
+            repeat_index: 0,
+            step_index: 0,
+            cycle_state: CycleState::RunningStep,
+            test_state: TestState::Running,
+            mode: sample.mode,
+            activity_known: true,
+            active: true,
+            voltage_mv: 4000,
+            current_ma: 1000,
+            device_capacity_mah: 0,
+            test_capacity_mah: Some(0),
+            test_energy_wh: 0.0,
+        };
+        vec![
+            WebSocketEvent::Update(SnapshotUpdate::from(&snapshot)),
+            WebSocketEvent::Snapshot(snapshot),
+            WebSocketEvent::Sample(sample),
+            WebSocketEvent::CycleSample(cycle_sample),
+            WebSocketEvent::RecipeLibrary(vec![recipe.clone()]),
+            WebSocketEvent::RecipeUpsert(recipe),
+            WebSocketEvent::RecipeDelete("recipe".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn websocket_decoder_preserves_every_known_event() {
+        for event in known_events() {
+            let text = serde_json::to_string(&event).expect("serialize known event");
+            assert_eq!(
+                decode_websocket_event(&text).expect("decode event"),
+                Some(event)
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_decoder_distinguishes_extensions_from_malformed_protocol() {
+        for text in [
+            r#"{"event":"future_optional_event","payload":{"hello":"world"}}"#,
+            r#"{"event":"future_optional_event","payload":[null,42,"arbitrary"]}"#,
+            r#"{"event":"future_optional_event"}"#,
+        ] {
+            assert_eq!(
+                decode_websocket_event(text).expect("compatible extension"),
+                None
+            );
+        }
+        for text in [
+            "not JSON",
+            "{}",
+            r#"{"event":42}"#,
+            r#"{"event":"future","payload":}"#,
+        ] {
+            assert!(decode_websocket_event(text).is_err(), "{text}");
+        }
+        for event in known_events() {
+            let mut value = serde_json::to_value(event).expect("known event");
+            value["payload"] = serde_json::json!({"broken": true});
+            assert!(
+                decode_websocket_event(&value.to_string()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn synchronization_requires_both_resources_and_ignores_extensions() {
+        for reverse in [false, true] {
+            let mut sync = RemoteSynchronization::default();
+            let mut resources = [
+                WebSocketEvent::Snapshot(crate::core::AuthoritativeSnapshot::default()),
+                WebSocketEvent::RecipeLibrary(Vec::new()),
+            ];
+            if reverse {
+                resources.reverse();
+            }
+            assert!(!sync.is_ready());
+            for (index, event) in resources.iter().enumerate() {
+                let unknown = decode_websocket_event(r#"{"event":"future","payload":null}"#)
+                    .expect("extension");
+                if let Some(event) = unknown {
+                    sync.observe(&event);
+                }
+                assert!(!sync.is_ready());
+                sync.observe(event);
+                assert_eq!(sync.is_ready(), index == 1);
+            }
+            for event in known_events() {
+                sync.observe(&event);
+            }
+            assert!(sync.is_ready());
+        }
+    }
 
     fn config() -> TestConfiguration {
         TestConfiguration::DischargeConstantCurrent {

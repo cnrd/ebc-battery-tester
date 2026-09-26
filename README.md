@@ -398,7 +398,9 @@ does not change protocol behavior.
 
 Remote clients first request `GET /api/info`, without a mutation header. This
 version-neutral endpoint returns static metadata directly from the running
-binary, even when the tester is disconnected or the device actor is unavailable:
+binary, even when the tester is disconnected or the device actor is unavailable.
+It returns `Cache-Control: no-store` so discovery metadata is not retained across
+deployments:
 
 ```json
 {
@@ -427,8 +429,11 @@ check capability membership for features they need, and ignore unknown
 capability strings and optional JSON fields. Native remote and remote WASM GUIs
 validate service and API major before opening their state WebSocket. Missing or
 malformed discovery, a wrong service, or an unsupported major produces a clear
-connection error without starting synchronization. Local/direct USB and WebUSB
-operation do not use HTTP discovery.
+terminal connection error without starting synchronization; retry requires
+recreating the remote connection (or reloading the browser). Other discovery
+client errors are also terminal, except HTTP 408, 425, and 429. Those responses,
+HTTP 5xx, and temporary network failures use the existing bounded reconnect
+backoff. Local/direct USB and WebUSB operation do not use HTTP discovery.
 
 The initial external-integration v1 contract covers this surface:
 
@@ -444,7 +449,13 @@ The initial external-integration v1 contract covers this surface:
 
 The WebSocket initially sends `Snapshot`, then `RecipeLibrary`; subsequent
 state, sample, cycle-sample and recipe events maintain authoritative client
-views. Clients must tolerate compatible event variants they do not recognize.
+views. Clients apply each initial resource as it arrives, but accept commands
+only after both `Snapshot` and `RecipeLibrary` have arrived, in either order.
+Commands issued during discovery or initial synchronization are rejected rather
+than deferred. Unknown compatible event tags are ignored, including during
+initial synchronization. Malformed JSON or invalid payloads for known event tags
+remain protocol errors; they are logged and skipped. Incompatible changes to
+existing event semantics still require a new machine API major.
 Mutating endpoints still require `X-EBC-Command: 1` and the existing origin
 policy. The saved-recipe start body accepts an optional `execution_name`.
 Other existing routes remain available, but are not implicitly part of this

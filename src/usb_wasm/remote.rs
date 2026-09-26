@@ -8,7 +8,8 @@ use crate::core::{
 };
 use crate::remote_backend::{
     COMMAND_HEADER, DiscoveryError, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS,
-    command_endpoint, publish_websocket,
+    RemoteSynchronization, check_discovery_status, command_endpoint, decode_websocket_event,
+    publish_websocket,
 };
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
@@ -52,34 +53,49 @@ pub(super) async fn remote_task(
         match connection {
             Ok(socket) => {
                 let (mut writer, mut reader) = socket.split();
-                let mut received_snapshot = false;
+                let mut synchronization = RemoteSynchronization::default();
                 loop {
                     let message = reader.next().fuse();
                     let command = command_rx.next().fuse();
                     futures::pin_mut!(message, command);
                     futures::select! {
                         incoming = message => match incoming {
-                            Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
-                                Ok(WebSocketEvent::RecipeLibrary(subscription_library)) => {
-                                    let recipes = match fetch_recipes().await {
-                                        Ok(recipes) => recipes,
-                                        Err(error) => {
-                                            event_tx.send(BackendEvent::CommandError(
+                            Some(Ok(Message::Text(text))) => match decode_websocket_event(&text) {
+                                Ok(Some(event)) => {
+                                    let was_ready = synchronization.is_ready();
+                                    synchronization.observe(&event);
+                                    let refresh_recipes = matches!(&event, WebSocketEvent::RecipeLibrary(_));
+                                    publish_websocket(event, &event_tx);
+                                    if refresh_recipes {
+                                        let Some(result) = while_rejecting_commands(
+                                            fetch_recipes(), &mut command_rx, &event_tx,
+                                            "browser is synchronizing remote state; command was not sent",
+                                        ).await else {
+                                            let _closed = writer.close().await;
+                                            return;
+                                        };
+                                        match result {
+                                            Ok(recipes) => event_tx.send(BackendEvent::RecipeLibrary(recipes)),
+                                            Err(error) => event_tx.send(BackendEvent::CommandError(
                                                 format!("failed to refresh recipes: {error}"),
-                                            ));
-                                            subscription_library
+                                            )),
                                         }
-                                    };
-                                    event_tx.send(BackendEvent::RecipeLibrary(recipes));
-                                    if !received_snapshot {
-                                        received_snapshot = true;
+                                    }
+                                    if !was_ready && synchronization.is_ready() {
+                                        // Commands queued before readiness must never run after it.
+                                        while let Ok(command) = command_rx.try_recv() {
+                                            if matches!(command, BackendCommand::Shutdown) {
+                                                let _closed = writer.close().await;
+                                                return;
+                                            }
+                                            reject_command(command, &event_tx,
+                                                "browser is synchronizing remote state; command was not sent");
+                                        }
                                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                                         send_connection(&event_tx, BackendConnectionStatus::Connected);
                                     }
                                 }
-                                Ok(event) => {
-                                    publish_websocket(event, &event_tx);
-                                }
+                                Ok(None) => {}
                                 Err(error) => log::error!("invalid server websocket event: {error}"),
                             },
                             Some(Ok(Message::Bytes(_))) => {}
@@ -98,13 +114,9 @@ pub(super) async fn remote_task(
                                 let _closed = writer.close().await;
                                 return;
                             }
-                            if !received_snapshot {
-                                let error = "browser is synchronizing the remote recipe library; command was not sent".to_owned();
-                                if let BackendCommand::History(request) = &command {
-                                    event_tx.send(BackendEvent::HistoryResult { request: request.clone(), result: Err(error) });
-                                } else {
-                                    event_tx.send(BackendEvent::CommandError(error));
-                                }
+                            if !synchronization.is_ready() {
+                                reject_command(command, &event_tx,
+                                    "browser is synchronizing remote state; command was not sent");
                                 continue;
                             }
                             match &command {
@@ -268,9 +280,8 @@ pub(super) async fn remote_task(
             futures::select_biased! {
                 command = command => match command {
                     Some(BackendCommand::Shutdown) | None => return,
-                    Some(_) => event_tx.send(BackendEvent::CommandError(
-                        "browser is disconnected; command was not sent".to_owned(),
-                    )),
+                    Some(command) => reject_command(command, &event_tx,
+                        "browser is disconnected; command was not sent"),
                 },
                 () = timeout => break,
             }
@@ -279,9 +290,11 @@ pub(super) async fn remote_task(
             if matches!(command, BackendCommand::Shutdown) {
                 return;
             }
-            event_tx.send(BackendEvent::CommandError(
-                "browser is disconnected; command was not sent".to_owned(),
-            ));
+            reject_command(
+                command,
+                &event_tx,
+                "browser is disconnected; command was not sent",
+            );
         }
         reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
     }
@@ -291,40 +304,61 @@ async fn discover_while_disconnected(
     command_rx: &mut UnboundedReceiver<BackendCommand>,
     event_tx: &BackendEventSender,
 ) -> Option<Result<(), DiscoveryError>> {
-    let discovery = discover_machine_api().fuse();
-    futures::pin_mut!(discovery);
+    while_rejecting_commands(
+        discover_machine_api(),
+        command_rx,
+        event_tx,
+        "browser is verifying remote compatibility; command was not sent",
+    )
+    .await
+}
+
+fn reject_command(command: BackendCommand, event_tx: &BackendEventSender, message: &str) {
+    let error = message.to_owned();
+    if let BackendCommand::History(request) = command {
+        event_tx.send(BackendEvent::HistoryResult {
+            request,
+            result: Err(error),
+        });
+    } else {
+        event_tx.send(BackendEvent::CommandError(error));
+    }
+}
+
+async fn while_rejecting_commands<T>(
+    operation: impl std::future::Future<Output = T>,
+    command_rx: &mut UnboundedReceiver<BackendCommand>,
+    event_tx: &BackendEventSender,
+    message: &str,
+) -> Option<T> {
+    let operation = operation.fuse();
+    futures::pin_mut!(operation);
     loop {
         let command = command_rx.next().fuse();
         futures::pin_mut!(command);
         futures::select_biased! {
             command = command => match command {
                 Some(BackendCommand::Shutdown) | None => return None,
-                Some(command) => {
-                    let error = "browser is verifying remote compatibility; command was not sent".to_owned();
-                    if let BackendCommand::History(request) = command {
-                        event_tx.send(BackendEvent::HistoryResult { request, result: Err(error) });
-                    } else {
-                        event_tx.send(BackendEvent::CommandError(error));
-                    }
-                }
+                Some(command) => reject_command(command, event_tx, message),
             },
-            result = discovery => return Some(result),
+            result = operation => return Some(result),
         }
     }
 }
 
 async fn discover_machine_api() -> Result<(), DiscoveryError> {
-    let response = Request::get("/api/info").send().await.map_err(|error| {
+    let response = Request::get("/api/info")
+        .cache(web_sys::RequestCache::NoStore)
+        .send()
+        .await
+        .map_err(|error| {
+            DiscoveryError::Transient(format!("{MACHINE_API_UNAVAILABLE_INFO} {error}"))
+        })?;
+    check_discovery_status(response.status())?;
+    let body = response.text().await.map_err(|error| {
         DiscoveryError::Transient(format!("{MACHINE_API_UNAVAILABLE_INFO} {error}"))
     })?;
-    if !response.ok() {
-        return Err(DiscoveryError::Incompatible(
-            MACHINE_API_UNAVAILABLE_INFO.to_owned(),
-        ));
-    }
-    let info = response
-        .json::<MachineApiInfo>()
-        .await
+    let info: MachineApiInfo = serde_json::from_str(&body)
         .map_err(|_error| DiscoveryError::Incompatible(MACHINE_API_INVALID_INFO.to_owned()))?;
     validate_machine_api(&info).map_err(|error| DiscoveryError::Incompatible(error.to_string()))?;
     log::info!(

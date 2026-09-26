@@ -19,7 +19,8 @@ use crate::core::{
     MachineApiInfo, RecipeExport, SavedRecipe, WebSocketEvent, validate_machine_api,
 };
 use crate::remote_backend::{
-    COMMAND_HEADER, DiscoveryError, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, RemoteUrls,
+    COMMAND_HEADER, DiscoveryError, INITIAL_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS,
+    RemoteSynchronization, RemoteUrls, check_discovery_status, decode_websocket_event,
     publish_websocket,
 };
 
@@ -68,7 +69,11 @@ fn remote_thread(
             },
         ));
         attempted_connection = true;
-        let connection = match discover_machine_api(&urls, &agent) {
+        let discovery = discover_machine_api(&urls, &agent);
+        if reject_queued_commands(&mut command_rx, &event_tx) {
+            return;
+        }
+        let connection = match discovery {
             Ok(()) => connect_websocket(&urls),
             Err(DiscoveryError::Transient(error)) => Err(error),
             Err(DiscoveryError::Incompatible(error)) => {
@@ -83,9 +88,9 @@ fn remote_thread(
                 if let Err(error) = set_read_timeout(&mut socket, SOCKET_POLL_INTERVAL) {
                     publish_network_error(&event_tx, &error);
                 } else {
-                    let mut ready = false;
+                    let mut synchronization = RemoteSynchronization::default();
                     loop {
-                        if ready {
+                        if synchronization.is_ready() {
                             match command_rx.try_recv() {
                                 Ok(BackendCommand::Shutdown) | Err(TryRecvError::Closed) => {
                                     let _closed = socket.close(None);
@@ -103,32 +108,44 @@ fn remote_thread(
 
                         match socket.read() {
                             Ok(Message::Text(text)) => {
-                                match serde_json::from_str::<WebSocketEvent>(text.as_str()) {
-                                    Ok(WebSocketEvent::RecipeLibrary(subscription_library)) => {
-                                        let recipes = match fetch_recipes(&urls, &agent) {
-                                            Ok(recipes) => recipes,
-                                            Err(error) => {
-                                                publish_network_error(
+                                match decode_websocket_event(text.as_str()) {
+                                    Ok(Some(event)) => {
+                                        let was_ready = synchronization.is_ready();
+                                        synchronization.observe(&event);
+                                        if let WebSocketEvent::RecipeLibrary(subscription_library) =
+                                            event
+                                        {
+                                            event_tx.send(BackendEvent::RecipeLibrary(
+                                                subscription_library,
+                                            ));
+                                            match fetch_recipes(&urls, &agent) {
+                                                Ok(recipes) => event_tx
+                                                    .send(BackendEvent::RecipeLibrary(recipes)),
+                                                Err(error) => publish_network_error(
                                                     &event_tx,
                                                     &format!("failed to refresh recipes: {error}"),
-                                                );
-                                                subscription_library
+                                                ),
                                             }
-                                        };
-                                        event_tx.send(BackendEvent::RecipeLibrary(recipes));
-                                        ready = true;
-                                        connected_once = true;
-                                        reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
-                                        event_tx.send(BackendEvent::BackendConnectionChanged(
-                                            BackendConnectionStatus::Connected,
-                                        ));
-                                    }
-                                    Ok(event) => {
-                                        if matches!(event, WebSocketEvent::Snapshot(_)) {
-                                            connected_once = true;
+                                        } else {
+                                            publish_websocket(event, &event_tx);
                                         }
-                                        publish_websocket(event, &event_tx);
+                                        // Reject commands that arrived during the blocking socket read
+                                        // or recipe refresh before crossing the readiness boundary.
+                                        if !was_ready
+                                            && reject_queued_commands(&mut command_rx, &event_tx)
+                                        {
+                                            let _closed = socket.close(None);
+                                            return;
+                                        }
+                                        if !was_ready && synchronization.is_ready() {
+                                            connected_once = true;
+                                            reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+                                            event_tx.send(BackendEvent::BackendConnectionChanged(
+                                                BackendConnectionStatus::Connected,
+                                            ));
+                                        }
                                     }
+                                    Ok(None) => {}
                                     Err(error) => {
                                         log::error!("invalid server websocket event: {error}");
                                     }
@@ -175,19 +192,23 @@ fn remote_thread(
 }
 
 fn discover_machine_api(urls: &RemoteUrls, agent: &ureq::Agent) -> Result<(), DiscoveryError> {
-    let response = agent
-        .get(&format!("{}/api/info", urls.base))
-        .call()
-        .map_err(|error| match error {
-            ureq::Error::Status(_, _) => {
-                DiscoveryError::Incompatible(MACHINE_API_UNAVAILABLE_INFO.to_owned())
-            }
-            ureq::Error::Transport(error) => {
-                DiscoveryError::Transient(format!("{MACHINE_API_UNAVAILABLE_INFO} {error}"))
-            }
-        })?;
-    let info = response
-        .into_json::<MachineApiInfo>()
+    let response = match agent.get(&format!("{}/api/info", urls.base)).call() {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(error)) => {
+            return Err(DiscoveryError::Transient(format!(
+                "{MACHINE_API_UNAVAILABLE_INFO} {error}"
+            )));
+        }
+    };
+    check_discovery_status(response.status())?;
+    let body = response.into_string().map_err(|error| {
+        if error.kind() == ErrorKind::InvalidData {
+            DiscoveryError::Incompatible(MACHINE_API_INVALID_INFO.to_owned())
+        } else {
+            DiscoveryError::Transient(format!("failed to read machine API information: {error}"))
+        }
+    })?;
+    let info = serde_json::from_str::<MachineApiInfo>(&body)
         .map_err(|_error| DiscoveryError::Incompatible(MACHINE_API_INVALID_INFO.to_owned()))?;
     validate_machine_api(&info).map_err(|error| DiscoveryError::Incompatible(error.to_string()))?;
     log::info!(
@@ -618,16 +639,22 @@ fn reject_queued_commands(
     loop {
         match command_rx.try_recv() {
             Ok(BackendCommand::Shutdown) | Err(TryRecvError::Closed) => return true,
-            Ok(_) => reject_disconnected_command(event_tx),
+            Ok(command) => reject_disconnected_command(command, event_tx),
             Err(TryRecvError::Empty) => return false,
         }
     }
 }
 
-fn reject_disconnected_command(event_tx: &BackendEventSender) {
-    event_tx.send(BackendEvent::CommandError(
-        "remote client is disconnected; command was not sent".to_owned(),
-    ));
+fn reject_disconnected_command(command: BackendCommand, event_tx: &BackendEventSender) {
+    let error = "remote client is disconnected or synchronizing; command was not sent".to_owned();
+    if let BackendCommand::History(request) = command {
+        event_tx.send(BackendEvent::HistoryResult {
+            request,
+            result: Err(error),
+        });
+    } else {
+        event_tx.send(BackendEvent::CommandError(error));
+    }
 }
 
 fn publish_network_error(event_tx: &BackendEventSender, error: &str) {
@@ -650,8 +677,43 @@ mod tests {
         StartTestRequest, TestConfiguration, UpdateSavedRecipeRequest,
     };
 
+    fn accept_test_connection(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    listener
+                        .set_nonblocking(false)
+                        .expect("restore blocking accept");
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("read timeout");
+                    return stream;
+                }
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("expected connection: {other:?}"),
+            }
+        }
+    }
+
     fn serve_discovery(listener: &TcpListener, status: &str, body: &str) {
-        let (mut stream, _) = listener.accept().expect("accept discovery");
+        serve_read_request(listener, "/api/info", status, body, || {});
+    }
+
+    fn serve_read_request(
+        listener: &TcpListener,
+        path: &str,
+        status: &str,
+        body: &str,
+        before_response: impl FnOnce(),
+    ) {
+        let mut stream = accept_test_connection(listener);
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
@@ -663,9 +725,225 @@ mod tests {
             request.extend_from_slice(&buffer[..count]);
         }
         let request = String::from_utf8(request).expect("HTTP request");
-        assert!(request.starts_with("GET /api/info HTTP/1.1\r\n"));
+        assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
         assert!(!request.to_ascii_lowercase().contains("x-ebc-command"));
+        before_response();
         write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("discovery response");
+    }
+
+    fn next_event(events: &mut UnboundedReceiver<BackendEvent>) -> BackendEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match events.try_recv() {
+                Ok(event) => return event,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("expected backend event: {other:?}"),
+            }
+        }
+    }
+
+    fn queue_unready_commands(commands: &mpsc::UnboundedSender<BackendCommand>) {
+        commands
+            .unbounded_send(BackendCommand::Api(ApiCommand::Stop))
+            .expect("queue stop");
+        commands
+            .unbounded_send(BackendCommand::History(
+                crate::backend::HistoryRequest::RefreshRuns,
+            ))
+            .expect("queue history");
+    }
+
+    fn assert_unready_commands_rejected(events: &mut UnboundedReceiver<BackendEvent>) {
+        let mut stop_rejected = false;
+        let mut history_rejected = false;
+        while !(stop_rejected && history_rejected) {
+            match next_event(events) {
+                BackendEvent::CommandError(error) => {
+                    assert!(
+                        error.contains("command was not sent"),
+                        "unexpected error: {error}"
+                    );
+                    stop_rejected = true;
+                }
+                BackendEvent::HistoryResult { request, result } => {
+                    assert_eq!(request, crate::backend::HistoryRequest::RefreshRuns);
+                    assert!(
+                        result
+                            .expect_err("history rejected")
+                            .contains("command was not sent")
+                    );
+                    history_rejected = true;
+                }
+                BackendEvent::BackendConnectionChanged(
+                    BackendConnectionStatus::Connected | BackendConnectionStatus::Error(_),
+                ) => panic!("unexpected ready/error before initial resources"),
+                _ => {}
+            }
+        }
+    }
+
+    fn send_test_event(socket: &mut WebSocket<TcpStream>, event: &WebSocketEvent) {
+        socket
+            .send(Message::Text(
+                serde_json::to_string(event).expect("event JSON").into(),
+            ))
+            .expect("send event");
+    }
+
+    fn send_unknown_event(socket: &mut WebSocket<TcpStream>) {
+        socket
+            .send(Message::Text(
+                r#"{"event":"future_optional_event","payload":{"hello":"world"}}"#.into(),
+            ))
+            .expect("send future event");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "staged native setup verifies retries, both resource orders, and commands across blocking boundaries"
+    )]
+    fn discovery_retries_and_initial_resources_gate_commands_in_either_order() {
+        for snapshot_first in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+            let urls = RemoteUrls::parse(&format!(
+                "http://{}",
+                listener.local_addr().expect("address")
+            ))
+            .expect("URLs");
+            let (commands, command_rx) = mpsc::unbounded();
+            let (events_tx, mut events) = mpsc::unbounded();
+            let worker = spawn_backend(urls, command_rx, BackendEventSender::new(events_tx, || {}))
+                .expect("worker");
+            if snapshot_first {
+                serve_discovery(&listener, "503 Service Unavailable", "temporary outage");
+                loop {
+                    match next_event(&mut events) {
+                        BackendEvent::BackendConnectionChanged(
+                            BackendConnectionStatus::Reconnecting,
+                        ) => break,
+                        BackendEvent::BackendConnectionChanged(BackendConnectionStatus::Error(
+                            _,
+                        )) => panic!("503 must not be terminal"),
+                        BackendEvent::CommandError(error) => assert!(error.contains("503")),
+                        _ => {}
+                    }
+                }
+            }
+            let info = serde_json::to_string(&MachineApiInfo::current()).expect("info");
+            serve_read_request(&listener, "/api/info", "200 OK", &info, || {
+                queue_unready_commands(&commands);
+            });
+            assert_unready_commands_rejected(&mut events);
+            let stream = accept_test_connection(&listener);
+            let mut socket = tungstenite::accept(stream).expect("websocket");
+            send_unknown_event(&mut socket);
+            let snapshot = WebSocketEvent::Snapshot(AuthoritativeSnapshot::default());
+            let library = WebSocketEvent::RecipeLibrary(Vec::new());
+            let first = if snapshot_first { &snapshot } else { &library };
+            let last = if snapshot_first { &library } else { &snapshot };
+            send_test_event(&mut socket, first);
+            if !snapshot_first {
+                serve_read_request(&listener, "/api/recipes", "200 OK", "[]", || {});
+            }
+            // Observing the first payload proves it was processed, without making the client ready.
+            loop {
+                match next_event(&mut events) {
+                    BackendEvent::Snapshot(_) if snapshot_first => break,
+                    BackendEvent::RecipeLibrary(_) if !snapshot_first => break,
+                    BackendEvent::BackendConnectionChanged(
+                        BackendConnectionStatus::Connected | BackendConnectionStatus::Error(_),
+                    )
+                    | BackendEvent::CommandError(_) => {
+                        panic!("partial synchronization must not be ready or erroneous")
+                    }
+                    _ => {}
+                }
+            }
+            queue_unready_commands(&commands);
+            assert_unready_commands_rejected(&mut events);
+            send_unknown_event(&mut socket);
+            if !snapshot_first {
+                queue_unready_commands(&commands);
+            }
+            send_test_event(&mut socket, last);
+            if snapshot_first {
+                // These commands arrive while the last required resource's HTTP refresh blocks.
+                serve_read_request(&listener, "/api/recipes", "200 OK", "[]", || {
+                    queue_unready_commands(&commands);
+                });
+            }
+            assert_unready_commands_rejected(&mut events);
+            loop {
+                match next_event(&mut events) {
+                    BackendEvent::BackendConnectionChanged(BackendConnectionStatus::Connected) => {
+                        break;
+                    }
+                    BackendEvent::BackendConnectionChanged(
+                        BackendConnectionStatus::Error(_) | BackendConnectionStatus::Reconnecting,
+                    )
+                    | BackendEvent::CommandError(_) => panic!("valid synchronization failed"),
+                    _ => {}
+                }
+            }
+            send_unknown_event(&mut socket);
+            send_test_event(
+                &mut socket,
+                &WebSocketEvent::RecipeDelete("marker".to_owned()),
+            );
+            loop {
+                match next_event(&mut events) {
+                    BackendEvent::RecipeDeleted(id) => {
+                        assert_eq!(id, "marker");
+                        break;
+                    }
+                    BackendEvent::BackendConnectionChanged(_) | BackendEvent::CommandError(_) => {
+                        panic!("unknown event disturbed connected state")
+                    }
+                    _ => {}
+                }
+            }
+            commands
+                .unbounded_send(BackendCommand::Shutdown)
+                .expect("shutdown");
+            worker.join().expect("worker");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+                "unready commands must never issue HTTP requests"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_discovery_body_is_transient() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let urls = RemoteUrls::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("address")
+        ))
+        .expect("URLs");
+        let server = std::thread::spawn(move || {
+            let mut stream = accept_test_connection(&listener);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).expect("read request");
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"service\":").expect("partial discovery response");
+        });
+        let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
+        assert!(matches!(
+            discover_machine_api(&urls, &agent),
+            Err(DiscoveryError::Transient(_))
+        ));
+        server.join().expect("server");
     }
 
     #[test]
@@ -679,12 +957,10 @@ mod tests {
             (
                 "404 Not Found",
                 "missing".to_owned(),
-                MACHINE_API_UNAVAILABLE_INFO.to_owned(),
-            ),
-            (
-                "500 Internal Server Error",
-                "failed".to_owned(),
-                MACHINE_API_UNAVAILABLE_INFO.to_owned(),
+                match check_discovery_status(404) {
+                    Err(DiscoveryError::Incompatible(error)) => error,
+                    other => panic!("unexpected status classification: {other:?}"),
+                },
             ),
             (
                 "200 OK",

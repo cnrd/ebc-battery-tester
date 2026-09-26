@@ -38,6 +38,11 @@ pub struct MachineApiInfo {
 }
 
 impl MachineApiInfo {
+    /// Check feature membership without assuming any ordering or closed vocabulary.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|value| value == capability)
+    }
+
     /// Discovery metadata for this binary; never reads device or persisted state.
     pub fn current() -> Self {
         let capabilities = BTreeSet::from([
@@ -63,16 +68,16 @@ impl MachineApiInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MachineApiCompatibilityError {
     WrongService,
-    UnsupportedVersion { server_version: u32 },
+    UnsupportedVersion { api_version: u32 },
 }
 
 impl std::fmt::Display for MachineApiCompatibilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongService => write!(f, "Remote endpoint is not an EBC Battery Tester server."),
-            Self::UnsupportedVersion { server_version } => write!(
+            Self::UnsupportedVersion { api_version } => write!(
                 f,
-                "Server machine API version {server_version} is unsupported; this client supports version {MACHINE_API_VERSION}."
+                "Server machine API version {api_version} is unsupported; this client supports version {MACHINE_API_VERSION}."
             ),
         }
     }
@@ -91,7 +96,7 @@ pub fn validate_machine_api(info: &MachineApiInfo) -> Result<(), MachineApiCompa
     }
     if info.api_version != MACHINE_API_VERSION {
         return Err(MachineApiCompatibilityError::UnsupportedVersion {
-            server_version: info.api_version,
+            api_version: info.api_version,
         });
     }
     Ok(())
@@ -857,7 +862,7 @@ mod tests {
         let error = validate_machine_api(&info).expect_err("unsupported major");
         assert_eq!(
             error,
-            MachineApiCompatibilityError::UnsupportedVersion { server_version: 2 }
+            MachineApiCompatibilityError::UnsupportedVersion { api_version: 2 }
         );
         assert_eq!(
             error.to_string(),
@@ -877,6 +882,21 @@ mod tests {
         .expect("open vocabulary and additive fields");
         assert_eq!(validate_machine_api(&info), Ok(()));
         assert_eq!(info.capabilities[1], "future.unknown.feature");
+    }
+
+    #[test]
+    fn machine_api_supports_unsorted_open_capabilities() {
+        let mut info = MachineApiInfo::current();
+        info.capabilities = vec![
+            CAP_STATE_WEBSOCKET.to_owned(),
+            "future.unknown.feature".to_owned(),
+            CAP_RECIPES_LIST.to_owned(),
+        ];
+        assert!(info.supports(CAP_RECIPES_LIST));
+        assert!(info.supports("future.unknown.feature"));
+        assert!(!info.supports("unknown.absent"));
+        assert!(!info.supports(CAP_RECIPES_START));
+        assert_eq!(validate_machine_api(&info), Ok(()));
     }
 
     #[test]
