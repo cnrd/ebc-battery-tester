@@ -30,6 +30,7 @@ mod history;
 #[cfg(test)]
 mod history_tests;
 mod identity;
+mod mdns;
 
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CreateSavedRecipeRequest,
@@ -55,6 +56,7 @@ pub struct ServerConfig {
     pub serial_port: String,
     pub data_dir: PathBuf,
     pub mock: bool,
+    pub mdns: bool,
     pub static_dir: PathBuf,
 }
 
@@ -62,7 +64,7 @@ impl ServerConfig {
     /// Reads server configuration from the documented `EBC_*` variables.
     ///
     /// # Errors
-    /// Returns an error when the listen address or mock boolean is invalid.
+    /// Returns an error when the listen address or a boolean is invalid.
     pub fn from_env() -> Result<Self, String> {
         let http_addr = std::env::var("EBC_HTTP_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
@@ -72,6 +74,7 @@ impl ServerConfig {
             .unwrap_or_else(|_| "false".to_owned())
             .parse()
             .map_err(|error| format!("invalid EBC_MOCK boolean: {error}"))?;
+        let mdns = mdns::parse_enabled(std::env::var("EBC_MDNS").ok().as_deref())?;
         Ok(Self {
             http_addr,
             serial_port: std::env::var("EBC_SERIAL_PORT")
@@ -79,6 +82,7 @@ impl ServerConfig {
             data_dir: std::env::var_os("EBC_DATA_DIR")
                 .map_or_else(|| PathBuf::from("/data"), PathBuf::from),
             mock,
+            mdns,
             static_dir: std::env::var_os("EBC_STATIC_DIR")
                 .map_or_else(|| PathBuf::from("dist"), PathBuf::from),
         })
@@ -2926,6 +2930,12 @@ fn write_frame(
 pub async fn run(config: ServerConfig) -> Result<(), String> {
     let machine_info =
         MachineApiInfo::for_instance(identity::load_or_create_instance_id(&config.data_dir)?);
+    // Bind before starting the actor, so a bind failure cannot leave it running.
+    // The actual bound address also supplies the port when configured with port 0.
+    let listener = tokio::net::TcpListener::bind(config.http_addr)
+        .await
+        .map_err(|error| format!("failed to bind {}: {error}", config.http_addr))?;
+    let bound_addr = listener.local_addr().map_err(|error| error.to_string())?;
     let (actor_tx, actor_rx) = std_mpsc::channel();
     let (snapshot_tx, _) = broadcast::channel(SNAPSHOT_CHANNEL_CAPACITY);
     let actor_config = config.clone();
@@ -2966,7 +2976,7 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
     let state = AppState {
         actor_tx: actor_tx.clone(),
         allowed_origin: std::env::var("EBC_ALLOWED_ORIGIN").ok(),
-        machine_info,
+        machine_info: machine_info.clone(),
     };
     let static_files = ServeDir::new(&config.static_dir)
         .not_found_service(ServeFile::new(config.static_dir.join("index.html")));
@@ -2974,12 +2984,10 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         .nest("/api", api_router())
         .fallback_service(static_files)
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(config.http_addr)
-        .await
-        .map_err(|error| format!("failed to bind {}: {error}", config.http_addr))?;
+    let mut advertisement = mdns::Advertisement::start(config.mdns, bound_addr, &machine_info);
     log::info!(
         "ebc-server listening on {}; serial={}, data={}, static={}, mock={}",
-        config.http_addr,
+        bound_addr,
         config.serial_port,
         config.data_dir.display(),
         config.static_dir.display(),
@@ -2995,10 +3003,15 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         response: response_tx,
     });
     let _flushed = response_rx.await;
-    tokio::task::spawn_blocking(move || actor_thread.join())
+    let actor_result = tokio::task::spawn_blocking(move || actor_thread.join())
         .await
-        .map_err(|error| format!("failed to join device actor: {error}"))?
-        .map_err(|_panic_payload| "device actor panicked".to_owned())?;
+        .map_err(|error| format!("failed to join device actor: {error}"))
+        .and_then(|result| result.map_err(|_panic_payload| "device actor panicked".to_owned()));
+    // Discovery cleanup never delays the existing physical shutdown path.
+    if let Some(advertisement) = advertisement.as_mut() {
+        advertisement.shutdown().await;
+    }
+    actor_result?;
     server_result
 }
 
@@ -3816,6 +3829,7 @@ mod tests {
             let directory = temporary_directory(scenario);
             let (snapshot_tx, _) = broadcast::channel(16);
             let config = ServerConfig {
+                mdns: false,
                 http_addr: "127.0.0.1:0".parse().expect("test address"),
                 serial_port: "/dev/null".to_owned(),
                 data_dir: directory.clone(),
@@ -3874,6 +3888,7 @@ mod tests {
     fn installation_identity_depends_only_on_data_directory() {
         let directory = temporary_directory("identity-config");
         let initial = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/old-tester".to_owned(),
             data_dir: directory.clone(),
@@ -3899,6 +3914,7 @@ mod tests {
     async fn invalid_identity_prevents_actor_start_and_actor_failure_preserves_identity() {
         let directory = temporary_directory("identity-startup");
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/unused".to_owned(),
             data_dir: directory.clone(),
@@ -4039,6 +4055,7 @@ mod tests {
         let directory = temporary_directory(name);
         let (snapshot_tx, _) = broadcast::channel(16);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("test address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -5032,6 +5049,7 @@ mod tests {
 
         let (snapshot_tx, _) = broadcast::channel(1);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("test address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -5554,6 +5572,7 @@ mod tests {
         drop(actor);
         let (snapshot_tx, _) = broadcast::channel(4);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -5767,6 +5786,7 @@ mod tests {
 
         let (snapshot_tx, _) = broadcast::channel(4);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -5819,6 +5839,7 @@ mod tests {
 
         let (snapshot_tx, _) = broadcast::channel(4);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -6012,6 +6033,7 @@ mod tests {
         drop(actor);
         let (snapshot_tx, _) = broadcast::channel(4);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -6028,6 +6050,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration scenario keeps lifecycle assertions together"
+    )]
     fn cycle_names_use_sidecars_survive_restart_and_never_name_child_runs() {
         let (mut actor, directory) = mock_actor("cycle-names");
         confirm_inactive(&mut actor);
@@ -6091,6 +6117,7 @@ mod tests {
         drop(actor);
         let (snapshot_tx, _) = broadcast::channel(4);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),
@@ -6466,6 +6493,7 @@ mod tests {
 
         let (snapshot_tx, _) = broadcast::channel(4);
         let config = ServerConfig {
+            mdns: false,
             http_addr: "127.0.0.1:0".parse().expect("address"),
             serial_port: "/dev/null".to_owned(),
             data_dir: directory.clone(),

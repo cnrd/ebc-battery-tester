@@ -70,6 +70,7 @@ impl BackendClient {
         ctx: &egui::Context,
         target: BackendTarget,
         remote_url: &str,
+        expected_instance_id: Option<&str>,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -82,7 +83,12 @@ impl BackendClient {
             BackendTarget::Remote => {
                 let urls = crate::remote_backend::RemoteUrls::parse(remote_url)?;
                 (
-                    crate::remote_native::spawn_backend(urls, command_rx, event_tx)?,
+                    crate::remote_native::spawn_backend(
+                        urls,
+                        expected_instance_id.map(str::to_owned),
+                        command_rx,
+                        event_tx,
+                    )?,
                     true,
                 )
             }
@@ -174,9 +180,13 @@ mod tests {
             listener.local_addr().expect("sentinel address")
         );
         for url in ["not a remote URL", remote_url.as_str()] {
-            let mut client =
-                BackendClient::new(&egui::Context::default(), BackendTarget::Local, url)
-                    .expect("direct mode must initialize independently of remote discovery");
+            let mut client = BackendClient::new(
+                &egui::Context::default(),
+                BackendTarget::Local,
+                url,
+                Some("ignored invalid identity"),
+            )
+            .expect("direct mode must initialize independently of remote discovery");
             assert!(!client.is_remote());
             // Initialization and shutdown alone neither enumerate nor open serial devices.
             client.shutdown();

@@ -30,12 +30,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) fn spawn_backend(
     urls: RemoteUrls,
+    expected_instance_id: Option<String>,
     command_rx: UnboundedReceiver<BackendCommand>,
     event_tx: BackendEventSender,
 ) -> Result<JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name("ebc-remote-backend".to_owned())
-        .spawn(move || remote_thread(urls, command_rx, event_tx))
+        .spawn(move || remote_thread(urls, expected_instance_id, command_rx, event_tx))
         .map_err(|error| format!("failed to spawn remote backend thread: {error}"))
 }
 
@@ -49,6 +50,7 @@ pub(crate) fn spawn_backend(
 )]
 fn remote_thread(
     urls: RemoteUrls,
+    expected_instance_id: Option<String>,
     mut command_rx: UnboundedReceiver<BackendCommand>,
     event_tx: BackendEventSender,
 ) {
@@ -69,7 +71,7 @@ fn remote_thread(
             },
         ));
         attempted_connection = true;
-        let discovery = discover_machine_api(&urls, &agent);
+        let discovery = discover_machine_api(&urls, &agent, expected_instance_id.as_deref());
         if reject_queued_commands(&mut command_rx, &event_tx) {
             return;
         }
@@ -191,7 +193,11 @@ fn remote_thread(
     }
 }
 
-fn discover_machine_api(urls: &RemoteUrls, agent: &ureq::Agent) -> Result<(), DiscoveryError> {
+fn discover_machine_api(
+    urls: &RemoteUrls,
+    agent: &ureq::Agent,
+    expected_instance_id: Option<&str>,
+) -> Result<(), DiscoveryError> {
     let response = match agent.get(&format!("{}/api/info", urls.base)).call() {
         Ok(response) | Err(ureq::Error::Status(_, response)) => response,
         Err(ureq::Error::Transport(error)) => {
@@ -211,6 +217,29 @@ fn discover_machine_api(urls: &RemoteUrls, agent: &ureq::Agent) -> Result<(), Di
     let info = serde_json::from_str::<MachineApiInfo>(&body)
         .map_err(|_error| DiscoveryError::Incompatible(MACHINE_API_INVALID_INFO.to_owned()))?;
     validate_machine_api(&info).map_err(|error| DiscoveryError::Incompatible(error.to_string()))?;
+    if let Some(expected) = expected_instance_id {
+        if !info
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::core::CAP_INSTANCE_IDENTITY)
+        {
+            return Err(DiscoveryError::Incompatible(
+                "Discovered server identity could not be verified: /api/info lacks instance.identity."
+                    .to_owned(),
+            ));
+        }
+        let actual = info.instance_id.as_deref().ok_or_else(|| {
+            DiscoveryError::Incompatible(
+                "Discovered server identity could not be verified: /api/info has no instance_id."
+                    .to_owned(),
+            )
+        })?;
+        if actual != expected {
+            return Err(DiscoveryError::Incompatible(format!(
+                "Discovered server identity changed: advertisement reported {expected} but /api/info reported {actual}."
+            )));
+        }
+    }
     log::info!(
         "connected to {} {} machine API v{}",
         info.service,
@@ -223,13 +252,19 @@ fn discover_machine_api(urls: &RemoteUrls, agent: &ureq::Agent) -> Result<(), Di
 fn connect_websocket(urls: &RemoteUrls) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
     let parsed = url::Url::parse(&urls.websocket)
         .map_err(|error| format!("invalid WebSocket URL: {error}"))?;
+    // URL host strings include IPv6 brackets, which ToSocketAddrs does not accept.
     let host = parsed
-        .host_str()
+        .host()
         .ok_or_else(|| "WebSocket URL is missing a host".to_owned())?;
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| "WebSocket URL is missing a port".to_owned())?;
-    let addresses = (host, port)
+    let host = match host {
+        url::Host::Domain(domain) => domain.to_owned(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => address.to_string(),
+    };
+    let addresses = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|error| format!("failed to resolve remote server: {error}"))?;
     let mut last_error = None;
@@ -817,8 +852,13 @@ mod tests {
             .expect("URLs");
             let (commands, command_rx) = mpsc::unbounded();
             let (events_tx, mut events) = mpsc::unbounded();
-            let worker = spawn_backend(urls, command_rx, BackendEventSender::new(events_tx, || {}))
-                .expect("worker");
+            let worker = spawn_backend(
+                urls,
+                snapshot_first.then(|| TEST_INSTANCE_ID.to_owned()),
+                command_rx,
+                BackendEventSender::new(events_tx, || {}),
+            )
+            .expect("worker");
             if snapshot_first {
                 serve_discovery(&listener, "503 Service Unavailable", "temporary outage");
                 loop {
@@ -955,21 +995,53 @@ mod tests {
         });
         let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
         assert!(matches!(
-            discover_machine_api(&urls, &agent),
+            discover_machine_api(&urls, &agent, None),
             Err(DiscoveryError::Transient(_))
         ));
         server.join().expect("server");
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "discovery rejection cases share the same terminal-error and no-WebSocket assertions"
+    )]
     fn incompatible_discovery_stops_setup_without_websocket_or_commands() {
         let valid = serde_json::to_value(MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned()))
             .expect("info");
         let mut wrong_service = valid.clone();
         wrong_service["service"] = serde_json::json!("another-service");
-        let mut wrong_version = valid;
+        let mut wrong_version = valid.clone();
         wrong_version["api_version"] = serde_json::json!(crate::core::MACHINE_API_VERSION + 1);
+        let mut wrong_identity = valid.clone();
+        let other_id = "3f7fb259-89ef-49c2-a545-40ecf8d63e22";
+        wrong_identity["instance_id"] = serde_json::json!(other_id);
+        let mut missing_identity = valid.clone();
+        missing_identity
+            .as_object_mut()
+            .expect("info object")
+            .remove("instance_id");
+        let mut missing_capability = valid;
+        missing_capability["capabilities"]
+            .as_array_mut()
+            .expect("capabilities")
+            .retain(|capability| capability != crate::core::CAP_INSTANCE_IDENTITY);
         let cases = [
+            (
+                "200 OK",
+                wrong_identity.to_string(),
+                format!("Discovered server identity changed: advertisement reported {TEST_INSTANCE_ID} but /api/info reported {other_id}."),
+            ),
+            (
+                "200 OK",
+                missing_identity.to_string(),
+                "Discovered server identity could not be verified: /api/info has no instance_id.".to_owned(),
+            ),
+            (
+                "200 OK",
+                missing_capability.to_string(),
+                "Discovered server identity could not be verified: /api/info lacks instance.identity.".to_owned(),
+            ),
             (
                 "404 Not Found",
                 "missing".to_owned(),
@@ -1012,8 +1084,13 @@ mod tests {
             .expect("URLs");
             let (command_tx, command_rx) = mpsc::unbounded();
             let (event_tx, mut event_rx) = mpsc::unbounded();
-            let worker = spawn_backend(urls, command_rx, BackendEventSender::new(event_tx, || {}))
-                .expect("worker");
+            let worker = spawn_backend(
+                urls,
+                Some(TEST_INSTANCE_ID.to_owned()),
+                command_rx,
+                BackendEventSender::new(event_tx, || {}),
+            )
+            .expect("worker");
             serve_discovery(&listener, status, &body);
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut failure = None;
@@ -1050,6 +1127,23 @@ mod tests {
             cutoff_voltage_mv: 3000,
             cutoff_time_min: 0,
         }
+    }
+
+    #[test]
+    fn websocket_connects_to_ipv6_loopback() {
+        let listener = TcpListener::bind("[::1]:0").expect("IPv6 listener");
+        let urls = RemoteUrls::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("IPv6 address")
+        ))
+        .expect("IPv6 URLs");
+        let server = std::thread::spawn(move || {
+            let stream = accept_test_connection(&listener);
+            tungstenite::accept(stream).expect("IPv6 websocket handshake")
+        });
+        let socket = connect_websocket(&urls).expect("IPv6 websocket connection");
+        drop(socket);
+        drop(server.join().expect("IPv6 server"));
     }
 
     fn capture_backend_request(command: BackendCommand) -> String {
@@ -1407,7 +1501,7 @@ mod tests {
         let (command_tx, command_rx) = mpsc::unbounded();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         let event_tx = BackendEventSender::new(event_tx, || {});
-        let worker = spawn_backend(urls, command_rx, event_tx)
+        let worker = spawn_backend(urls, None, command_rx, event_tx)
             .unwrap_or_else(|error| panic!("failed to start remote worker: {error}"));
 
         let deadline = Instant::now() + Duration::from_secs(5);

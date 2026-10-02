@@ -211,8 +211,9 @@ impl DeviceSession {
         ctx: &egui::Context,
         target: BackendTarget,
         remote_url: &str,
+        expected_instance_id: Option<&str>,
     ) -> Result<Self, String> {
-        BackendClient::new(ctx, target, remote_url).map(Self::with_backend)
+        BackendClient::new(ctx, target, remote_url, expected_instance_id).map(Self::with_backend)
     }
 
     fn with_backend(backend: BackendClient) -> Self {
@@ -242,8 +243,9 @@ impl DeviceSession {
         ctx: &egui::Context,
         target: BackendTarget,
         remote_url: &str,
+        expected_instance_id: Option<&str>,
     ) -> Result<(), String> {
-        let replacement = Self::new(ctx, target, remote_url)?;
+        let replacement = Self::new(ctx, target, remote_url, expected_instance_id)?;
         *self = replacement;
         Ok(())
     }
@@ -1024,6 +1026,7 @@ mod tests {
             &context,
             BackendTarget::Remote,
             &format!("http://{address}"),
+            None,
         )
         .unwrap_or_else(|error| panic!("failed to create remote session: {error}"));
         session.saved_recipes = vec![saved_recipe("old", "Old", 9)];

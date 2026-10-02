@@ -31,6 +31,9 @@ The default Cargo feature builds the desktop GUI. It talks to the operating
 system serial port directly and is suitable when the computer remains attached.
 Closing the application stops and disconnects the test during orderly shutdown.
 
+The native app can also connect to an independent remote server using a manual
+URL or the **Discovered servers** list; see [LAN discovery](#lan-discovery-mdns).
+
 ### Direct WebUSB
 
 Standalone Trunk builds, GitHub Pages, CI artifacts, and release archives
@@ -122,6 +125,7 @@ The server accepts these environment variables:
 | `EBC_DATA_DIR` | `/data` | Persistent state directory |
 | `EBC_STATIC_DIR` | `dist` | Trunk static asset directory |
 | `EBC_MOCK` | `false` | Use the simulated device |
+| `EBC_MDNS` | `true` | Advertise the server on the LAN; `false` disables mDNS |
 | `EBC_ALLOWED_ORIGIN` | unset | Exact browser `Origin` accepted behind a reverse proxy |
 | `RUST_LOG` | `info` in Docker | Rust log filter |
 
@@ -404,6 +408,58 @@ not replace a real-device check.
 The available protocol documentation is ambiguous about serial parity. This
 project preserves the known-working odd-parity implementation; deployment work
 does not change protocol behavior.
+
+## LAN discovery (mDNS)
+
+The server advertises DNS-SD service type `_ebc-battery._tcp.local.` with exactly
+two TXT keys: `id=<persistent installation UUID>` and `api=1` (the machine API
+major). Its default instance name is `EBC Battery Tester <first8 UUID>` and its
+hostname is `ebc-<fullUUID>.local.`. DNS name conflict resolution does not change
+the UUID. The advertised port is the actual bound HTTP port, including when
+configured with port zero, not a container's externally mapped port.
+
+`EBC_MDNS=true` is the default; `EBC_MDNS=false` disables advertisement. Wildcard
+HTTP binds automatically advertise non-loopback interface addresses of the bound
+family (IPv4 for `0.0.0.0`, IPv6 for `::`); concrete binds advertise that address.
+Loopback-only binds skip advertisement. Advertisement failures are logged and
+nonfatal: HTTP and device operation remain available.
+IPv4-mapped IPv6 binds are conservatively not advertised; use an ordinary IPv4
+or IPv6 bind instead. Concrete scoped IPv6 publication stays on its bound interface.
+
+The native app browses continuously, independently of the selected backend or
+whether the discovery panel is open, and deduplicates installations by UUID.
+Select **Connect** explicitly to use a discovered server. Before opening its
+WebSocket, the client checks `/api/info` for the expected service, supported API
+major, `instance.identity` capability, and a UUID matching the discovery record.
+mDNS and this identity check are not authentication or proof of trust. Manual
+URLs remain supported, including older API-v1 servers without installation
+identity; applying a manual URL clears the discovered identity binding.
+
+**mDNS is unauthenticated discovery.** Anyone on the local multicast domain can
+advertise records. TXT `id` and `api` are hints; `/api/info` remains authoritative.
+The instance UUID is identity, not authentication, and matching it does not
+prevent malicious impersonation. No physical state or secrets are advertised.
+
+URL edits are drafts until **Apply**. The applied URL and selected discovered
+UUID are persisted, not unapplied drafts or discovery results. Switching to
+**Local USB** retains the last remote target; switching back uses that applied
+URL and UUID. Discovery updates never automatically switch servers or migrate a
+saved URL, even if the same UUID appears at a new address. Browsers and PWAs do
+not browse mDNS; open the server URL directly.
+
+Resolved IPv4 and unscoped IPv6 addresses (including ULA IPv6) produce numeric
+HTTP URLs, with IPv6 addresses in brackets. Scoped IPv6 link-local results are
+retained in discovery but are not connectable because the current URL stack
+cannot represent their scope; use a reachable IPv4 or unscoped IPv6 address.
+
+mDNS is link-local multicast and needs a network topology that passes multicast.
+Container bridge/NAT networks may hide advertisements, expose container-only
+addresses, or publish a different host port than the bound HTTP port.
+Container bridge networks may isolate
+advertisements from the LAN: use host/LAN networking or a suitable mDNS reflector.
+Mapped HTTP ports alone do not guarantee discovery or that an advertised endpoint
+is reachable. Manual URLs remain the fallback across routed networks, reverse
+proxies, and multicast restrictions.
 
 ## Machine API discovery and compatibility
 

@@ -447,6 +447,37 @@ Identity is not authentication, authorization, a secret, or proof of trust.
 
 ---
 
+# LAN discovery invariants
+
+- Advertise exactly `_ebc-battery._tcp.local.` with TXT keys only `id` (the
+  persistent installation UUID) and `api` (machine API major, currently `1`).
+  Default instance name is `EBC Battery Tester <first8 UUID>`; hostname is
+  `ebc-<fullUUID>.local.`. DNS name conflicts must not change installation identity.
+- Advertise the actual bound HTTP port, not a configured zero or external port
+  mapping. Wildcard binds auto-select non-loopback addresses of the bound family;
+  concrete binds advertise their address; loopback-only binds skip advertisement.
+- `EBC_MDNS` defaults to `true`; `false` disables advertisement. Advertisement
+  failures are nonfatal and must not alter HTTP, actor, or physical lifecycle.
+- Native browsing is continuous and independent of backend/panel state; deduplicate
+  by UUID. Discovery is a hint, never authentication or physical authority.
+- A discovered connection must verify HTTP `/api/info` service, supported API
+  major, `instance.identity`, and matching UUID before opening the WebSocket.
+  Manual URLs must still accept older compatible v1 servers without identity;
+  applying a manual URL clears the expected discovered UUID.
+- Persist only the applied remote URL and selected expected UUID, not URL drafts,
+  discovery caches, or remote telemetry. Local switching retains the remote target.
+  Discovery changes must never automatically switch backends or migrate saved URLs.
+  Discovery/resolution/removal must never issue physical device commands;
+  disappearance does not disconnect an active remote backend.
+- Preserve scoped IPv6 link-local discovery results, but do not offer connectable
+  URLs until the URL stack supports scope IDs. Use resolved numeric IPv4/unscoped
+  IPv6 URLs, including ULA IPv6, rather than relying on `.local` host resolution.
+- Browser/WASM clients do not browse mDNS. LAN multicast/container bridge
+  restrictions require host/LAN networking or a reflector; mapped HTTP ports alone
+  do not guarantee discovery or endpoint reachability.
+
+---
+
 # WIP API compatibility policy
 
 The current HTTP API was developed on the unreleased `wip` branch and is not yet a stable public compatibility boundary.

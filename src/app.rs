@@ -45,6 +45,12 @@ pub struct MainApp {
     #[serde(default = "default_remote_url")]
     remote_url: String,
     #[cfg(not(target_arch = "wasm32"))]
+    #[serde(default)]
+    remote_instance_id: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[serde(skip)]
+    discovery: Option<crate::mdns::NativeDiscovery>,
+    #[cfg(not(target_arch = "wasm32"))]
     #[serde(skip)]
     remote_url_draft: String,
     #[serde(skip)]
@@ -76,18 +82,27 @@ impl MainApp {
                 app.remote_url = default_remote_url();
             }
             app.remote_url_draft.clone_from(&app.remote_url);
-            app.session =
-                match DeviceSession::new(&cc.egui_ctx, app.backend_target, &app.remote_url) {
-                    Ok(session) => session,
-                    Err(error) => {
-                        app.backend_target = BackendTarget::Local;
-                        let mut session =
-                            DeviceSession::new(&cc.egui_ctx, BackendTarget::Local, &app.remote_url)
-                                .unwrap_or_default();
-                        session.command_error = Some(error);
-                        session
-                    }
-                };
+            app.discovery = Some(crate::mdns::NativeDiscovery::start(cc.egui_ctx.clone()));
+            app.session = match DeviceSession::new(
+                &cc.egui_ctx,
+                app.backend_target,
+                &app.remote_url,
+                app.remote_instance_id.as_deref(),
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    app.backend_target = BackendTarget::Local;
+                    let mut session = DeviceSession::new(
+                        &cc.egui_ctx,
+                        BackendTarget::Local,
+                        &app.remote_url,
+                        None,
+                    )
+                    .unwrap_or_default();
+                    session.command_error = Some(error);
+                    session
+                }
+            };
         }
         app.about_window = ui::about_window::AboutWindow::new(&cc.egui_ctx);
         app
@@ -95,13 +110,22 @@ impl MainApp {
 
     fn connection_ui(&mut self, ui: &mut egui::Ui) {
         #[cfg(not(target_arch = "wasm32"))]
-        ui::usb_panel::backend_selector(
-            &mut self.session,
-            &mut self.backend_target,
-            &mut self.remote_url,
-            &mut self.remote_url_draft,
-            ui,
-        );
+        {
+            let discovery = self
+                .discovery
+                .as_ref()
+                .map(crate::mdns::NativeDiscovery::snapshot)
+                .unwrap_or_default();
+            ui::usb_panel::backend_selector(
+                &mut self.session,
+                &mut self.backend_target,
+                &mut self.remote_url,
+                &mut self.remote_url_draft,
+                &mut self.remote_instance_id,
+                &discovery,
+                ui,
+            );
+        }
         ui::usb_panel::ui(&mut self.session, ui);
     }
 }
@@ -120,6 +144,10 @@ impl eframe::App for MainApp {
     // clients deliberately leave the independently running backend untouched.
     fn on_exit(&mut self) {
         self.session.shutdown();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.discovery = None;
+        }
     }
 
     #[expect(
@@ -269,6 +297,7 @@ mod tests {
         let app = MainApp {
             backend_target: BackendTarget::Remote,
             remote_url: "http://active.example:8080".to_owned(),
+            remote_instance_id: Some("7f7fb259-89ef-49c2-a545-40ecf8d63e22".to_owned()),
             remote_url_draft: "not a valid url".to_owned(),
             ..MainApp::default()
         };
@@ -279,7 +308,35 @@ mod tests {
 
         assert_eq!(restored.backend_target, BackendTarget::Remote);
         assert_eq!(restored.remote_url, "http://active.example:8080");
+        assert_eq!(restored.remote_instance_id, app.remote_instance_id);
         assert!(restored.remote_url_draft.is_empty());
         assert!(!serialized.contains("not a valid url"));
+        assert!(!serialized.contains("discovery"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn older_app_state_has_no_expected_remote_identity() {
+        let restored: MainApp = serde_json::from_str(r#"{"remote_url":"http://old.example:8080"}"#)
+            .unwrap_or_else(|error| panic!("failed to restore older app: {error}"));
+        assert_eq!(restored.remote_instance_id, None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn local_selection_preserves_remembered_discovered_target() {
+        let app = MainApp {
+            backend_target: BackendTarget::Local,
+            remote_url: "http://192.168.1.20:8080".to_owned(),
+            remote_instance_id: Some("7f7fb259-89ef-49c2-a545-40ecf8d63e22".to_owned()),
+            ..MainApp::default()
+        };
+        let serialized = serde_json::to_string(&app)
+            .unwrap_or_else(|error| panic!("failed to serialize app: {error}"));
+        let restored: MainApp = serde_json::from_str(&serialized)
+            .unwrap_or_else(|error| panic!("failed to restore app: {error}"));
+        assert_eq!(restored.backend_target, BackendTarget::Local);
+        assert_eq!(restored.remote_url, app.remote_url);
+        assert_eq!(restored.remote_instance_id, app.remote_instance_id);
     }
 }
