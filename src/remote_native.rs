@@ -677,6 +677,8 @@ mod tests {
         StartTestRequest, TestConfiguration, UpdateSavedRecipeRequest,
     };
 
+    const TEST_INSTANCE_ID: &str = "7f7fb259-89ef-49c2-a545-40ecf8d63e22";
+
     fn accept_test_connection(listener: &TcpListener) -> TcpStream {
         listener.set_nonblocking(true).expect("nonblocking accept");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -832,7 +834,20 @@ mod tests {
                     }
                 }
             }
-            let info = serde_json::to_string(&MachineApiInfo::current()).expect("info");
+            let mut info =
+                serde_json::to_value(MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned()))
+                    .expect("info");
+            if !snapshot_first {
+                // Older v1 servers without installation identity still synchronize normally.
+                info.as_object_mut()
+                    .expect("info object")
+                    .remove("instance_id");
+                info["capabilities"]
+                    .as_array_mut()
+                    .expect("capabilities")
+                    .retain(|capability| capability != crate::core::CAP_INSTANCE_IDENTITY);
+            }
+            let info = info.to_string();
             serve_read_request(&listener, "/api/info", "200 OK", &info, || {
                 queue_unready_commands(&commands);
             });
@@ -948,7 +963,8 @@ mod tests {
 
     #[test]
     fn incompatible_discovery_stops_setup_without_websocket_or_commands() {
-        let valid = serde_json::to_value(MachineApiInfo::current()).expect("info");
+        let valid = serde_json::to_value(MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned()))
+            .expect("info");
         let mut wrong_service = valid.clone();
         wrong_service["service"] = serde_json::json!("another-service");
         let mut wrong_version = valid;
@@ -1314,7 +1330,9 @@ mod tests {
         let snapshot = AuthoritativeSnapshot::default();
         let response_snapshot = snapshot.clone();
         let server = std::thread::spawn(move || {
-            let body = serde_json::to_string(&MachineApiInfo::current()).expect("info");
+            let body =
+                serde_json::to_string(&MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned()))
+                    .expect("info");
             serve_discovery(&listener, "200 OK", &body);
             let (websocket_stream, _) = listener
                 .accept()

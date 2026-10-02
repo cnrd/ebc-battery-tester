@@ -23,6 +23,7 @@ pub const CAP_RECIPES_LIST: &str = "recipes.list";
 pub const CAP_RECIPES_EVENTS: &str = "recipes.events";
 pub const CAP_RECIPES_START: &str = "recipes.start";
 pub const CAP_CYCLES_STOP: &str = "cycles.stop";
+pub const CAP_INSTANCE_IDENTITY: &str = "instance.identity";
 pub const MACHINE_API_INVALID_INFO: &str = "Server returned invalid machine API information.";
 pub const MACHINE_API_UNAVAILABLE_INFO: &str =
     "The remote server does not provide compatible machine API information.";
@@ -33,6 +34,9 @@ pub struct MachineApiInfo {
     pub service: String,
     pub server_version: String,
     pub api_version: u32,
+    /// Stable server installation identity; absent on older API-v1 servers.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Open string vocabulary: clients must tolerate unknown future capabilities.
     pub capabilities: Vec<String>,
 }
@@ -43,8 +47,9 @@ impl MachineApiInfo {
         self.capabilities.iter().any(|value| value == capability)
     }
 
-    /// Discovery metadata for this binary; never reads device or persisted state.
-    pub fn current() -> Self {
+    /// Discovery metadata for this binary and its already-loaded installation identity.
+    /// The server validates and persists the UUID before calling this constructor.
+    pub fn for_instance(instance_id: String) -> Self {
         let capabilities = BTreeSet::from([
             CAP_STATE_STATUS,
             CAP_STATE_WEBSOCKET,
@@ -52,6 +57,7 @@ impl MachineApiInfo {
             CAP_RECIPES_EVENTS,
             CAP_RECIPES_START,
             CAP_CYCLES_STOP,
+            CAP_INSTANCE_IDENTITY,
         ])
         .into_iter()
         .map(str::to_owned)
@@ -60,6 +66,7 @@ impl MachineApiInfo {
             service: MACHINE_API_SERVICE.to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             api_version: MACHINE_API_VERSION,
+            instance_id: Some(instance_id),
             capabilities,
         }
     }
@@ -823,16 +830,21 @@ fn cutoff_time(value: u16) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
 
+    const TEST_INSTANCE_ID: &str = "7f7fb259-89ef-49c2-a545-40ecf8d63e22";
+
     #[test]
     fn machine_api_info_is_canonical() {
-        let info = MachineApiInfo::current();
+        let info = MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned());
         assert_eq!(info.service, MACHINE_API_SERVICE);
         assert_eq!(info.server_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.api_version, 1);
+        assert_eq!(info.instance_id.as_deref(), Some(TEST_INSTANCE_ID));
+        assert!(info.supports(CAP_INSTANCE_IDENTITY));
         assert_eq!(
             info.capabilities,
             [
                 CAP_CYCLES_STOP,
+                CAP_INSTANCE_IDENTITY,
                 CAP_RECIPES_EVENTS,
                 CAP_RECIPES_LIST,
                 CAP_RECIPES_START,
@@ -844,8 +856,8 @@ mod tests {
     }
 
     #[test]
-    fn machine_api_validation_checks_identity_and_major_only() {
-        let mut info = MachineApiInfo::current();
+    fn machine_api_validation_checks_service_and_major_only() {
+        let mut info = MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned());
         assert_eq!(validate_machine_api(&info), Ok(()));
         info.server_version = "future informational release".to_owned();
         info.capabilities.clear();
@@ -871,6 +883,23 @@ mod tests {
     }
 
     #[test]
+    fn old_machine_api_v1_without_instance_identity_remains_compatible() {
+        let info: MachineApiInfo = serde_json::from_value(serde_json::json!({
+            "service": MACHINE_API_SERVICE,
+            "server_version": "0.5.0",
+            "api_version": 1,
+            "capabilities": [
+                CAP_CYCLES_STOP, CAP_RECIPES_EVENTS, CAP_RECIPES_LIST,
+                CAP_RECIPES_START, CAP_STATE_STATUS, CAP_STATE_WEBSOCKET
+            ]
+        }))
+        .expect("pre-identity API-v1 discovery");
+        assert_eq!(info.instance_id, None);
+        assert!(!info.supports(CAP_INSTANCE_IDENTITY));
+        assert_eq!(validate_machine_api(&info), Ok(()));
+    }
+
+    #[test]
     fn machine_api_accepts_unknown_capabilities_and_optional_fields() {
         let info: MachineApiInfo = serde_json::from_value(serde_json::json!({
             "service": MACHINE_API_SERVICE,
@@ -886,7 +915,7 @@ mod tests {
 
     #[test]
     fn machine_api_supports_unsorted_open_capabilities() {
-        let mut info = MachineApiInfo::current();
+        let mut info = MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned());
         info.capabilities = vec![
             CAP_STATE_WEBSOCKET.to_owned(),
             "future.unknown.feature".to_owned(),
@@ -901,7 +930,8 @@ mod tests {
 
     #[test]
     fn machine_api_required_fields_and_types_are_explicit() {
-        let info = serde_json::to_value(MachineApiInfo::current()).expect("serialize info");
+        let info = serde_json::to_value(MachineApiInfo::for_instance(TEST_INSTANCE_ID.to_owned()))
+            .expect("serialize info");
         for field in ["service", "server_version", "api_version", "capabilities"] {
             let mut missing = info.clone();
             missing.as_object_mut().expect("object").remove(field);

@@ -513,6 +513,7 @@ async fn history_http_routes_are_bounded_read_only_and_device_independent() {
         .with_state(AppState {
             actor_tx,
             allowed_origin: None,
+            machine_info: tests::fixture_machine_info(),
         });
     let server = tokio::spawn(axum::serve(listener, router).into_future());
     let mut paths = vec![

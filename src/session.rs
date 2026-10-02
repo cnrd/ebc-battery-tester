@@ -1079,8 +1079,10 @@ mod tests {
             request.extend_from_slice(&buffer[..count]);
         }
         assert!(String::from_utf8_lossy(&request).starts_with("GET /api/info HTTP/1.1\r\n"));
-        let body = serde_json::to_string(&crate::core::MachineApiInfo::current())
-            .unwrap_or_else(|error| panic!("serialize discovery: {error}"));
+        let body = serde_json::to_string(&crate::core::MachineApiInfo::for_instance(
+            "7f7fb259-89ef-49c2-a545-40ecf8d63e22".to_owned(),
+        ))
+        .unwrap_or_else(|error| panic!("serialize discovery: {error}"));
         write!(discovery, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap_or_else(|error| panic!("send discovery: {error}"));
     }
 

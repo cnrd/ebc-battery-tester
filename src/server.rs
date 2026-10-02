@@ -29,6 +29,7 @@ use crate::controller::{
 mod history;
 #[cfg(test)]
 mod history_tests;
+mod identity;
 
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CreateSavedRecipeRequest,
@@ -88,6 +89,7 @@ impl ServerConfig {
 struct AppState {
     actor_tx: std_mpsc::Sender<ActorMessage>,
     allowed_origin: Option<String>,
+    machine_info: MachineApiInfo,
 }
 
 enum ActorRequest {
@@ -2922,6 +2924,8 @@ fn write_frame(
 /// Returns an error if persistence initialization, listener binding, or HTTP
 /// serving fails.
 pub async fn run(config: ServerConfig) -> Result<(), String> {
+    let machine_info =
+        MachineApiInfo::for_instance(identity::load_or_create_instance_id(&config.data_dir)?);
     let (actor_tx, actor_rx) = std_mpsc::channel();
     let (snapshot_tx, _) = broadcast::channel(SNAPSHOT_CHANNEL_CAPACITY);
     let actor_config = config.clone();
@@ -2962,6 +2966,7 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
     let state = AppState {
         actor_tx: actor_tx.clone(),
         allowed_origin: std::env::var("EBC_ALLOWED_ORIGIN").ok(),
+        machine_info,
     };
     let static_files = ServeDir::new(&config.static_dir)
         .not_found_service(ServeFile::new(config.static_dir.join("index.html")));
@@ -3113,10 +3118,10 @@ async fn start_command(
     }
 }
 
-async fn get_info() -> impl IntoResponse {
+async fn get_info(State(state): State<AppState>) -> impl IntoResponse {
     (
         [(header::CACHE_CONTROL, "no-store")],
-        Json(MachineApiInfo::current()),
+        Json(state.machine_info),
     )
 }
 
@@ -3703,7 +3708,10 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
 
-    async fn fetch_machine_info(actor_tx: std_mpsc::Sender<ActorMessage>) -> MachineApiInfo {
+    async fn fetch_machine_info(
+        actor_tx: std_mpsc::Sender<ActorMessage>,
+        machine_info: MachineApiInfo,
+    ) -> MachineApiInfo {
         use std::future::IntoFuture as _;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -3716,6 +3724,7 @@ mod tests {
             .with_state(AppState {
                 actor_tx,
                 allowed_origin: None,
+                machine_info,
             });
         let server = tokio::spawn(axum::serve(listener, router).into_future());
         let mut stream = tokio::net::TcpStream::connect(address)
@@ -3751,20 +3760,28 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_slice(&response[split + 4..]).expect("info JSON");
-        assert_eq!(body.as_object().expect("info object").len(), 4);
+        assert_eq!(body.as_object().expect("info object").len(), 5);
         serde_json::from_value(body).expect("machine API info shape")
     }
 
     #[tokio::test]
     async fn machine_info_is_available_without_actor_or_mutation_header() {
         use crate::core::{
-            CAP_CYCLES_STOP, CAP_RECIPES_EVENTS, CAP_RECIPES_LIST, CAP_RECIPES_START,
-            CAP_STATE_STATUS, CAP_STATE_WEBSOCKET, MACHINE_API_SERVICE, MACHINE_API_VERSION,
+            CAP_CYCLES_STOP, CAP_INSTANCE_IDENTITY, CAP_RECIPES_EVENTS, CAP_RECIPES_LIST,
+            CAP_RECIPES_START, CAP_STATE_STATUS, CAP_STATE_WEBSOCKET, MACHINE_API_SERVICE,
+            MACHINE_API_VERSION,
         };
 
         let (actor_tx, actor_rx) = std_mpsc::channel();
         drop(actor_rx);
-        let info = fetch_machine_info(actor_tx).await;
+        let directory = temporary_directory("info-identity");
+        let id = identity::load_or_create_instance_id(&directory).expect("persistent identity");
+        let expected = MachineApiInfo::for_instance(id.clone());
+        let info = fetch_machine_info(actor_tx.clone(), expected.clone()).await;
+        assert_eq!(info.instance_id.as_deref(), Some(id.as_str()));
+        // The live HTTP context remains fixed even if the on-disk file becomes unavailable.
+        fs::remove_dir_all(directory).expect("remove backing data");
+        assert_eq!(fetch_machine_info(actor_tx, expected).await, info);
         assert_eq!(info.service, MACHINE_API_SERVICE);
         assert_eq!(info.api_version, MACHINE_API_VERSION);
         assert_eq!(info.server_version, env!("CARGO_PKG_VERSION"));
@@ -3772,6 +3789,7 @@ mod tests {
             info.capabilities,
             [
                 CAP_CYCLES_STOP,
+                CAP_INSTANCE_IDENTITY,
                 CAP_RECIPES_EVENTS,
                 CAP_RECIPES_LIST,
                 CAP_RECIPES_START,
@@ -3784,12 +3802,16 @@ mod tests {
 
     #[tokio::test]
     async fn machine_info_is_identical_across_actor_states_and_construction_modes() {
-        let expected = MachineApiInfo::current();
+        let identity_directory = temporary_directory("info-state-identity");
+        let expected = MachineApiInfo::for_instance(
+            identity::load_or_create_instance_id(&identity_directory).expect("identity"),
+        );
         for scenario in [
             "normal-disconnected",
             "mock-disconnected",
             "mock-idle",
             "mock-active",
+            "mock-cycle",
         ] {
             let directory = temporary_directory(scenario);
             let (snapshot_tx, _) = broadcast::channel(16);
@@ -3802,11 +3824,24 @@ mod tests {
             };
             // Construct normal mode without opening any serial device.
             let mut actor = DeviceActor::new(config, snapshot_tx).expect("create actor");
-            if matches!(scenario, "mock-idle" | "mock-active") {
+            if matches!(scenario, "mock-idle" | "mock-active" | "mock-cycle") {
                 confirm_inactive(&mut actor);
             }
             if scenario == "mock-active" {
                 confirm_running(&mut actor);
+            }
+            if scenario == "mock-cycle" {
+                assert!(
+                    actor
+                        .start_cycle(unnamed_cycle(cycle_recipe(
+                            vec![crate::core::CycleStep::Rest {
+                                duration_seconds: 60
+                            }],
+                            1,
+                        )))
+                        .is_ok()
+                );
+                assert!(!matches!(actor.snapshot.cycle.state, CycleState::Idle));
             }
             let before = actor.current_snapshot();
             actor.sent_frames.clear();
@@ -3817,13 +3852,85 @@ mod tests {
                 }
                 actor
             });
-            assert_eq!(fetch_machine_info(actor_tx).await, expected, "{scenario}");
+            assert_eq!(
+                fetch_machine_info(actor_tx, expected.clone()).await,
+                expected,
+                "{scenario}"
+            );
             let mut actor = worker.join().expect("actor stopped");
             assert_eq!(actor.current_snapshot(), before, "{scenario}");
             assert!(actor.sent_frames.is_empty(), "{scenario}");
             drop(actor);
             fs::remove_dir_all(directory).expect("remove test directory");
         }
+        fs::remove_dir_all(identity_directory).expect("remove identity directory");
+    }
+
+    pub(super) fn fixture_machine_info() -> MachineApiInfo {
+        MachineApiInfo::for_instance("7f7fb259-89ef-49c2-a545-40ecf8d63e22".to_owned())
+    }
+
+    #[test]
+    fn installation_identity_depends_only_on_data_directory() {
+        let directory = temporary_directory("identity-config");
+        let initial = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/old-tester".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.join("old-static"),
+        };
+        let changed = ServerConfig {
+            http_addr: "0.0.0.0:12345".parse().expect("changed address"),
+            serial_port: "/dev/replacement-tester".to_owned(),
+            mock: false,
+            static_dir: directory.join("new-static"),
+            ..initial.clone()
+        };
+        let id = identity::load_or_create_instance_id(&initial.data_dir).expect("first start");
+        assert_eq!(
+            identity::load_or_create_instance_id(&changed.data_dir).expect("changed configuration"),
+            id
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn invalid_identity_prevents_actor_start_and_actor_failure_preserves_identity() {
+        let directory = temporary_directory("identity-startup");
+        let config = ServerConfig {
+            http_addr: "127.0.0.1:0".parse().expect("address"),
+            serial_port: "/dev/unused".to_owned(),
+            data_dir: directory.clone(),
+            mock: true,
+            static_dir: directory.clone(),
+        };
+        fs::write(directory.join("instance-id"), "broken").expect("bad identity");
+        assert!(
+            run(config.clone())
+                .await
+                .expect_err("startup fails")
+                .contains("invalid server instance identity")
+        );
+        assert!(
+            !directory.join("runs").exists(),
+            "actor persistence must not initialize"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("instance-id")).expect("unchanged"),
+            "broken"
+        );
+        fs::remove_file(directory.join("instance-id")).expect("remove test corruption");
+        fs::write(directory.join("session.json"), "{").expect("bad session");
+        assert!(
+            run(config).await.is_err(),
+            "malformed session must fail actor startup"
+        );
+        let committed = fs::read(directory.join("instance-id")).expect("identity committed first");
+        let id = identity::load_or_create_instance_id(&directory)
+            .expect("identity survives actor failure");
+        assert_eq!(committed, format!("{id}\n").as_bytes());
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     fn temporary_directory(name: &str) -> PathBuf {
@@ -6416,6 +6523,7 @@ mod tests {
         let mut state = AppState {
             actor_tx,
             allowed_origin: None,
+            machine_info: fixture_machine_info(),
         };
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "tester.local".parse().expect("host"));

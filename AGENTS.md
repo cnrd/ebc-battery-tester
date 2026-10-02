@@ -419,6 +419,34 @@ This persistence-compatibility preference is separate from HTTP API compatibilit
 
 ---
 
+# Server installation identity
+
+`ebc-server` owns one persistent random UUID-v4 stored as canonical lowercase
+hyphenated text plus a newline in `EBC_DATA_DIR/instance-id`.
+
+Identity belongs to the logical persistent server/data directory, not its URL,
+host, container, USB adapter, or physical tester. Migration, backup/restore, and
+cloning of the data directory retain that identity.
+
+Missing identity is generated once with no-clobber creation and file/directory
+sync before use. Malformed, empty, or unreadable existing identity is fatal and
+must never be silently regenerated. Persistence failures must not fall back to
+an ephemeral identity.
+
+Startup resolves identity into immutable server-level machine info before HTTP
+service begins. `GET /api/info` exposes optional `instance_id` with capability
+`instance.identity`, remains actor-independent, and returns `Cache-Control: no-store`.
+The capability guarantees a present instance UUID on current servers.
+
+This is an additive machine API v1 feature. Generic v1 clients, including the
+remote GUI, must tolerate absence of the identity field/capability on older
+servers. Identity stays outside device/controller state, snapshots, WebSocket
+events, execution metadata, and direct-mode application storage.
+
+Identity is not authentication, authorization, a secret, or proof of trust.
+
+---
+
 # WIP API compatibility policy
 
 The current HTTP API was developed on the unreleased `wip` branch and is not yet a stable public compatibility boundary.

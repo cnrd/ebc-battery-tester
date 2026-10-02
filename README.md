@@ -125,7 +125,18 @@ The server accepts these environment variables:
 | `EBC_ALLOWED_ORIGIN` | unset | Exact browser `Origin` accepted behind a reverse proxy |
 | `RUST_LOG` | `info` in Docker | Rust log filter |
 
-Persist `/data`. `session.json` stores the current device/test metadata,
+Persist `/data`. On first startup, the server generates a random UUID-v4 and
+stores its canonical lowercase hyphenated text plus a newline in
+`/data/instance-id`. Existing installations without that file receive an identity
+automatically on their first upgraded startup. The file is retained across
+restarts and upgrades; an unreadable, empty, or malformed existing identity
+fails startup and is preserved for operator intervention, never silently replaced.
+Backups and restores that include this file retain the same installation identity.
+Copying the entire data directory also copies that logical identity: use
+independently provisioned persistent state for an independent second server,
+rather than running two live clones with the same identity.
+
+`session.json` stores the current device/test metadata,
 including the current run name, and `samples.csv` stores current-run
 measurements. Manual runs are archived as soon as a device report confirms
 Completed or Stopped, while their current graph and immutable run ID remain
@@ -397,8 +408,10 @@ does not change protocol behavior.
 ## Machine API discovery and compatibility
 
 Remote clients first request `GET /api/info`, without a mutation header. This
-version-neutral endpoint returns static metadata directly from the running
-binary, even when the tester is disconnected or the device actor is unavailable.
+version-neutral endpoint returns pre-resolved metadata for the running binary
+and persistent installation, even when the tester is disconnected or the device
+actor is unavailable. Identity is resolved before HTTP service starts and is
+fixed for the process lifetime; discovery makes no actor request or disk read.
 It returns `Cache-Control: no-store` so discovery metadata is not retained across
 deployments:
 
@@ -407,8 +420,10 @@ deployments:
   "service": "ebc-battery-tester",
   "server_version": "0.5.0",
   "api_version": 1,
+  "instance_id": "7f7fb259-89ef-49c2-a545-40ecf8d63e22",
   "capabilities": [
     "cycles.stop",
+    "instance.identity",
     "recipes.events",
     "recipes.list",
     "recipes.start",
@@ -423,6 +438,24 @@ application/package release; clients must **not** use it for feature detection.
 `api_version` is the machine API **major compatibility version**, independent of
 application releases. `capabilities` is a sorted, unique array of strings for
 additive feature discovery.
+
+`instance_id` is the stable UUID of one logical server installation. It follows
+`EBC_DATA_DIR` across host, container, URL, and port changes and is independent
+of the tester or USB adapter. It is an identifier, not a secret, authentication
+credential, authorization token, or proof of trust.
+
+When `instance.identity` is advertised, `instance_id` must be present and contain
+the stable installation UUID. This is an additive API-v1 feature: older v1 servers
+may omit both the field and capability. Identity-dependent clients should verify
+service/API v1, require `instance.identity`, and then require `instance_id`.
+The native and WASM GUIs do not require identity and continue accepting older v1
+servers.
+
+For a future external integration's URL reconfiguration, URL A reporting UUID X
+and replacement URL B reporting the same UUID X represent the same installation
+and can retain the same config entry/device. UUID Y at the new URL identifies a
+different logical installation. Restoring or migrating the data directory
+preserves X; no network or tester identity is used for this decision.
 
 Clients should check the service identifier, require a supported API major,
 check capability membership for features they need, and ignore unknown
@@ -440,6 +473,7 @@ The initial external-integration v1 contract covers this surface:
 | Endpoint | Capability | Meaning |
 | --- | --- | --- |
 | `GET /api/info` | Discovery itself | Service identity and compatibility handshake |
+| `GET /api/info` | `instance.identity` | Stable UUID of the persistent server installation |
 | `GET /api/status` | `state.status` | Authoritative current snapshot |
 | `GET /api/ws` | `state.websocket` | Authoritative state and telemetry event stream |
 | `GET /api/recipes` | `recipes.list` | Authoritative saved-recipe library |
