@@ -1,10 +1,6 @@
 services:
   ebc-battery-tester:
-    image: ebc-battery-tester:local
-    build:
-      context: .
-      args:
-        TRUNK_VERSION: ${TRUNK_VERSION:-0.21.14}
+    image: ${EBC_IMAGE:-ghcr.io/cnrd/ebc-battery-tester:latest}
     user: "${PUID:-99}:${PGID:-100}"
     group_add:
       - "${SERIAL_GID:-20}"

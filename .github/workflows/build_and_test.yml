@@ -11,6 +11,14 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+# Cancel the entire older main pipeline, not just its final push. PRs are isolated.
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -105,81 +113,21 @@ jobs:
       - name: Build
         run: EBC_WASM_DEFAULT_TRANSPORT=webusb ./trunk build --locked
 
-  docker-build:
+  container-policy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build production image
-        run: docker build --build-arg "TRUNK_VERSION=${TRUNK_VERSION}" --tag ebc-battery-tester:ci .
-      - name: Smoke test production runtime and persistence
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir .ci-data
-          chmod 0777 .ci-data
-          cleanup() {
-            docker rm -f ebc-battery-tester-ci >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          run_server() {
-            docker run -d --name ebc-battery-tester-ci \
-              --user 10001:10001 \
-              -e EBC_MOCK=true \
-              -p 18080:8080 \
-              -v "$PWD/.ci-data:/data" \
-              ebc-battery-tester:ci
-            for _ in $(seq 1 60); do
-              if [ "$(docker inspect --format '{{.State.Health.Status}}' ebc-battery-tester-ci)" = healthy ]; then
-                return
-              fi
-              sleep 1
-            done
-            docker logs ebc-battery-tester-ci
-            return 1
-          }
-          run_server
+      - run: node --test .github/scripts/*.test.mjs
 
-          HTML=$(curl --fail --silent --show-error http://127.0.0.1:18080/)
-          curl --fail --silent --show-error http://127.0.0.1:18080/manifest.json >/dev/null
-          JS=$(printf '%s' "$HTML" | grep -oE "[A-Za-z0-9_./-]+[-.][a-f0-9]{8,}\.js" | sed -n '1p')
-          WASM=$(printf '%s' "$HTML" | grep -oE "[A-Za-z0-9_./-]+[-.][a-f0-9]{8,}(_bg)?\.wasm" | sed -n '1p')
-          test -n "$JS" && test -n "$WASM"
-          JS=${JS#./}; JS=${JS#/}
-          WASM=${WASM#./}; WASM=${WASM#/}
-          curl --fail --silent --show-error "http://127.0.0.1:18080/$JS" >/dev/null
-          curl --fail --silent --show-error "http://127.0.0.1:18080/$WASM" >/dev/null
-          curl --fail --silent --show-error http://127.0.0.1:18080/api/status >/dev/null
+  docker-build:
+    uses: ./.github/workflows/container_validate.yml
 
-          COMMAND=(-H 'X-EBC-Command: 1')
-          curl --fail --silent --show-error -X POST "${COMMAND[@]}" http://127.0.0.1:18080/api/connect >/dev/null
-          for _ in $(seq 1 20); do
-            STATUS=$(curl --fail --silent --show-error http://127.0.0.1:18080/api/status)
-            if printf '%s' "$STATUS" | grep -q '"activity_known":true' && \
-               printf '%s' "$STATUS" | grep -q '"active":false'; then
-              break
-            fi
-            sleep 0.1
-          done
-          printf '%s' "$STATUS" | grep -q '"activity_known":true'
-          printf '%s' "$STATUS" | grep -q '"active":false'
-          curl --fail --silent --show-error -X POST "${COMMAND[@]}" \
-            -H 'Content-Type: application/json' \
-            --data '{"config":{"mode":"discharge_constant_current","current_ma":100,"cutoff_voltage_mv":3000,"cutoff_time_min":0},"name":null}' \
-            http://127.0.0.1:18080/api/test/start >/dev/null
-          sleep 3
-          curl --fail --silent --show-error -X POST "${COMMAND[@]}" http://127.0.0.1:18080/api/test/stop >/dev/null
-          for _ in $(seq 1 20); do
-            if curl --fail --silent --show-error http://127.0.0.1:18080/api/status | grep -q 'stopped'; then
-              break
-            fi
-            sleep 0.1
-          done
-          curl --fail --silent --show-error http://127.0.0.1:18080/api/status | grep -q 'stopped'
-          curl --fail --silent --show-error http://127.0.0.1:18080/api/history.csv | grep -q ',100,'
-
-          docker rm -f ebc-battery-tester-ci >/dev/null
-          run_server
-          curl --fail --silent --show-error http://127.0.0.1:18080/ >/dev/null
-          curl --fail --silent --show-error http://127.0.0.1:18080/manifest.json >/dev/null
-          curl --fail --silent --show-error http://127.0.0.1:18080/api/status | grep -q 'stopped'
-          curl --fail --silent --show-error http://127.0.0.1:18080/api/history.csv | grep -q ',100,'
+  container-publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'cnrd/ebc-battery-tester'
+    needs: [fmt, check, clippy, test, trunk-build, container-policy, docker-build]
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/container_publish.yml

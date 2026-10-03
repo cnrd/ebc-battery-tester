@@ -11,3 +11,5 @@ images
 *.bin
 *.exe
 __pycache__
+hardware-*-validation*/
+hardware-*-validation.tar.gz

@@ -70,17 +70,22 @@ with that single owner through messages.
 
 ## Docker
 
-Build and run the production image:
+The production image is `ghcr.io/cnrd/ebc-battery-tester`, supporting
+`linux/amd64` and `linux/arm64`. Docker selects the matching architecture.
+Publication starts after this workflow reaches `main`; a new GHCR package must
+be made Public in GitHub's package settings before anonymous pulls work.
+
+Pull and run the published image:
 
 ```bash
-docker build -t ebc-battery-tester .
+docker pull ghcr.io/cnrd/ebc-battery-tester:latest
 docker run -d --name ebc-battery-tester \
   --restart unless-stopped \
   --device /dev/ttyUSB0:/dev/ttyUSB0 \
   --group-add "$(stat -c '%g' /dev/ttyUSB0)" \
   -p 8080:8080 \
   -v /srv/ebc-battery-tester:/data \
-  ebc-battery-tester
+  ghcr.io/cnrd/ebc-battery-tester:latest
 ```
 
 Open `http://SERVER:8080/`. The image compiles the server without GUI/X11
@@ -89,12 +94,56 @@ runtime `libudev` library. It does not contain a compiler, browser, VNC, or
 desktop stack. Its health check calls the existing `/api/status` endpoint using
 the server binary itself.
 
-### Docker Compose and Unraid
+### Image channels and release pinning
 
-`docker-compose.yml` defaults to Unraid's conventional UID/GID and appdata path:
+- `latest` and `main` both mean the latest successful **main publication**, after
+  all CI gates pass. Only main writes these rolling aliases, never release tags.
+- Stable release tag `vX.Y.Z` publishes `X.Y.Z` and `X.Y`; releases with major
+  version at least 1 also publish `X`. There is intentionally no floating `0` tag.
+- Prerelease `v2.8.0-rc.1` publishes only `2.8.0-rc.1`, not stable aliases.
+- Every publication also has `sha-<full 40-character Git SHA>`.
+
+Version tags are release-tag builds, not aliases for the current main image.
+Release tags must match the Cargo package version and point to a commit contained
+in main. Do not move or reuse a release tag for a different commit; publication
+also rejects an existing exact version image with a different OCI revision.
+Images receive OCI source/revision/version/license metadata and GitHub build
+provenance for the multiarchitecture manifest digest.
+Channel aliases are assigned only after provenance succeeds. Linux, Windows,
+and standalone WASM release downloads remain available; GitHub Release creation
+also waits for container validation, publication, and provenance.
+
+For a pinned release, replace `latest` in the run command with its version.
+For example, **after `v0.5.0` has been published** (not a claim it exists now):
 
 ```bash
-SERIAL_GID="$(stat -c '%g' /dev/ttyUSB0)" docker compose up -d --build
+docker pull ghcr.io/cnrd/ebc-battery-tester:0.5.0
+```
+
+### Local source build
+
+Local builds remain available separately; they do not publish anything:
+
+```bash
+docker build -t ebc-battery-tester:local .
+# Or, on an amd64 Podman host (use arm64 on an arm64 host):
+podman build --format docker --build-arg TARGETARCH=amd64 -t ebc-battery-tester:local .
+```
+
+Buildx supplies `TARGETARCH` automatically. For Podman, pass the architecture
+explicitly and use a matching host or configured emulation. Use the local image
+in the run example, or set `EBC_IMAGE=ebc-battery-tester:local` for Compose.
+The Podman `--format docker` flag preserves the Dockerfile's health check;
+Podman's default OCI-format build omits that Docker-specific configuration.
+
+### Docker Compose and Unraid
+
+`docker-compose.yml` consumes the published image without compiling from source.
+It defaults to Unraid's conventional UID/GID and appdata path:
+
+```bash
+docker compose pull
+SERIAL_GID="$(stat -c '%g' /dev/ttyUSB0)" docker compose up -d
 ```
 
 The defaults are `PUID=99`, `PGID=100`, port `8080`, device `/dev/ttyUSB0`, and
@@ -103,12 +152,18 @@ host data path `/mnt/cache/appdata/ebc-battery-tester`. Override them as needed:
 ```bash
 PUID=1000 PGID=1000 SERIAL_GID=20 EBC_DEVICE=/dev/ttyUSB1 \
 EBC_PORT=8081 EBC_DATA_PATH=/mnt/user/appdata/ebc-battery-tester \
-docker compose up -d --build
+docker compose up -d
 ```
 
 `SERIAL_GID` must be the numeric group owner of the host serial device. Obtain
 it with `stat -c '%g' /dev/ttyUSB0` (or `ls -ln /dev/ttyUSB0`). Compose runs with
 that supplementary group and never uses `privileged: true`.
+
+Set `EBC_IMAGE` in the environment or `.env` to pin a published version, for
+example `EBC_IMAGE=ghcr.io/cnrd/ebc-battery-tester:0.5.0` once that release exists.
+Compose does not force pulls on every start; use `docker compose pull` explicitly
+when updating a rolling channel. Ensure the host data directory is writable by
+the configured `PUID`/`PGID`.
 
 In server/native serial mode, leave the Linux `ch341` driver attached. Do not
 install an unbind udev rule: the server needs the resulting `/dev/ttyUSB*`
@@ -339,7 +394,7 @@ server use.
 Run the complete container stack without hardware:
 
 ```bash
-EBC_MOCK=true docker compose up --build
+EBC_MOCK=true docker compose up
 ```
 
 Or run it from source after building the web UI:

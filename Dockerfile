@@ -1,12 +1,20 @@
 FROM rust:1.92-bookworm AS builder
 
 ARG TRUNK_VERSION=0.21.14
-RUN apt-get update \
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+        amd64) TRUNK_ARCH=x86_64 ;; \
+        arm64) TRUNK_ARCH=aarch64 ;; \
+        *) echo "Unsupported target architecture: $TARGETARCH (expected amd64 or arm64)" >&2; exit 1 ;; \
+    esac \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libudev-dev pkg-config \
     && rm -rf /var/lib/apt/lists/* \
     && curl --fail --location --silent --show-error \
-        "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
-        | tar -xz -C /usr/local/bin trunk \
+        --output /trunk.tar.gz \
+        "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${TRUNK_ARCH}-unknown-linux-gnu.tar.gz" \
+    && tar -xzf /trunk.tar.gz -C /usr/local/bin trunk \
+    && rm /trunk.tar.gz \
     && rustup target add wasm32-unknown-unknown
 
 WORKDIR /build
@@ -15,6 +23,10 @@ RUN cargo build --locked --release --no-default-features --features server --bin
 RUN EBC_WASM_DEFAULT_TRANSPORT=remote trunk build --locked --release
 
 FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.source="https://github.com/cnrd/ebc-battery-tester" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.description="Headless EBC Battery Tester server with remote browser UI"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libudev1 \
