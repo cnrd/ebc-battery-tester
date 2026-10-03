@@ -19,6 +19,8 @@ jobs:
       packages: write
       attestations: write
       id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,7 +91,8 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-      - name: Assign channel aliases only after provenance succeeds
+      - name: Assign main aliases only after provenance succeeds
+        if: github.ref == 'refs/heads/main'
         env:
           PUBLISH_TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -105,12 +108,6 @@ jobs:
                 exit 1
               }
               ;;
-            refs/tags/v*)
-              bash .github/scripts/validate-release.sh
-              # The SHA push has already created/linked a new private package;
-              # exact-version lookups now distinguish missing from auth errors.
-              bash .github/scripts/check-release-image.sh "$IMAGE" "${GITHUB_REF_NAME#v}" "$GITHUB_SHA"
-              ;;
             *) exit 1 ;;
           esac
           test -n "$PUBLISH_TAGS"
@@ -118,4 +115,48 @@ jobs:
           while IFS= read -r TAG; do TAG_ARGS+=(--tag "$TAG"); done <<< "$PUBLISH_TAGS"
           # One existing index is carbon-copied: no platform-specific public tags,
           # no rebuild, and all aliases retain the attested manifest digest.
+          docker buildx imagetools create "${TAG_ARGS[@]}" "$IMAGE@$DIGEST"
+
+  release-aliases:
+    if: github.repository == 'cnrd/ebc-battery-tester' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # Only alias mutation is serialized; builds, SHA pushes and provenance stay
+    # parallel. Prereleases have no floating aliases and use per-tag groups.
+    concurrency:
+      group: container-release-aliases-${{ contains(github.ref_name, '-') && github.ref || 'stable' }}
+      cancel-in-progress: false
+      # The default single pending slot cancels earlier queued releases.
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR with the workflow token
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select and assign release aliases from current registry state
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/validate-release.sh
+          VERSION=${GITHUB_REF_NAME#v}
+          # The SHA push already created/linked the package. Preserve exact
+          # revision immutability independently of floating alias selection.
+          bash .github/scripts/check-release-image.sh "$IMAGE" "$VERSION" "$GITHUB_SHA"
+          # Inspect inside the serialization boundary immediately before write.
+          # A deliberate skip is successful; ambiguity fails before any aliases.
+          PUBLISH_TAGS=$(node .github/scripts/select-release-aliases.mjs "$IMAGE" "$VERSION" "$GITHUB_SHA")
+          TAG_ARGS=()
+          while IFS= read -r TAG; do TAG_ARGS+=(--tag "$TAG"); done <<< "$PUBLISH_TAGS"
           docker buildx imagetools create "${TAG_ARGS[@]}" "$IMAGE@$DIGEST"

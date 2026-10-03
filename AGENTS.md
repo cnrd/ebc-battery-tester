@@ -840,6 +840,27 @@ Do not accidentally introduce GUI/windowing dependencies into server-only builds
 
 ---
 
+# Container publication invariants
+
+- Main alone owns the rolling `latest` and `main` image aliases.
+- Exact release versions are immutable by Git revision; a different revision
+  cannot replace an existing exact version image.
+- Stable floating release aliases (`X.Y`, and `X` for major >= 1) move forward
+  only, never backwards. Ownership is determined by the currently published
+  registry alias's numeric stable version, not the existence of Git tags.
+- Floating-alias inspection and mutation occur within a shared serialized
+  stable-release job. Both runtime platforms must have consistent valid OCI
+  version/revision labels; ambiguous metadata or registry errors fail closed.
+- Prereleases never inspect or move stable floating aliases.
+- Major zero has no floating `0` alias.
+- SHA image tags use the full 40-character commit SHA.
+- Release publication remains gated by Cargo/tag version equality, main
+  ancestry, and verification that the remote release tag still names the
+  workflow commit. GitHub Release creation waits for container publication
+  and provenance, including successful alias assignment or deliberate skips.
+
+---
+
 # Important build configurations
 
 Keep the project working across:

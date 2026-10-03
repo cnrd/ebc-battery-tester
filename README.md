@@ -98,8 +98,10 @@ the server binary itself.
 
 - `latest` and `main` both mean the latest successful **main publication**, after
   all CI gates pass. Only main writes these rolling aliases, never release tags.
-- Stable release tag `vX.Y.Z` publishes `X.Y.Z` and `X.Y`; releases with major
-  version at least 1 also publish `X`. There is intentionally no floating `0` tag.
+- Stable release tag `vX.Y.Z` publishes `X.Y.Z`. Floating `X.Y` tracks the
+  highest published stable patch in that minor line; `X` tracks the highest
+  published stable release in that major line for major >= 1. Older releases
+  never move these aliases backwards. There is intentionally no floating `0` tag.
 - Prerelease `v2.8.0-rc.1` publishes only `2.8.0-rc.1`, not stable aliases.
 - Every publication also has `sha-<full 40-character Git SHA>`.
 

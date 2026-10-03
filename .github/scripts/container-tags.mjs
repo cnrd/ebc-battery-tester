@@ -2,20 +2,26 @@ import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 // Explicit aliases: metadata-action must never infer ownership of latest.
+export function parseReleaseVersion(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(version);
+  if (!match) throw new Error('Expected X.Y.Z[-prerelease] release version (no build metadata)');
+  const [, major, minor, patch, prerelease] = match;
+  if (prerelease?.split('.').some(id => /^\d+$/.test(id) && id.length > 1 && id.startsWith('0'))) {
+    throw new Error('Numeric prerelease identifiers must not have leading zeros');
+  }
+  if (version.length > 128) throw new Error('Release version exceeds registry tag length');
+  return { major, minor, patch, prerelease };
+}
+
 export function containerTags(ref, sha) {
   if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error('Expected a full 40-character Git SHA');
   const tags = [];
   if (ref === 'refs/heads/main') {
     tags.push('latest', 'main');
   } else {
-    const match = /^refs\/tags\/v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(ref);
-    if (!match) throw new Error('Expected main or a vX.Y.Z[-prerelease] release tag (no build metadata)');
-    const [, major, minor, , prerelease] = match;
-    if (prerelease?.split('.').some(id => /^\d+$/.test(id) && id.length > 1 && id.startsWith('0'))) {
-      throw new Error('Numeric prerelease identifiers must not have leading zeros');
-    }
+    if (!ref.startsWith('refs/tags/v')) throw new Error('Expected main or a vX.Y.Z[-prerelease] release tag');
     const version = ref.slice('refs/tags/v'.length);
-    if (version.length > 128) throw new Error('Release version exceeds registry tag length');
+    const { major, minor, prerelease } = parseReleaseVersion(version);
     tags.push(version);
     if (!prerelease) {
       tags.push(`${major}.${minor}`);
