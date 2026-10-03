@@ -8,17 +8,25 @@ permissions:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: Set up arm64 emulation
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: arm64
+      - name: Verify native runner architecture
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          case "$ARCH:$(uname -m)" in
+            amd64:x86_64|arm64:aarch64) ;;
+            *) echo 'Runner does not match the requested native architecture' >&2; exit 1 ;;
+          esac
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build loadable production image
@@ -32,9 +40,7 @@ jobs:
           provenance: false
           sbom: false
           tags: ebc-battery-tester:smoke-${{ matrix.arch }}
-          cache-from: |
-            type=gha,scope=container-${{ matrix.arch }}
-            type=gha,scope=container-multiarch
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
       - name: Smoke production runtime and persistent data
         run: bash .github/scripts/container-smoke.sh "ebc-battery-tester:smoke-${{ matrix.arch }}"

@@ -842,6 +842,11 @@ Do not accidentally introduce GUI/windowing dependencies into server-only builds
 
 # Container publication invariants
 
+- Production amd64 and arm64 container builds and runtime smoke tests use native
+  GitHub-hosted architecture runners rather than QEMU emulation.
+- Native publication pushes each platform by digest, then constructs one
+  two-platform SHA index. Provenance and channel aliases use that combined
+  manifest digest; the finalizer never rebuilds platform images.
 - Main alone owns the rolling `latest` and `main` image aliases.
 - Exact release versions are immutable by Git revision; a different revision
   cannot replace an existing exact version image.
