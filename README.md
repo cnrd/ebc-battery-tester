@@ -8,7 +8,10 @@ directly in a WebUSB-capable browser.
 
 The project is written in Rust with [egui](https://github.com/emilk/egui) and
 [eframe](https://github.com/emilk/egui/tree/master/crates/eframe). Native builds
-are available on the [releases page](https://github.com/Kazhuu/ebc-battery-tester/releases).
+are available on this fork's [releases page](https://github.com/cnrd/ebc-battery-tester/releases).
+
+This project builds on [Mauri Mustonen's original EBC Battery Tester](https://github.com/Kazhuu/ebc-battery-tester)
+and retains its MIT license.
 
 ## Modes
 
@@ -267,8 +270,7 @@ Both detail sample arrays use the established 5000-point presentation limit,
 including first/last samples and voltage, current, and power bucket extrema.
 Raw CSV export retains every
 sample and uses `<immutable-id>.csv` filenames (native save dialog or browser
-download); server paths are never exposed. These resource routes replace the
-obsolete WIP `/api/runs/{id}.csv` route without a compatibility alias.
+download); server paths are never exposed.
 
 `CycleSummary` has `execution_id: String`, `name: Option<String>`,
 `recipe: Option<CycleRecipe>`, `saved_recipe: Option<SavedRecipeReference>`,

@@ -1,6 +1,6 @@
 //! GUI-independent physical test lifecycle, metrics, and command policy.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use crate::core::{
     ApiCommand, CalibrationCommand, Capabilities, DeviceState, Sample, TestConfiguration,

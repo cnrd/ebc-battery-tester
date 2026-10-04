@@ -1,6 +1,6 @@
 //! GUI-independent recipe orchestration.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use crate::core::{
     CycleRecipe, CycleState, CycleStatus, CycleStep, DeviceState, SavedRecipeReference,

@@ -16,10 +16,11 @@ if CONFIGS=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json
     exit 1
   fi
 else
-  # A missing manifest is the only acceptable lookup failure. Auth/network
-  # errors must not bypass the immutability check.
-  if ! grep -Eq 'manifest unknown|MANIFEST_UNKNOWN|: not found' "$ERROR"; then
-    cat "$ERROR" >&2
-    exit 1
-  fi
+  # Match the entire response, not substrings from credential-helper, auth or
+  # network failures. Only a proven missing manifest may bypass this guard.
+  case "$(cat "$ERROR")" in
+    "ERROR: $IMAGE:$VERSION: not found"|"ERROR: $IMAGE:$VERSION: manifest unknown"|\
+    'ERROR: manifest unknown'|'ERROR: manifest unknown: manifest unknown') ;;
+    *) cat "$ERROR" >&2; exit 1 ;;
+  esac
 fi

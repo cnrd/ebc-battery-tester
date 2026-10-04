@@ -2701,7 +2701,7 @@ impl DeviceActor {
         if normal_report && self.cycle.is_executing() {
             self.record_cycle_sample(&report, &timestamp_utc, now);
         }
-        if let Some(measurement) = measurement {
+        if normal_report && let Some(measurement) = measurement {
             let sample = Sample {
                 run_id: self.persistence.current_run_id.clone(),
                 sequence: self.persistence.next_sequence,
@@ -5618,7 +5618,7 @@ mod tests {
     }
 
     #[test]
-    fn firmware_reports_do_not_create_cycle_samples() {
+    fn firmware_reports_do_not_create_run_or_cycle_samples() {
         let (mut actor, directory) = mock_actor("cycle-firmware-filter");
         confirm_inactive(&mut actor);
         actor
@@ -5636,6 +5636,14 @@ mod tests {
             Some("3.0.2".to_owned()),
         );
         assert!(actor.snapshot.cycle_history.is_empty());
+        assert!(actor.snapshot.history.is_empty());
+        assert_eq!(actor.persistence.next_sequence, 0);
+        assert_eq!(actor.persistence.raw_sample_count, 0);
+        assert_eq!(actor.controller.test().state, TestState::Running);
+        assert_eq!(
+            actor.controller.device().firmware_version.as_deref(),
+            Some("3.0.2")
+        );
         actor.record_report_with_source(
             device::DeviceMode::DischargeConstantCurrent,
             3990,
@@ -5647,6 +5655,29 @@ mod tests {
             None,
         );
         assert_eq!(actor.snapshot.cycle_history.len(), 1);
+        assert_eq!(actor.snapshot.history.len(), 1);
+        assert_eq!(actor.snapshot.history[0].sequence, 0);
+        assert_eq!(actor.snapshot.history[0].voltage_mv, 3990);
+        actor.record_report_with_source(
+            device::DeviceMode::DischargeConstantCurrent,
+            3980,
+            1000,
+            3,
+            ReportState::Active,
+            false,
+            "EBC-MOCK",
+            Some("3.0.2".to_owned()),
+        );
+        assert_eq!(actor.snapshot.history.len(), 1);
+        assert_eq!(actor.snapshot.cycle_history.len(), 1);
+        assert_eq!(actor.persistence.next_sequence, 1);
+        assert_eq!(actor.persistence.raw_sample_count, 1);
+        let csv = read_export(actor.persistence.live_export().expect("run CSV"));
+        assert_eq!(
+            csv.lines().count(),
+            2,
+            "only header and normal-report sample"
+        );
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

@@ -12,7 +12,7 @@ use crate::core::{
 };
 use crate::cycle::{CycleAction, CycleEngine};
 use crate::device::{self, InboundFrame, OutboundFrame};
-use std::time::Instant;
+use web_time::Instant;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn timestamp_utc() -> String {

@@ -28,6 +28,10 @@ printf '%s\\n' "$MOCK_CONFIG"
       ['', 'ERROR: manifest unknown', true],
       ['', 'ERROR: denied: requested access to the resource is denied', false],
       ['', 'ERROR: network connection timed out', false],
+      ['', 'ERROR: docker-credential-helper: not found', false],
+      ['', 'ERROR: failed to authorize: auth endpoint: not found', false],
+      ['', 'ERROR: ghcr.io/another/image:0.5.0: not found', false],
+      ['', 'ERROR: manifest unknown\nERROR: denied: authentication failed', false],
     ]) {
       const result = spawnSync('bash', [fileURLToPath(new URL('./check-release-image.sh', import.meta.url)), 'ghcr.io/cnrd/ebc-battery-tester', '0.5.0', sha], {
         env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, TMPDIR: dir, RUNNER_TEMP: dir, MOCK_CONFIG: configs, MOCK_ERROR: error },
