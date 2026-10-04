@@ -2,6 +2,7 @@
 
 use web_time::{Duration, Instant};
 
+use crate::controller::{REPORT_TIMEOUT_REASON, TestController};
 use crate::core::{
     CycleRecipe, CycleState, CycleStatus, CycleStep, DeviceState, SavedRecipeReference,
     TestConfiguration, TestState, TestStatus, ValidationError,
@@ -331,6 +332,20 @@ impl CycleEngine {
         self.interrupt(reason);
     }
 
+    /// Shared controller/orchestration boundary for every physical backend.
+    /// Must run before timers, user commands, and newly recovered reports.
+    pub fn expire_report_freshness(
+        &mut self,
+        controller: &mut TestController,
+        now: Instant,
+    ) -> bool {
+        if !controller.expire_report_freshness(now) {
+            return false;
+        }
+        self.interrupt_for_gap(REPORT_TIMEOUT_REASON);
+        true
+    }
+
     fn begin_current_step(&mut self, started: Instant) -> Option<CycleAction> {
         let step = self.current_step()?.clone();
         match step {
@@ -475,6 +490,76 @@ mod tests {
             active: false,
             current_ma: Some(0),
             ..DeviceState::default()
+        }
+    }
+
+    #[test]
+    fn report_timeout_interrupts_every_nonterminal_phase_once() {
+        use crate::controller::{
+            ControllerMode, DeviceReport, REPORT_FRESHNESS_TIMEOUT, ReportState,
+        };
+        let t0 = Instant::now();
+        for phase in [
+            CycleState::Preparing,
+            CycleState::StartingStep,
+            CycleState::RunningStep,
+            CycleState::Settling,
+            CycleState::Resting,
+            CycleState::Stopping,
+        ] {
+            let mut controller = TestController::new(ControllerMode::Server);
+            controller.begin_connection("connect");
+            controller.connection_established_at(t0);
+            let idle = DeviceReport {
+                mode: crate::device::DeviceMode::DischargeConstantCurrent,
+                state: ReportState::Idle,
+                voltage_mv: 4000,
+                current_ma: 0,
+                capacity_mah: 0,
+                model: "EBC-A20".to_owned(),
+                firmware_version: None,
+            };
+            controller.report_at(idle.clone(), t0);
+            let mut engine = CycleEngine::new();
+            start(
+                &mut engine,
+                recipe(
+                    vec![
+                        CycleStep::Rest {
+                            duration_seconds: REPORT_FRESHNESS_TIMEOUT.as_secs(),
+                        },
+                        device_step(100),
+                    ],
+                    1,
+                ),
+                t0,
+            );
+            engine.status.state = phase;
+            assert!(!engine.expire_report_freshness(
+                &mut controller,
+                t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1))
+            ));
+            assert_eq!(engine.status.state, phase);
+            // Rest expiry and report expiry on the same tick: interruption wins.
+            assert!(engine.expire_report_freshness(&mut controller, t0 + REPORT_FRESHNESS_TIMEOUT));
+            assert_eq!(engine.status.state, CycleState::Interrupted);
+            assert_eq!(engine.status.result.as_deref(), Some(REPORT_TIMEOUT_REASON));
+            assert_eq!(engine.pending_action(), None);
+            assert_eq!(engine.tick(t0 + Duration::from_secs(65)), None);
+            let interrupted = engine.status.clone();
+            assert!(!engine.expire_report_freshness(&mut controller, t0 + Duration::from_secs(65)));
+            controller.report_at(idle, t0 + Duration::from_secs(66));
+            assert_eq!(
+                engine.on_physical_state(
+                    t0 + Duration::from_secs(66),
+                    controller.device(),
+                    controller.test(),
+                    true
+                ),
+                None
+            );
+            assert_eq!(engine.tick(t0 + Duration::from_secs(100)), None);
+            assert_eq!(engine.status, interrupted);
         }
     }
 

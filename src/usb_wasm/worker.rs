@@ -348,6 +348,13 @@ async fn publish(
         event_tx.send(event);
     }
     for send in output.sends {
+        let (authorization, allowed) = backend.authorize_send(send);
+        for event in authorization.events {
+            event_tx.send(event);
+        }
+        if !allowed {
+            continue;
+        }
         let frame = send.frame();
         event_tx.send(outgoing(frame));
         let result = if let (Some(current), Some(endpoint)) = (device.as_ref(), *out_endpoint_num) {

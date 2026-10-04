@@ -24,8 +24,11 @@ use tokio_util::io::ReaderStream;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::controller::{
-    CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
+    CommandKind, ControllerMode, DeviceReport, PreparedCommand, REPORT_TIMEOUT_REASON, ReportState,
+    TestController,
 };
+#[cfg(test)]
+mod freshness_tests;
 mod history;
 #[cfg(test)]
 mod history_tests;
@@ -1661,6 +1664,7 @@ impl DeviceActor {
     }
 
     fn handle_message(&mut self, message: ActorMessage) {
+        self.expire_report_freshness(Instant::now());
         let result = match message.request {
             ActorRequest::Snapshot => Ok(ActorResponse::Snapshot(self.current_snapshot())),
             ActorRequest::Subscribe => {
@@ -1754,6 +1758,7 @@ impl DeviceActor {
     }
 
     fn handle_command(&mut self, command: ApiCommand) -> Result<(), String> {
+        self.expire_report_freshness(Instant::now());
         if command == ApiCommand::Stop
             && (self.cycle.owns_orchestration()
                 || self.cycle.status().state == CycleState::Interrupted)
@@ -1862,6 +1867,7 @@ impl DeviceActor {
         name: Option<String>,
         cycle: Option<CycleRunContext>,
     ) -> Result<(), StartError> {
+        self.expire_report_freshness(Instant::now());
         let name = normalize_optional_name(name.as_deref())
             .map_err(|error| StartError::BadRequest(error.to_string()))?;
         let name = if cycle.is_some() { None } else { name };
@@ -1898,8 +1904,8 @@ impl DeviceActor {
         }
         self.send_command_frame(prepared)
             .map_err(StartError::Internal)?;
-        self.controller
-            .commit_command(prepared, Some(Utc::now().to_rfc3339()));
+        self.commit_written_command(prepared, Some(Utc::now().to_rfc3339()))
+            .map_err(StartError::Internal)?;
         self.sync_controller_state();
         if self.config.mock {
             self.controller.set_current_ma(mock_current(&config));
@@ -2037,6 +2043,7 @@ impl DeviceActor {
         request: StartCycleRequest,
         saved_recipe: Option<SavedRecipeReference>,
     ) -> Result<(), StartError> {
+        self.expire_report_freshness(Instant::now());
         request
             .recipe
             .validate()
@@ -2140,6 +2147,7 @@ impl DeviceActor {
     }
 
     fn stop_cycle(&mut self) -> Result<(), String> {
+        self.expire_report_freshness(Instant::now());
         if let Some(action) = self.cycle.stop(self.controller.test()) {
             self.execute_cycle_action(action)?;
         }
@@ -2303,8 +2311,12 @@ impl DeviceActor {
             CycleAction::Stop => self.stop_test(),
         };
         if let Err(error) = result {
-            self.cycle
-                .on_action_failed(format!("cycle physical action failed: {error}"));
+            if !matches!(action, CycleAction::Start(_))
+                || self.cycle.status().result.as_deref() != Some(REPORT_TIMEOUT_REASON)
+            {
+                self.cycle
+                    .on_action_failed(format!("cycle physical action failed: {error}"));
+            }
             self.sync_controller_state();
             if let Err(persistence_error) = self.persistence.flush_cycle_samples() {
                 log::error!("failed to flush interrupted cycle telemetry: {persistence_error}");
@@ -2369,23 +2381,22 @@ impl DeviceActor {
     }
 
     fn stop_test(&mut self) -> Result<(), String> {
+        self.expire_report_freshness(Instant::now());
         let prepared = self.controller.prepare_command(ApiCommand::Stop)?;
         self.send_command_frame(prepared)?;
-        self.controller.commit_command(prepared, None);
+        self.commit_written_command(prepared, None)?;
         self.sync_controller_state();
         self.persistence.flush_samples()?;
         Ok(())
     }
 
     fn adjust_test(&mut self, config: TestConfiguration) -> Result<(), String> {
+        self.expire_report_freshness(Instant::now());
         let prepared = self
             .controller
             .prepare_command(ApiCommand::Adjust(config))?;
-        let frame = prepared
-            .frame()
-            .ok_or_else(|| "adjustment did not produce a protocol frame".to_owned())?;
-        self.send_frame_with_recovery(frame, Some(prepared.kind()))?;
-        self.controller.commit_command(prepared, None);
+        self.send_command_frame(prepared)?;
+        self.commit_written_command(prepared, None)?;
         if self.config.mock {
             let TestConfiguration::DischargeConstantCurrent { current_ma, .. } = config else {
                 unreachable!();
@@ -2397,25 +2408,21 @@ impl DeviceActor {
     }
 
     fn resume_test(&mut self) -> Result<(), String> {
+        self.expire_report_freshness(Instant::now());
         let prepared = self.controller.prepare_command(ApiCommand::Resume)?;
-        let frame = prepared
-            .frame()
-            .ok_or_else(|| "resume did not produce a protocol frame".to_owned())?;
-        self.send_frame_with_recovery(frame, Some(prepared.kind()))?;
-        self.controller.commit_command(prepared, None);
+        self.send_command_frame(prepared)?;
+        self.commit_written_command(prepared, None)?;
         self.sync_controller_state();
         Ok(())
     }
 
     fn calibrate(&mut self, command: CalibrationCommand) -> Result<(), String> {
+        self.expire_report_freshness(Instant::now());
         let prepared = self
             .controller
             .prepare_command(ApiCommand::Calibration(command))?;
-        let frame = prepared
-            .frame()
-            .ok_or_else(|| "calibration did not produce a protocol frame".to_owned())?;
-        self.send_frame_with_recovery(frame, Some(prepared.kind()))?;
-        self.controller.commit_command(prepared, None);
+        self.send_command_frame(prepared)?;
+        self.commit_written_command(prepared, None)?;
         self.sync_controller_state();
         Ok(())
     }
@@ -2445,10 +2452,28 @@ impl DeviceActor {
     }
 
     fn send_command_frame(&mut self, prepared: PreparedCommand) -> Result<(), String> {
+        let now = Instant::now();
+        self.expire_report_freshness(now);
+        self.controller.validate_prepared_at(prepared, now)?;
         let Some(frame) = prepared.frame() else {
             return Ok(());
         };
         self.send_frame_with_recovery(frame, Some(prepared.kind()))
+    }
+
+    fn commit_written_command(
+        &mut self,
+        prepared: PreparedCommand,
+        started_at: Option<String>,
+    ) -> Result<(), String> {
+        let now = Instant::now();
+        self.expire_report_freshness(now);
+        if self.controller.commit_command_at(prepared, started_at, now) {
+            return Ok(());
+        }
+        self.cycle.interrupt_for_gap(REPORT_TIMEOUT_REASON);
+        self.persist_and_publish()?;
+        Err(REPORT_TIMEOUT_REASON.to_owned())
     }
 
     fn send_frame_with_recovery(
@@ -2456,6 +2481,13 @@ impl DeviceActor {
         frame: OutboundFrame,
         command: Option<CommandKind>,
     ) -> Result<(), String> {
+        if matches!(frame, OutboundFrame::TimerSync(_)) {
+            let now = Instant::now();
+            self.expire_report_freshness(now);
+            if !self.controller.timer_sync_authorized_at(now) {
+                return Err(REPORT_TIMEOUT_REASON.to_owned());
+            }
+        }
         if let Err(error) = self.send(frame) {
             self.handle_protocol_write_failure(command, &error);
             return Err(error);
@@ -2489,20 +2521,50 @@ impl DeviceActor {
     }
 
     fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    fn expire_report_freshness(&mut self, now: Instant) -> bool {
+        if !self
+            .cycle
+            .expire_report_freshness(&mut self.controller, now)
+        {
+            return false;
+        }
+        // The output path stays open: observation may recover and explicit
+        // Stop/Disconnect remain writable. This is not a transport failure.
+        self.snapshot.connection_error = Some(REPORT_TIMEOUT_REASON.to_owned());
+        self.sync_controller_state();
+        if let Err(error) = self.persistence.flush_samples() {
+            log::error!("failed to flush timed-out run telemetry: {error}");
+        }
+        if let Err(error) = self.persist_and_publish() {
+            log::error!("failed to persist report timeout: {error}");
+            self.publish();
+        }
+        true
+    }
+
+    fn tick_at(&mut self, now: Instant) {
+        self.expire_report_freshness(now);
         let previous_cycle = self.cycle.status().clone();
         if self.config.mock {
             self.tick_mock();
         } else {
             self.read_serial();
         }
-        if let Some(minutes) = self.controller.next_timer_sync()
+        // A blocking read may itself cross the deadline. Re-evaluate before any
+        // timeout-driven action, using the same explicit time seam in tests.
+        let now = now.max(Instant::now());
+        self.expire_report_freshness(now);
+        if let Some(minutes) = self.controller.next_timer_sync_at(now)
             && let Err(error) =
                 self.send_frame_with_recovery(OutboundFrame::TimerSync(minutes), None)
         {
             log::error!("timer sync write failed: {error}");
         }
         self.sync_controller_state();
-        if let Some(action) = self.cycle.tick(Instant::now())
+        if let Some(action) = self.cycle.tick(now)
             && let Err(error) = self.execute_cycle_action(action)
         {
             log::error!("cycle action failed during tick: {error}");
@@ -2558,12 +2620,29 @@ impl DeviceActor {
             );
             return;
         }
-        if !(self.controller.is_starting() || self.controller.is_running_owned())
+        if self.snapshot.connection != ServerConnectionState::Connected
             || self.last_mock_sample.elapsed() < Duration::from_secs(1)
         {
             return;
         }
         self.last_mock_sample = Instant::now();
+        if !(self.controller.is_starting() || self.controller.is_running_owned()) {
+            // A mock device, like hardware, keeps reporting while idle/resting.
+            self.record_report_with_source(
+                self.controller
+                    .device()
+                    .mode
+                    .unwrap_or(device::DeviceMode::DischargeConstantCurrent),
+                self.controller.device().voltage_mv.unwrap_or(4200),
+                0,
+                self.controller.device().capacity_mah.unwrap_or(0),
+                ReportState::Idle,
+                true,
+                "EBC-MOCK",
+                None,
+            );
+            return;
+        }
         self.mock_sample_number += 1;
         let Some(config) = self.controller.test().config else {
             return;
@@ -2684,9 +2763,6 @@ impl DeviceActor {
         model: &str,
         firmware: Option<String>,
     ) {
-        let active = report_state == ReportState::Active;
-        let now = Instant::now();
-        let timestamp_utc = Utc::now().to_rfc3339();
         let report = DeviceReport {
             mode,
             state: report_state,
@@ -2696,10 +2772,25 @@ impl DeviceActor {
             model: model.to_owned(),
             firmware_version: firmware,
         };
-        let (outcome, measurement) = self.controller.report(report.clone());
+        self.record_device_report_at(&report, normal_report, Instant::now());
+    }
+
+    fn record_device_report_at(
+        &mut self,
+        report: &DeviceReport,
+        normal_report: bool,
+        now: Instant,
+    ) {
+        self.expire_report_freshness(now);
+        if self.snapshot.connection_error.as_deref() == Some(REPORT_TIMEOUT_REASON) {
+            self.snapshot.connection_error = None;
+        }
+        let active = report.state == ReportState::Active;
+        let timestamp_utc = Utc::now().to_rfc3339();
+        let (outcome, measurement) = self.controller.report_at(report.clone(), now);
         self.sync_controller_state();
         if normal_report && self.cycle.is_executing() {
-            self.record_cycle_sample(&report, &timestamp_utc, now);
+            self.record_cycle_sample(report, &timestamp_utc, now);
         }
         if normal_report && let Some(measurement) = measurement {
             let sample = Sample {

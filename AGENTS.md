@@ -211,6 +211,35 @@ TimerSync only occurs for a fresh confirmed active report while the run is owned
 
 Reconnect to an already-active physical device must never silently reclaim ownership.
 
+Physical authority from reports is time-bounded by the shared controller's fixed
+10-second monotonic freshness deadline (about five missed EBC-A20 reports at the
+observed two-second cadence). At `age >= timeout`, an open transport without
+recent reports is physically uncertain, not necessarily disconnected. A new
+connection has no physical authority until its first valid report; connection
+changes discard prior freshness.
+
+Report freshness loss:
+
+- clears `activity_known` and revokes owned lifecycle/metric authority;
+- conservatively marks potentially active manual work `RecoveredUncertain`;
+- breaks energy interpolation and freezes owned elapsed time at the deadline;
+- interrupts every active cycle phase, including Rest, Settling and Stopping;
+- suppresses autonomous next-step Start and TimerSync without automatically sending Stop;
+- leaves explicit safety Stop and Disconnect available over the open transport.
+
+Every physical backend uses the same controller/cycle expiry policy before
+autonomous progression, user command authorization, and recovered reports.
+State-dependent Start, Continue/Resume, Adjust and calibration also check report
+age at authorization and the wire boundary. Delayed successful command writes
+cannot commit previously revoked authority.
+
+Both ordinary and firmware reports carry explicit fresh activity/current and
+refresh physical observation. Firmware reports remain excluded from per-run and
+cycle telemetry sampling. Fresh reports restore observation only: they never
+silently restore prior owned work or restart an interrupted cycle. Freshness uses
+monotonic runtime time; its deadline and prepared-command authority generations
+are not persisted or part of the HTTP schema.
+
 Do not weaken these semantics merely to simplify UI behavior.
 
 ---

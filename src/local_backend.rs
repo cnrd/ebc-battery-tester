@@ -2,7 +2,8 @@
 
 use crate::backend::{BackendEvent, BackendState, DiagnosticDirection, DiagnosticEvent};
 use crate::controller::{
-    CommandKind, ControllerMode, DeviceReport, PreparedCommand, ReportState, TestController,
+    CommandKind, ControllerMode, DeviceReport, PreparedCommand, REPORT_TIMEOUT_REASON, ReportState,
+    TestController,
 };
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CurrentRunMetadata, CycleRecipe, CycleRunContext,
@@ -129,6 +130,16 @@ impl LocalBackend {
     }
 
     pub(crate) fn command(&mut self, command: ApiCommand) -> LocalOutput {
+        self.command_at(command, Instant::now())
+    }
+
+    fn command_at(&mut self, command: ApiCommand, now: Instant) -> LocalOutput {
+        let mut output = self.expire_report_freshness(now);
+        output.extend(self.command_inner(command));
+        output
+    }
+
+    fn command_inner(&mut self, command: ApiCommand) -> LocalOutput {
         let command = match command {
             ApiCommand::Start(config) => {
                 return self.start_test(StartTestRequest { config, name: None });
@@ -172,9 +183,15 @@ impl LocalBackend {
 
     #[expect(
         clippy::needless_pass_by_value,
-        reason = "backend command dispatch transfers request ownership"
+        reason = "backend dispatch transfers request ownership"
     )]
     pub(crate) fn start_test(&mut self, request: StartTestRequest) -> LocalOutput {
+        let mut output = self.expire_report_freshness(Instant::now());
+        output.extend(self.start_test_inner(&request));
+        output
+    }
+
+    fn start_test_inner(&mut self, request: &StartTestRequest) -> LocalOutput {
         if self.cycle.owns_orchestration() {
             return Self::command_error("the active cycle owns test orchestration".to_owned());
         }
@@ -207,7 +224,13 @@ impl LocalBackend {
         }
     }
 
-    pub(crate) fn resume(&self, config: TestConfiguration) -> LocalOutput {
+    pub(crate) fn resume(&mut self, config: TestConfiguration) -> LocalOutput {
+        let mut output = self.expire_report_freshness(Instant::now());
+        output.extend(self.resume_inner(config));
+        output
+    }
+
+    fn resume_inner(&self, config: TestConfiguration) -> LocalOutput {
         if self.cycle.owns_orchestration() {
             return Self::command_error("the active cycle owns test orchestration".to_owned());
         }
@@ -252,6 +275,16 @@ impl LocalBackend {
     }
 
     fn start_cycle_with_provenance(
+        &mut self,
+        request: StartCycleRequest,
+        saved_recipe: Option<SavedRecipeReference>,
+    ) -> LocalOutput {
+        let mut output = self.expire_report_freshness(Instant::now());
+        output.extend(self.start_cycle_inner(request, saved_recipe));
+        output
+    }
+
+    fn start_cycle_inner(
         &mut self,
         request: StartCycleRequest,
         saved_recipe: Option<SavedRecipeReference>,
@@ -305,6 +338,12 @@ impl LocalBackend {
     }
 
     pub(crate) fn stop_cycle(&mut self) -> LocalOutput {
+        let mut output = self.expire_report_freshness(Instant::now());
+        output.extend(self.stop_cycle_inner());
+        output
+    }
+
+    fn stop_cycle_inner(&mut self) -> LocalOutput {
         if let Some(action) = self.cycle.stop(self.controller.test()) {
             self.prepare_cycle_action(action, true)
         } else {
@@ -375,6 +414,26 @@ impl LocalBackend {
         send: LocalSend,
         result: Result<(), String>,
     ) -> LocalOutput {
+        self.finish_send_at(send, result, Instant::now())
+    }
+
+    fn finish_send_at(
+        &mut self,
+        send: LocalSend,
+        result: Result<(), String>,
+        now: Instant,
+    ) -> LocalOutput {
+        let mut output = self.expire_report_freshness(now);
+        output.extend(self.finish_send_inner(send, result, now));
+        output
+    }
+
+    fn finish_send_inner(
+        &mut self,
+        send: LocalSend,
+        result: Result<(), String>,
+        now: Instant,
+    ) -> LocalOutput {
         match result {
             Ok(()) => match send.completion {
                 SendCompletion::Command {
@@ -382,7 +441,7 @@ impl LocalBackend {
                     cycle_action,
                     notify_command,
                     ..
-                } => self.command_succeeded(prepared, cycle_action, notify_command),
+                } => self.command_succeeded_at(prepared, cycle_action, notify_command, now),
                 SendCompletion::TimerSync | SendCompletion::BestEffort => LocalOutput::default(),
             },
             Err(error) => self.send_failed(send, &error),
@@ -395,8 +454,25 @@ impl LocalBackend {
         cycle_action: Option<CycleAction>,
         notify_command: bool,
     ) -> LocalOutput {
+        self.command_succeeded_at(prepared, cycle_action, notify_command, Instant::now())
+    }
+
+    fn command_succeeded_at(
+        &mut self,
+        prepared: PreparedCommand,
+        cycle_action: Option<CycleAction>,
+        notify_command: bool,
+        now: Instant,
+    ) -> LocalOutput {
         let mut output = LocalOutput::default();
-        self.controller.commit_command(prepared, None);
+        if !self.controller.commit_command_at(prepared, None, now) {
+            self.cycle.interrupt_for_gap(REPORT_TIMEOUT_REASON);
+            output.extend(self.state_output());
+            output
+                .events
+                .push(BackendEvent::CommandError(REPORT_TIMEOUT_REASON.to_owned()));
+            return output;
+        }
         if let Some(action) = cycle_action {
             self.cycle
                 .on_action_committed(&action, self.controller.test());
@@ -413,6 +489,29 @@ impl LocalBackend {
         output
     }
 
+    /// Recheck at the wire boundary as a tab/process can pause after preparation.
+    pub(crate) fn authorize_send(&mut self, send: LocalSend) -> (LocalOutput, bool) {
+        self.authorize_send_at(send, Instant::now())
+    }
+
+    fn authorize_send_at(&mut self, send: LocalSend, now: Instant) -> (LocalOutput, bool) {
+        let mut output = self.expire_report_freshness(now);
+        let authorization = match send.completion {
+            SendCompletion::Command { prepared, .. } => {
+                self.controller.validate_prepared_at(prepared, now)
+            }
+            SendCompletion::TimerSync if !self.controller.timer_sync_authorized_at(now) => {
+                Err(REPORT_TIMEOUT_REASON.to_owned())
+            }
+            SendCompletion::TimerSync | SendCompletion::BestEffort => Ok(()),
+        };
+        if let Err(error) = authorization {
+            output.events.push(BackendEvent::CommandError(error));
+            return (output, false);
+        }
+        (output, true)
+    }
+
     fn prepare_cycle_action(&mut self, action: CycleAction, notify_command: bool) -> LocalOutput {
         let reset_history = matches!(action, CycleAction::Start(_));
         let command = match action {
@@ -422,7 +521,11 @@ impl LocalBackend {
         let prepared = match self.controller.prepare_command(command) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.cycle.on_action_failed(error.clone());
+                if !matches!(action, CycleAction::Start(_))
+                    || self.cycle.status().result.as_deref() != Some(REPORT_TIMEOUT_REASON)
+                {
+                    self.cycle.on_action_failed(error.clone());
+                }
                 let mut output = self.state_output();
                 output.events.push(BackendEvent::CommandError(error));
                 return output;
@@ -498,16 +601,31 @@ impl LocalBackend {
     }
 
     pub(crate) fn tick(&mut self) -> LocalOutput {
-        let mut output = LocalOutput::default();
+        self.tick_at(Instant::now())
+    }
+
+    fn expire_report_freshness(&mut self, now: Instant) -> LocalOutput {
+        if !self
+            .cycle
+            .expire_report_freshness(&mut self.controller, now)
+        {
+            return LocalOutput::default();
+        }
+        self.connection_error = Some(REPORT_TIMEOUT_REASON.to_owned());
+        self.state_output()
+    }
+
+    fn tick_at(&mut self, now: Instant) -> LocalOutput {
+        let mut output = self.expire_report_freshness(now);
         let previous_cycle = self.cycle.status().clone();
-        if let Some(minutes) = self.controller.next_timer_sync() {
+        if let Some(minutes) = self.controller.next_timer_sync_at(now) {
             output.sends.push(LocalSend {
                 frame: OutboundFrame::TimerSync(minutes),
                 completion: SendCompletion::TimerSync,
             });
         }
-        self.controller.update_elapsed();
-        if let Some(action) = self.cycle.tick(Instant::now()) {
+        self.controller.update_elapsed_at(now);
+        if let Some(action) = self.cycle.tick(now) {
             output.extend(self.prepare_cycle_action(action, false));
         }
         let elapsed = self.controller.test().elapsed_seconds;
@@ -586,12 +704,24 @@ impl LocalBackend {
     }
 
     fn report(&mut self, report: DeviceReport, sample_report: bool) -> LocalOutput {
-        let now = Instant::now();
+        self.report_at(report, sample_report, Instant::now())
+    }
+
+    fn report_at(
+        &mut self,
+        report: DeviceReport,
+        sample_report: bool,
+        now: Instant,
+    ) -> LocalOutput {
+        let mut output = self.expire_report_freshness(now);
+        if self.connection_error.as_deref() == Some(REPORT_TIMEOUT_REASON) {
+            self.connection_error = None;
+        }
         let mode = report.mode;
         let voltage_mv = report.voltage_mv;
         let current_ma = report.current_ma;
         let device_capacity_mah = report.capacity_mah;
-        let (_, measurement) = self.controller.report(report);
+        let (_, measurement) = self.controller.report_at(report, now);
         let cycle_sample = if sample_report && self.cycle.is_executing() {
             let status = self.cycle.status();
             status.execution_id.clone().map(|execution_id| CycleSample {
@@ -623,7 +753,6 @@ impl LocalBackend {
             }
             self.next_cycle_sequence = self.next_cycle_sequence.saturating_add(1);
         }
-        let mut output = LocalOutput::default();
         if let Some(sample) = cycle_sample {
             output.events.push(BackendEvent::CycleSample(sample));
         }
@@ -891,6 +1020,344 @@ mod tests {
             config: config(),
             name: name.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn silent_rest_is_interrupted_before_expiry_start_and_never_recovers() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let output = backend.start_cycle(cycle_request(recipe(vec![
+            CycleStep::Rest {
+                duration_seconds: REPORT_FRESHNESS_TIMEOUT.as_secs(),
+            },
+            device_step(100),
+        ])));
+        assert!(output.sends.is_empty());
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let expired = backend.tick_at(t0 + REPORT_FRESHNESS_TIMEOUT);
+        assert!(expired.sends.is_empty());
+        assert_eq!(state(&expired).update.cycle.state, CycleState::Interrupted);
+        assert!(!state(&expired).update.device.activity_known);
+        assert_eq!(
+            state(&expired).update.connection,
+            ServerConnectionState::Connected
+        );
+        assert!(
+            backend
+                .tick_at(t0 + web_time::Duration::from_secs(65))
+                .events
+                .is_empty()
+        );
+        let recovered = backend.report_at(
+            report(ReportState::Idle, 0),
+            true,
+            t0 + web_time::Duration::from_secs(66),
+        );
+        assert!(recovered.sends.is_empty());
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+        assert!(
+            backend
+                .tick_at(t0 + web_time::Duration::from_secs(67))
+                .sends
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_command_expiry_denies_intent_but_preserves_stop_and_disconnect() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let t0 = Instant::now();
+        let mut backend = connected_backend();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let start = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &start);
+        backend.report_at(report(ReportState::Active, 1), true, t0);
+        let adjust =
+            backend.command_at(ApiCommand::Adjust(config()), t0 + REPORT_FRESHNESS_TIMEOUT);
+        assert!(adjust.sends.is_empty());
+        assert!(
+            adjust
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::CommandError(_)))
+        );
+        assert!(!backend.controller.is_running_owned());
+        let stop = backend.command_at(ApiCommand::Stop, t0 + REPORT_FRESHNESS_TIMEOUT);
+        assert!(matches!(
+            send_frames(&stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        let disconnect = backend.request_disconnect();
+        assert!(matches!(
+            send_frames(&disconnect).as_slice(),
+            [OutboundFrame::Stop, OutboundFrame::Disconnect]
+        ));
+        assert!(
+            backend
+                .command_at(ApiCommand::Start(config()), t0 + REPORT_FRESHNESS_TIMEOUT)
+                .sends
+                .is_empty()
+        );
+        assert!(
+            backend
+                .command_at(ApiCommand::Resume, t0 + REPORT_FRESHNESS_TIMEOUT)
+                .sends
+                .is_empty()
+        );
+        assert!(
+            backend
+                .command_at(
+                    ApiCommand::Calibration(crate::core::CalibrationCommand::VoltageLow(1000)),
+                    t0 + REPORT_FRESHNESS_TIMEOUT
+                )
+                .sends
+                .is_empty()
+        );
+        assert!(
+            backend
+                .start_cycle(cycle_request(recipe(vec![device_step(100)])))
+                .sends
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_first_recovered_report_interrupts_rest_before_it_can_advance() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        backend.start_cycle(cycle_request(recipe(vec![
+            CycleStep::Rest {
+                duration_seconds: 65,
+            },
+            device_step(100),
+        ])));
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let output = backend.report_at(
+            report(ReportState::Idle, 0),
+            true,
+            t0 + REPORT_FRESHNESS_TIMEOUT,
+        );
+        assert!(output.sends.is_empty());
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+        assert!(
+            backend
+                .tick_at(t0 + web_time::Duration::from_secs(66))
+                .sends
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn queued_start_is_rejected_at_wire_boundary_even_after_report_recovery() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let output = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+        let send = output.sends[0];
+        let (expired, allowed) = backend.authorize_send_at(send, t0 + REPORT_FRESHNESS_TIMEOUT);
+        assert!(!allowed);
+        assert!(expired.sends.is_empty());
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+        let rejected = backend.prepare_cycle_action(CycleAction::Start(config()), false);
+        assert!(rejected.sends.is_empty());
+        assert_eq!(
+            backend.cycle.status().result.as_deref(),
+            Some(REPORT_TIMEOUT_REASON)
+        );
+        backend.report_at(
+            report(ReportState::Idle, 0),
+            true,
+            t0 + REPORT_FRESHNESS_TIMEOUT,
+        );
+        assert!(
+            !backend
+                .authorize_send_at(send, t0 + REPORT_FRESHNESS_TIMEOUT)
+                .1
+        );
+    }
+
+    #[test]
+    fn late_successful_start_ack_is_uncertain_and_cannot_reclaim_ownership() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let output = backend.command(ApiCommand::Start(config()));
+        let completed =
+            backend.finish_send_at(output.sends[0], Ok(()), t0 + REPORT_FRESHNESS_TIMEOUT);
+        assert_eq!(
+            backend.controller.test().state,
+            TestState::RecoveredUncertain
+        );
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::CommandSucceeded))
+        );
+        let recovered = backend.report_at(
+            report(ReportState::Active, 10),
+            true,
+            t0 + REPORT_FRESHNESS_TIMEOUT,
+        );
+        assert!(!backend.controller.is_running_owned());
+        assert!(
+            !recovered
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::Sample(_)))
+        );
+        assert_eq!(backend.connection, ServerConnectionState::Connected);
+        assert!(matches!(
+            send_frames(&backend.command(ApiCommand::Stop)).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+    }
+
+    #[test]
+    fn queued_explicit_stop_remains_authorized_at_wire_and_ack_after_expiry() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let start = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &start);
+        backend.report_at(report(ReportState::Active, 0), true, t0);
+        let stop = backend.command(ApiCommand::Stop).sends[0];
+        let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+        backend.tick_at(boundary);
+        assert_eq!(
+            backend.controller.test().state,
+            TestState::RecoveredUncertain
+        );
+        let (_, allowed) = backend.authorize_send_at(stop, boundary);
+        assert!(allowed);
+        let ack = backend.finish_send_at(stop, Ok(()), boundary);
+        assert!(
+            !ack.events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::CommandError(_)))
+        );
+        assert_eq!(backend.controller.test().state, TestState::Stopping);
+        assert!(!backend.controller.is_running_owned());
+        assert!(!backend.controller.device().activity_known);
+        assert_eq!(backend.connection, ServerConnectionState::Connected);
+    }
+
+    #[test]
+    fn due_and_queued_timer_sync_are_suppressed_by_report_age() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Idle, 0), true, t0);
+        let output = backend.command(ApiCommand::Start(config()));
+        finish_success(&mut backend, &output);
+        backend.report_at(report(ReportState::Active, 0), true, t0);
+        backend.set_elapsed_for_test(60);
+        let due = backend.tick_at(t0);
+        assert!(matches!(
+            send_frames(&due).as_slice(),
+            [OutboundFrame::TimerSync(1)]
+        ));
+        assert!(
+            !backend
+                .authorize_send_at(due.sends[0], t0 + REPORT_FRESHNESS_TIMEOUT)
+                .1
+        );
+        assert!(
+            backend
+                .tick_at(t0 + web_time::Duration::from_secs(65))
+                .sends
+                .is_empty()
+        );
+        backend.report_at(
+            report(ReportState::Active, 2),
+            true,
+            t0 + web_time::Duration::from_secs(66),
+        );
+        assert!(
+            backend
+                .tick_at(t0 + web_time::Duration::from_secs(66))
+                .sends
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn firmware_observation_is_fresh_and_can_settle_without_sampling() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![
+            device_step(100),
+            CycleStep::Rest {
+                duration_seconds: 65,
+            },
+        ])));
+        finish_success(&mut backend, &start);
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Active, 0), true, t0);
+        let mut firmware = report(ReportState::Active, 1);
+        firmware.firmware_version = Some("3.0.2".to_owned());
+        let observed = backend.report_at(
+            firmware.clone(),
+            false,
+            t0 + web_time::Duration::from_secs(9),
+        );
+        assert!(!observed.events.iter().any(|event| matches!(
+            event,
+            BackendEvent::Sample(_) | BackendEvent::CycleSample(_)
+        )));
+        assert!(
+            backend
+                .tick_at(t0 + REPORT_FRESHNESS_TIMEOUT)
+                .sends
+                .is_empty()
+        );
+        assert!(backend.controller.device().activity_known);
+        backend.report_at(
+            report(ReportState::Finished, 1),
+            true,
+            t0 + web_time::Duration::from_secs(10),
+        );
+        assert_eq!(backend.cycle.status().state, CycleState::Settling);
+        firmware.state = ReportState::InactiveUnknown;
+        firmware.current_ma = 0;
+        let settled = backend.report_at(firmware, false, t0 + web_time::Duration::from_secs(11));
+        assert!(settled.sends.is_empty());
+        assert!(!settled.events.iter().any(|event| matches!(
+            event,
+            BackendEvent::Sample(_) | BackendEvent::CycleSample(_)
+        )));
+        assert_eq!(backend.cycle.status().state, CycleState::Resting);
+        let expired = backend.tick_at(t0 + web_time::Duration::from_secs(21));
+        assert!(expired.sends.is_empty());
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+    }
+
+    #[test]
+    fn settling_silence_interrupts_before_recovered_zero_current_can_advance() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![
+            device_step(100),
+            device_step(200),
+        ])));
+        finish_success(&mut backend, &start);
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Active, 0), true, t0);
+        backend.report_at(report(ReportState::Finished, 1), true, t0);
+        assert_eq!(backend.cycle.status().state, CycleState::Settling);
+        let recovered = backend.report_at(
+            report(ReportState::Idle, 1),
+            true,
+            t0 + REPORT_FRESHNESS_TIMEOUT,
+        );
+        assert!(recovered.sends.is_empty());
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+        assert_eq!(backend.cycle.status().step_index, 0);
     }
 
     #[test]
