@@ -2466,7 +2466,15 @@ impl DeviceActor {
         prepared: PreparedCommand,
         started_at: Option<String>,
     ) -> Result<(), String> {
-        let now = Instant::now();
+        self.commit_written_command_at(prepared, started_at, Instant::now())
+    }
+
+    fn commit_written_command_at(
+        &mut self,
+        prepared: PreparedCommand,
+        started_at: Option<String>,
+        now: Instant,
+    ) -> Result<(), String> {
         self.expire_report_freshness(now);
         if self.controller.commit_command_at(prepared, started_at, now) {
             return Ok(());

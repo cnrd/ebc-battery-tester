@@ -715,7 +715,9 @@ impl TestController {
     }
 
     /// Revalidates immediately before a potentially delayed transport write.
-    /// Safety Stop does not require a fresh observation.
+    /// A real safety Stop frame does not require a fresh observation. A no-frame
+    /// Stop completion only acknowledges existing intent and cannot survive loss
+    /// of the authority under which that intent was prepared.
     ///
     /// # Errors
     /// Returns an error if authority or the physical connection changed.
@@ -727,7 +729,7 @@ impl TestController {
         if prepared.connection_generation != self.connection_generation || !self.connected {
             return Err("command belongs to an old physical connection".to_owned());
         }
-        if prepared.kind == CommandKind::Stop {
+        if prepared.kind == CommandKind::Stop && prepared.frame.is_some() {
             return Ok(());
         }
         if prepared.authority_generation != self.authority_generation {
@@ -1294,6 +1296,51 @@ mod tests {
                 );
                 assert!(!controller.is_running_owned());
             }
+        }
+    }
+
+    #[test]
+    fn no_frame_stop_cannot_commit_after_expiry_in_either_mode() {
+        let t0 = Instant::now();
+        let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            let mut controller = connected_at(mode, t0);
+            controller.report_at(report(ReportState::Idle, 0), t0);
+            commit_at(&mut controller, ApiCommand::Start(config()), t0);
+            controller.report_at(report(ReportState::Active, 0), t0);
+            let first = controller
+                .prepare_command_at(ApiCommand::Stop, t0)
+                .expect("first Stop");
+            assert!(matches!(first.frame(), Some(OutboundFrame::Stop)));
+            assert!(controller.commit_command_at(first, None, t0));
+            let before = t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1));
+            let repeated = controller
+                .prepare_command_at(ApiCommand::Stop, before)
+                .expect("repeated Stop");
+            assert!(repeated.frame().is_none());
+            assert!(controller.commit_command_at(repeated, None, before));
+            assert_eq!(controller.test.state, TestState::Stopping);
+            assert!(!controller.commit_command_at(repeated, None, boundary));
+            assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+            assert_eq!(
+                controller.test.result.as_deref(),
+                Some(REPORT_TIMEOUT_REASON)
+            );
+            assert!(!controller.device.activity_known);
+            assert_eq!(controller.physical_state(), PhysicalState::Unknown);
+            assert!(!controller.expire_report_freshness(boundary));
+            let test = controller.test.clone();
+            assert!(!controller.commit_command_at(repeated, None, boundary));
+            assert_eq!(controller.test, test);
+            let retry = controller
+                .prepare_command_at(ApiCommand::Stop, boundary)
+                .expect("new safety Stop");
+            assert!(matches!(retry.frame(), Some(OutboundFrame::Stop)));
+            assert!(controller.validate_prepared_at(retry, boundary).is_ok());
+            assert!(controller.commit_command_at(retry, None, boundary));
+            assert_eq!(controller.test.state, TestState::Stopping);
+            assert!(!controller.stopping_owns_metrics);
+            assert!(!controller.device.activity_known);
         }
     }
 

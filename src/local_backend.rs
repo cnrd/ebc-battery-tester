@@ -464,7 +464,11 @@ impl LocalBackend {
         notify_command: bool,
         now: Instant,
     ) -> LocalOutput {
-        let mut output = LocalOutput::default();
+        // Both written-frame acknowledgements and synchronous no-frame
+        // completions must propagate expiry to orchestration at the same instant
+        // used by the controller commit. Checking only before preparation leaves
+        // a deadline-crossing race even without an await.
+        let mut output = self.expire_report_freshness(now);
         if !self.controller.commit_command_at(prepared, None, now) {
             self.cycle.interrupt_for_gap(REPORT_TIMEOUT_REASON);
             output.extend(self.state_output());
@@ -1215,6 +1219,196 @@ mod tests {
             send_frames(&backend.command(ApiCommand::Stop)).as_slice(),
             [OutboundFrame::Stop]
         ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the complete deadline race and safety retry sequence together"
+    )]
+    fn no_frame_repeated_stop_completion_crossing_deadline_interrupts_cycle() {
+        use crate::controller::{PhysicalState, REPORT_FRESHNESS_TIMEOUT};
+        use web_time::Duration;
+
+        for lateness in [Duration::ZERO, Duration::from_nanos(1)] {
+            let mut backend = connected_backend();
+            let start = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+            let t0 = Instant::now();
+            backend.finish_send_at(start.sends[0], Ok(()), t0);
+            backend.report_at(report(ReportState::Active, 0), true, t0);
+            assert_eq!(backend.cycle.status().state, CycleState::RunningStep);
+
+            let action = backend
+                .cycle
+                .stop(backend.controller.test())
+                .expect("first Stop");
+            let first = backend.prepare_cycle_action(action, true);
+            assert!(matches!(
+                send_frames(&first).as_slice(),
+                [OutboundFrame::Stop]
+            ));
+            assert!(backend.authorize_send_at(first.sends[0], t0).1);
+            backend.finish_send_at(first.sends[0], Ok(()), t0);
+            assert_eq!(backend.cycle.status().state, CycleState::Stopping);
+            assert_eq!(backend.controller.test().state, TestState::Stopping);
+
+            let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+            let before = t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1));
+            let action = backend
+                .cycle
+                .stop(backend.controller.test())
+                .expect("repeated Stop");
+            let prepared = backend
+                .controller
+                .prepare_command_at(ApiCommand::Stop, before)
+                .expect("fresh Stop");
+            assert!(prepared.frame().is_none());
+            assert!(
+                backend
+                    .controller
+                    .validate_prepared_at(prepared, before)
+                    .is_ok()
+            );
+            assert!(backend.controller.device().activity_known);
+            let completed =
+                backend.command_succeeded_at(prepared, Some(action), true, boundary + lateness);
+            assert!(completed.sends.is_empty(), "no second Stop was written");
+            assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+            assert_eq!(
+                backend.cycle.status().result.as_deref(),
+                Some(REPORT_TIMEOUT_REASON)
+            );
+            assert_eq!(
+                backend.controller.test().state,
+                TestState::RecoveredUncertain
+            );
+            assert_eq!(
+                backend.controller.test().result.as_deref(),
+                Some(REPORT_TIMEOUT_REASON)
+            );
+            assert_eq!(backend.controller.physical_state(), PhysicalState::Unknown);
+            assert!(!backend.controller.device().activity_known);
+            assert!(!backend.controller.is_running_owned());
+            assert_eq!(backend.connection, ServerConnectionState::Connected);
+            assert!(
+                completed
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::CommandError(_)))
+            );
+            assert!(
+                !completed
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::CommandSucceeded))
+            );
+
+            // Repeated completion and later ticks cannot consume or erase the interruption.
+            let test = backend.controller.test().clone();
+            backend.command_succeeded_at(prepared, Some(action), true, boundary + lateness);
+            assert_eq!(backend.controller.test(), &test);
+            assert!(
+                backend
+                    .tick_at(boundary + Duration::from_secs(1))
+                    .sends
+                    .is_empty()
+            );
+            assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+            for command in [
+                ApiCommand::Start(config()),
+                ApiCommand::Adjust(config()),
+                ApiCommand::Resume,
+            ] {
+                assert!(
+                    backend
+                        .controller
+                        .prepare_command_at(command, boundary)
+                        .is_err()
+                );
+            }
+
+            // A new explicit safety intent must really reach the transport.
+            let retry_action = backend
+                .cycle
+                .stop(backend.controller.test())
+                .expect("safety Stop");
+            let retry = backend.prepare_cycle_action(retry_action, true);
+            assert!(matches!(
+                send_frames(&retry).as_slice(),
+                [OutboundFrame::Stop]
+            ));
+            assert!(
+                backend
+                    .authorize_send_at(retry.sends[0], boundary + lateness)
+                    .1
+            );
+            backend.finish_send_at(retry.sends[0], Ok(()), boundary + lateness);
+            assert_eq!(backend.controller.test().state, TestState::Stopping);
+            assert!(!backend.controller.device().activity_known);
+            assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+            assert_eq!(
+                backend.cycle.status().result.as_deref(),
+                Some(REPORT_TIMEOUT_REASON)
+            );
+            for state in [ReportState::Active, ReportState::Idle] {
+                backend.report_at(report(state, 0), true, boundary + Duration::from_secs(2));
+                assert!(!backend.controller.is_running_owned());
+                assert!(
+                    backend
+                        .tick_at(boundary + Duration::from_secs(3))
+                        .sends
+                        .is_empty()
+                );
+                assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+                assert_eq!(
+                    backend.cycle.status().result.as_deref(),
+                    Some(REPORT_TIMEOUT_REASON)
+                );
+            }
+            assert!(
+                send_frames(&backend.request_disconnect())
+                    .iter()
+                    .any(|frame| matches!(frame, OutboundFrame::Disconnect))
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_no_frame_repeated_stop_completion_remains_a_no_op() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+        let t0 = Instant::now();
+        backend.finish_send_at(start.sends[0], Ok(()), t0);
+        backend.report_at(report(ReportState::Active, 0), true, t0);
+        let first = backend.stop_cycle();
+        assert!(matches!(
+            send_frames(&first).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        backend.finish_send_at(first.sends[0], Ok(()), t0);
+        let before =
+            t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(web_time::Duration::from_nanos(1));
+        let action = backend
+            .cycle
+            .stop(backend.controller.test())
+            .expect("repeated Stop");
+        let prepared = backend
+            .controller
+            .prepare_command_at(ApiCommand::Stop, before)
+            .expect("Stop");
+        assert!(prepared.frame().is_none());
+        let completed = backend.command_succeeded_at(prepared, Some(action), true, before);
+        assert!(completed.sends.is_empty());
+        assert!(
+            completed
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::CommandSucceeded))
+        );
+        assert_eq!(backend.controller.test().state, TestState::Stopping);
+        assert!(backend.controller.device().activity_known);
+        assert_eq!(backend.cycle.status().state, CycleState::Stopping);
     }
 
     #[test]

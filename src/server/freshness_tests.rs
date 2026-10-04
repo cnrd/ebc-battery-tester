@@ -204,6 +204,143 @@ fn firmware_refreshes_observation_without_creating_telemetry_or_reclaiming_owner
 }
 
 #[test]
+fn no_frame_repeated_stop_completion_retains_durable_interruption_and_real_retry() {
+    let (mut actor, directory) = mock_actor("no-frame-stop-expiry");
+    confirm_inactive(&mut actor);
+    actor
+        .start_cycle(unnamed_cycle(CycleRecipe {
+            steps: vec![device_step()],
+            repeat_count: 1,
+        }))
+        .expect("cycle");
+    let t0 = Instant::now();
+    actor.record_device_report_at(&report(ReportState::Active), true, t0);
+    assert_eq!(actor.cycle.status().state, CycleState::RunningStep);
+    actor.sent_frames.clear();
+    actor.stop_cycle().expect("first written Stop");
+    assert!(matches!(
+        actor.sent_frames.as_slice(),
+        [OutboundFrame::Stop]
+    ));
+    assert_eq!(actor.controller.test().state, TestState::Stopping);
+    assert_eq!(actor.cycle.status().state, CycleState::Stopping);
+    let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+    let before = t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1));
+    let action = actor
+        .cycle
+        .stop(actor.controller.test())
+        .expect("repeated Stop");
+    let prepared = actor
+        .controller
+        .prepare_command_at(ApiCommand::Stop, before)
+        .expect("fresh repeated Stop");
+    assert!(prepared.frame().is_none());
+    actor.send_command_frame(prepared).expect("no-frame send");
+    assert!(
+        actor
+            .commit_written_command_at(prepared, None, boundary)
+            .is_err()
+    );
+    actor
+        .cycle
+        .on_action_committed(&action, actor.controller.test());
+    assert!(matches!(
+        actor.sent_frames.as_slice(),
+        [OutboundFrame::Stop]
+    ));
+    assert_eq!(actor.snapshot.cycle.state, CycleState::Interrupted);
+    assert_eq!(
+        actor.snapshot.cycle.result.as_deref(),
+        Some(REPORT_TIMEOUT_REASON)
+    );
+    assert_eq!(actor.snapshot.test.state, TestState::RecoveredUncertain);
+    assert_eq!(
+        actor.snapshot.test.result.as_deref(),
+        Some(REPORT_TIMEOUT_REASON)
+    );
+    assert!(!actor.snapshot.device.activity_known);
+    assert_eq!(actor.snapshot.connection, ServerConnectionState::Connected);
+    let metadata = fs::read(directory.join("session.json")).expect("timeout metadata");
+    let persisted: serde_json::Value = serde_json::from_slice(&metadata).expect("JSON");
+    assert_eq!(persisted["cycle"]["state"], "interrupted");
+    assert_eq!(persisted["test"]["state"], "recovered_uncertain");
+    assert_eq!(persisted["device"]["activity_known"], false);
+    assert!(
+        actor
+            .commit_written_command_at(prepared, None, boundary)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(directory.join("session.json")).expect("same metadata"),
+        metadata
+    );
+    actor.config.mock = false; // no synthetic reports during later ticks
+    actor.tick_at(boundary + Duration::from_secs(1));
+    assert_eq!(actor.snapshot.cycle.state, CycleState::Interrupted);
+    actor.config.mock = true; // explicit write recorder
+    actor.stop_cycle().expect("new explicit safety Stop");
+    assert!(matches!(
+        actor.sent_frames.as_slice(),
+        [OutboundFrame::Stop, OutboundFrame::Stop]
+    ));
+    assert!(!actor.snapshot.device.activity_known);
+    assert_eq!(actor.snapshot.cycle.state, CycleState::Interrupted);
+    actor.record_device_report_at(
+        &report(ReportState::Idle),
+        true,
+        boundary + Duration::from_secs(2),
+    );
+    assert_eq!(actor.snapshot.cycle.state, CycleState::Interrupted);
+    assert_eq!(
+        actor.snapshot.cycle.result.as_deref(),
+        Some(REPORT_TIMEOUT_REASON)
+    );
+    assert!(!actor.controller.is_running_owned());
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn written_stop_crossing_deadline_still_commits_without_restoring_cycle() {
+    let (mut actor, directory) = mock_actor("written-stop-expiry");
+    confirm_inactive(&mut actor);
+    actor
+        .start_cycle(unnamed_cycle(CycleRecipe {
+            steps: vec![device_step()],
+            repeat_count: 1,
+        }))
+        .expect("cycle");
+    let t0 = Instant::now();
+    actor.record_device_report_at(&report(ReportState::Active), true, t0);
+    let action = actor.cycle.stop(actor.controller.test()).expect("Stop");
+    let prepared = actor
+        .controller
+        .prepare_command_at(ApiCommand::Stop, t0)
+        .expect("written Stop");
+    actor.sent_frames.clear();
+    actor.send_command_frame(prepared).expect("real Stop write");
+    actor
+        .commit_written_command_at(prepared, None, t0 + REPORT_FRESHNESS_TIMEOUT)
+        .expect("late Stop completion");
+    actor
+        .cycle
+        .on_action_committed(&action, actor.controller.test());
+    actor.sync_controller_state();
+    assert!(matches!(
+        actor.sent_frames.as_slice(),
+        [OutboundFrame::Stop]
+    ));
+    assert_eq!(actor.snapshot.test.state, TestState::Stopping);
+    assert!(!actor.snapshot.device.activity_known);
+    assert_eq!(actor.snapshot.cycle.state, CycleState::Interrupted);
+    assert_eq!(
+        actor.snapshot.cycle.result.as_deref(),
+        Some(REPORT_TIMEOUT_REASON)
+    );
+    assert!(!actor.controller.is_running_owned());
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn mock_idle_reports_keep_observation_fresh() {
     let (mut actor, directory) = mock_actor("mock-idle-fresh");
     confirm_inactive(&mut actor);
