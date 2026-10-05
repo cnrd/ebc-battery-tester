@@ -34,6 +34,8 @@ mod history;
 mod history_tests;
 mod identity;
 mod mdns;
+#[cfg(test)]
+mod safety_tests;
 
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CalibrationCommand, CreateSavedRecipeRequest,
@@ -1759,10 +1761,7 @@ impl DeviceActor {
 
     fn handle_command(&mut self, command: ApiCommand) -> Result<(), String> {
         self.expire_report_freshness(Instant::now());
-        if command == ApiCommand::Stop
-            && (self.cycle.owns_orchestration()
-                || self.cycle.status().state == CycleState::Interrupted)
-        {
+        if command == ApiCommand::Stop && self.cycle.owns_orchestration() {
             self.stop_cycle()?;
             self.persist_and_publish()?;
             return Ok(());
@@ -1868,6 +1867,13 @@ impl DeviceActor {
         cycle: Option<CycleRunContext>,
     ) -> Result<(), StartError> {
         self.expire_report_freshness(Instant::now());
+        // Only the actor's explicitly authorized cycle-child path may bypass
+        // orchestration ownership. HTTP Start and semantic Start share this guard.
+        if cycle.is_none() && self.cycle.owns_orchestration() {
+            return Err(StartError::BadRequest(
+                "the active cycle owns test orchestration".to_owned(),
+            ));
+        }
         let name = normalize_optional_name(name.as_deref())
             .map_err(|error| StartError::BadRequest(error.to_string()))?;
         let name = if cycle.is_some() { None } else { name };
@@ -2148,8 +2154,16 @@ impl DeviceActor {
 
     fn stop_cycle(&mut self) -> Result<(), String> {
         self.expire_report_freshness(Instant::now());
+        let owned_orchestration = self.cycle.owns_orchestration();
         if let Some(action) = self.cycle.stop(self.controller.test()) {
             self.execute_cycle_action(action)?;
+        } else if owned_orchestration
+            && self.cycle.pending_action().is_none()
+            && self.controller.requires_stop_before_disconnect()
+        {
+            // Stopping Rest/Settling orchestration is not proof that potentially
+            // active physical work has stopped, even without an owned child run.
+            self.stop_test()?;
         }
         self.sync_controller_state();
         Ok(())

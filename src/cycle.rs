@@ -29,7 +29,6 @@ pub struct CycleEngine {
     pending_action: Option<CycleAction>,
     rest_clock: Option<RestClock>,
     start_committed: bool,
-    safety_stop_issued: bool,
 }
 
 impl Default for CycleEngine {
@@ -47,7 +46,6 @@ impl CycleEngine {
             pending_action: None,
             rest_clock: None,
             start_committed: false,
-            safety_stop_issued: false,
         }
     }
 
@@ -66,7 +64,6 @@ impl CycleEngine {
             pending_action: None,
             rest_clock: None,
             start_committed: false,
-            safety_stop_issued: false,
         }
     }
 
@@ -146,7 +143,6 @@ impl CycleEngine {
         self.pending_action = None;
         self.rest_clock = None;
         self.start_committed = false;
-        self.safety_stop_issued = false;
         Ok(self.begin_current_step(now))
     }
 
@@ -243,11 +239,6 @@ impl CycleEngine {
     }
 
     pub fn on_action_failed(&mut self, reason: impl Into<String>) {
-        if self.status.state == CycleState::Interrupted
-            && self.pending_action == Some(CycleAction::Stop)
-        {
-            self.safety_stop_issued = false;
-        }
         self.pending_action = None;
         self.start_committed = false;
         self.set_interrupted(reason);
@@ -279,8 +270,8 @@ impl CycleEngine {
         }
     }
 
-    /// Requests a user stop. Resting and settling stop synchronously; physical
-    /// work emits at most one semantic stop action.
+    /// Requests a user stop. Only inactive work stops synchronously. Deduplicate
+    /// in-flight actions, not completed wire submissions: those do not prove Stop.
     pub fn stop(&mut self, test: &TestStatus) -> Option<CycleAction> {
         if !self.is_executing() && self.status.state != CycleState::Interrupted {
             return None;
@@ -294,16 +285,20 @@ impl CycleEngine {
                 | TestState::RecoveredUncertain
         );
         if self.status.state == CycleState::Interrupted {
-            return may_be_active.then(|| self.issue_safety_stop()).flatten();
+            return may_be_active
+                .then(|| self.issue(CycleAction::Stop))
+                .flatten();
         }
 
         self.rest_clock = None;
         self.start_committed = false;
         self.status.rest_remaining_seconds = None;
-        if matches!(
-            self.status.state,
-            CycleState::Preparing | CycleState::Resting | CycleState::Settling
-        ) {
+        if !may_be_active
+            && matches!(
+                self.status.state,
+                CycleState::Preparing | CycleState::Resting | CycleState::Settling
+            )
+        {
             self.pending_action = None;
             self.status.state = CycleState::Stopped;
             return None;
@@ -411,14 +406,6 @@ impl CycleEngine {
         }
         self.pending_action = Some(action);
         Some(action)
-    }
-
-    fn issue_safety_stop(&mut self) -> Option<CycleAction> {
-        if self.safety_stop_issued {
-            return None;
-        }
-        self.safety_stop_issued = true;
-        self.issue(CycleAction::Stop)
     }
 
     fn set_interrupted(&mut self, reason: impl Into<String>) {
@@ -911,7 +898,11 @@ mod tests {
         );
         engine.on_action_committed(&CycleAction::Stop, &status(TestState::Stopped));
         assert_eq!(engine.status().state, CycleState::Interrupted);
-        assert_eq!(engine.stop(&status(TestState::RecoveredUncertain)), None);
+        assert_eq!(engine.stop(&status(TestState::Stopped)), None);
+        assert_eq!(
+            engine.stop(&status(TestState::RecoveredUncertain)),
+            Some(CycleAction::Stop)
+        );
     }
 
     #[test]

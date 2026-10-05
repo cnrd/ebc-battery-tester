@@ -347,6 +347,18 @@ persisted or pre-disconnect voltage/activity values are never accepted as proof
 that hardware is ready. All four calibration references must be staged on the
 same uninterrupted connection before Confirm is accepted.
 
+When physical observation is unknown, each explicit Stop retry sends a real
+Stop frame, even if an earlier write succeeded and the test still says
+`stopping`. A subsequent Active report also permits a new explicit retry;
+immediate duplicate intent without a new report is deduplicated while observation
+is fresh. A successful write is not confirmation of inactivity. An interrupted
+cycle does not own a later manual run or intercept its Stop. Manual Start is
+rejected while a cycle owns orchestration, including Rest and Settling.
+
+Inbound reports must pass normal XOR or the validated high-XOR firmware checksum
+variant. Invalid checksums cannot refresh observation, record telemetry, or
+satisfy the zero-current settling barrier for the next cycle step.
+
 Metadata replacement and run archival use write, sync, rename, and directory
 sync. Samples are append-only and flushed with `sync_data` at least once per
 second while reports arrive, and are flushed on orderly stop/shutdown. On load,

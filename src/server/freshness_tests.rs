@@ -120,7 +120,11 @@ fn owned_run_timeout_suppresses_due_timer_sync_and_explicit_stop_still_writes() 
         .expect("uncertain Disconnect");
     assert!(matches!(
         actor.sent_frames.as_slice(),
-        [OutboundFrame::Stop, OutboundFrame::Disconnect]
+        [
+            OutboundFrame::Stop,
+            OutboundFrame::Stop,
+            OutboundFrame::Disconnect
+        ]
     ));
     assert_eq!(
         actor.snapshot.connection,

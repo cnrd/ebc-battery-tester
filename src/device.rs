@@ -447,9 +447,9 @@ impl TryFrom<&[u8]> for InboundFrame {
         // Captured inbound frames encode XOR values >= 0xf0 either verbatim or
         // reduced by 0xf0. The reason for this device behavior is unknown.
         if !inbound_checksum_valid(calculated_checksum, checksum) {
-            log::warn!(
+            return Err(format!(
                 "Invalid checksum: expected {calculated_checksum:#04x}, got {checksum:#04x}"
-            );
+            ));
         }
         let command_byte = payload[0];
         match command_byte {
@@ -955,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_inbound_checksum_remains_tolerated() {
+    fn invalid_inbound_checksum_is_rejected() {
         let mut frame = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
         frame[INBOUND_FRAME_SIZE - 2] ^= 0x01;
         let payload = &frame[1..INBOUND_FRAME_SIZE - 2];
@@ -963,7 +963,56 @@ mod tests {
             xor_checksum(payload),
             frame[INBOUND_FRAME_SIZE - 2]
         ));
-        assert!(InboundFrame::try_from(frame.as_slice()).is_ok());
+        assert!(InboundFrame::try_from(frame.as_slice()).is_err());
+    }
+
+    #[test]
+    fn single_bit_current_corruption_and_invalid_firmware_checksums_are_rejected() {
+        for command in [0x00, 0x0a, 0x14, 0x64, 0x6e] {
+            let mut payload = [0_u8; 16];
+            payload[0] = command;
+            payload[2] = 8; // 80mA: flip one bit to fabricate zero, keep checksum.
+            let mut frame = inbound_frame(payload);
+            frame[3] ^= 8;
+            assert!(InboundFrame::try_from(frame.as_slice()).is_err());
+            let mut buffer = frame;
+            assert!(process_buffer(&mut buffer).is_empty());
+        }
+    }
+
+    #[test]
+    fn parser_recovers_from_corrupt_frames_to_fragmented_valid_frame() {
+        let mut corrupt = report_frame(0x64);
+        corrupt[17] ^= 1;
+        let valid = report_frame(0x0a);
+        let mut buffer = vec![0x12, 0xf8, 0xfa, 0x02];
+        buffer.extend_from_slice(&corrupt);
+        buffer.extend_from_slice(&valid[..7]);
+        assert!(process_buffer(&mut buffer).is_empty());
+        assert_eq!(buffer, valid[..7]);
+        buffer.extend_from_slice(&valid[7..]);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, valid);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parser_accepts_both_validated_checksums_through_stream_boundary() {
+        for command in [0x00, 0x64, 0x6e] {
+            for calculated in 0xf0..=0xff {
+                let mut payload = [0_u8; 16];
+                payload[0] = command;
+                payload[15] = calculated ^ command;
+                for checksum in [calculated, calculated - 0xf0] {
+                    let mut buffer = inbound_frame(payload);
+                    buffer[17] = checksum;
+                    assert!(InboundFrame::try_from(buffer.as_slice()).is_ok());
+                    assert_eq!(process_buffer(&mut buffer).len(), 1);
+                    assert!(buffer.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::controller::{
 };
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CurrentRunMetadata, CycleRecipe, CycleRunContext,
-    CycleSample, CycleState, RenameRequest, Sample, SavedRecipeReference, ServerConnectionState,
+    CycleSample, RenameRequest, Sample, SavedRecipeReference, ServerConnectionState,
     SnapshotUpdate, StartCycleRequest, StartTestRequest, TestConfiguration,
     cycle_presentation_history, normalize_optional_name,
 };
@@ -146,10 +146,7 @@ impl LocalBackend {
             }
             command => command,
         };
-        if command == ApiCommand::Stop
-            && (self.cycle.owns_orchestration()
-                || self.cycle.status().state == CycleState::Interrupted)
-        {
+        if command == ApiCommand::Stop && self.cycle.owns_orchestration() {
             return self.stop_cycle();
         }
         if self.cycle.owns_orchestration()
@@ -344,8 +341,16 @@ impl LocalBackend {
     }
 
     fn stop_cycle_inner(&mut self) -> LocalOutput {
+        let owned_orchestration = self.cycle.owns_orchestration();
         if let Some(action) = self.cycle.stop(self.controller.test()) {
             self.prepare_cycle_action(action, true)
+        } else if owned_orchestration
+            && self.cycle.pending_action().is_none()
+            && self.controller.requires_stop_before_disconnect()
+        {
+            // Rest/Settling may have no owned physical run, but contradictory
+            // live activity must still receive the operator's safety Stop.
+            self.command_inner(ApiCommand::Stop)
         } else {
             let mut output = self.state_output();
             output.events.push(BackendEvent::CommandSucceeded);
@@ -1024,6 +1029,241 @@ mod tests {
             config: config(),
             name: name.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn interrupted_cycle_allows_stop_retries_and_a_later_manual_stop() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+        finish_success(&mut backend, &start);
+        let t0 = Instant::now();
+        backend.report_at(report(ReportState::Active, 1), true, t0);
+        backend.tick_at(t0 + REPORT_FRESHNESS_TIMEOUT);
+        let interrupted = backend.cycle.status().clone();
+        let stop = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &stop);
+        backend.report_at(report(ReportState::Active, 2), true, t0);
+        backend.tick_at(t0 + REPORT_FRESHNESS_TIMEOUT);
+        let retry = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&retry).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &retry);
+        // The cycle-specific public backend boundary must allow retries too.
+        let retry = backend.stop_cycle();
+        assert!(matches!(
+            send_frames(&retry).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &retry);
+        backend.report(report(ReportState::Idle, 2), true);
+        let start = backend.start_test(start_request(Some("new manual")));
+        finish_success(&mut backend, &start);
+        assert!(backend.current_run.cycle.is_none());
+        backend.report(report(ReportState::Active, 1), true);
+        let stop = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &stop);
+        assert_eq!(backend.controller.test().state, TestState::Stopping);
+        assert_eq!(backend.cycle.status(), &interrupted);
+    }
+
+    #[test]
+    fn manual_start_is_guarded_and_defensive_stop_writes_during_rest() {
+        let mut backend = connected_backend();
+        backend.start_cycle(cycle_request(recipe(vec![CycleStep::Rest {
+            duration_seconds: 30,
+        }])));
+        let before = backend.snapshot();
+        for output in [
+            backend.start_test(start_request(Some("competing"))),
+            backend.command(ApiCommand::Start(config())),
+        ] {
+            assert!(output.sends.is_empty());
+            assert!(
+                output
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::CommandError(_)))
+            );
+        }
+        assert_eq!(backend.snapshot(), before);
+        // Contradictory backend state must not let Rest skip physical Stop.
+        let prepared = backend
+            .controller
+            .prepare_command(ApiCommand::Start(config()))
+            .expect("Start");
+        backend.controller.commit_command(prepared, None);
+        backend.controller.report(report(ReportState::Active, 1));
+        let output = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&output).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &output);
+        assert_eq!(backend.cycle.status().state, CycleState::Stopping);
+        assert_eq!(backend.controller.test().state, TestState::Stopping);
+    }
+
+    #[test]
+    fn stop_during_rest_also_stops_live_activity_without_owned_test_state() {
+        let mut backend = connected_backend();
+        backend.start_cycle(cycle_request(recipe(vec![CycleStep::Rest {
+            duration_seconds: 30,
+        }])));
+        backend.report(report(ReportState::Active, 1), true);
+        assert_eq!(backend.controller.test().state, TestState::Idle);
+        assert!(backend.controller.device().active);
+        assert_eq!(backend.cycle.status().state, CycleState::Resting);
+        let stop = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&stop).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &stop);
+        assert_eq!(backend.controller.test().state, TestState::Stopping);
+        assert_eq!(backend.cycle.status().state, CycleState::Stopped);
+        assert!(!backend.controller.is_running_owned());
+    }
+
+    #[test]
+    fn silent_stop_success_failure_and_late_ack_preserve_real_retries() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        for fail in [false, true] {
+            let mut backend = connected_backend();
+            let start = backend.command(ApiCommand::Start(config()));
+            finish_success(&mut backend, &start);
+            let t0 = Instant::now();
+            backend.report_at(report(ReportState::Active, 1), true, t0);
+            backend.tick_at(t0 + REPORT_FRESHNESS_TIMEOUT);
+            let stop = backend.command(ApiCommand::Stop);
+            assert!(matches!(
+                send_frames(&stop).as_slice(),
+                [OutboundFrame::Stop]
+            ));
+            if fail {
+                finish_failure(&mut backend, &stop);
+                assert!(backend.command(ApiCommand::Stop).sends.is_empty());
+                backend.begin_connection();
+                backend.connection_established();
+            } else {
+                finish_success(&mut backend, &stop);
+            }
+            backend.tick_at(t0 + web_time::Duration::from_secs(100));
+            assert!(!backend.controller.device().activity_known);
+            assert!(backend.snapshot().capabilities.stop);
+            let retry = backend.command(ApiCommand::Stop);
+            assert!(matches!(
+                send_frames(&retry).as_slice(),
+                [OutboundFrame::Stop]
+            ));
+            let late = t0 + web_time::Duration::from_secs(101);
+            assert!(backend.authorize_send_at(retry.sends[0], late).1);
+            backend.finish_send_at(retry.sends[0], Ok(()), late);
+            assert!(!backend.controller.is_running_owned());
+            assert!(!backend.controller.device().activity_known);
+            let retry = backend.command(ApiCommand::Stop);
+            assert!(matches!(
+                send_frames(&retry).as_slice(),
+                [OutboundFrame::Stop]
+            ));
+            finish_success(&mut backend, &retry);
+            backend.report_at(report(ReportState::Idle, 1), true, late);
+            assert_eq!(backend.controller.test().state, TestState::Stopped);
+        }
+    }
+
+    #[test]
+    fn still_active_report_after_stop_allows_a_real_retry_without_reclaiming_metrics() {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        let stop = backend.command(ApiCommand::Stop);
+        finish_success(&mut backend, &stop);
+        assert!(backend.command(ApiCommand::Stop).sends.is_empty());
+        let metrics = backend.controller.test().clone();
+        backend.report(report(ReportState::Active, 2), true);
+        assert!(!backend.controller.is_running_owned());
+        assert_eq!(backend.controller.test().capacity_mah, metrics.capacity_mah);
+        assert_eq!(backend.controller.test().energy_wh, metrics.energy_wh);
+        assert!(backend.snapshot().capabilities.stop);
+        let retry = backend.command(ApiCommand::Stop);
+        assert!(matches!(
+            send_frames(&retry).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+        finish_success(&mut backend, &retry);
+        assert_eq!(backend.cycle.status().state, CycleState::Stopping);
+    }
+
+    fn receive_bytes(backend: &mut LocalBackend, mut bytes: Vec<u8>) -> LocalOutput {
+        let mut output = LocalOutput::default();
+        for (frame, raw) in device::process_buffer(&mut bytes) {
+            output.extend(backend.frame(frame, raw));
+        }
+        output
+    }
+
+    #[test]
+    fn corrupt_payload_and_firmware_cannot_settle_sample_or_refresh_local_authority() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![
+            device_step(100),
+            device_step(100),
+        ])));
+        finish_success(&mut backend, &start);
+        backend.report(observed_report(ReportState::Active, 4000, 80, 1), true);
+        backend.report(observed_report(ReportState::Finished, 4000, 80, 1), true);
+        let before = backend.snapshot();
+        assert_eq!(before.cycle.state, CycleState::Settling);
+        let mut corrupt = vec![
+            0xfa, 0, 0, 8, 0x10, 0xa0, 0, 1, 0, 0, 0, 10, 1, 0x3c, 0, 0, 9, 0x87, 0xf8,
+        ];
+        corrupt[3] ^= 8;
+        let output = receive_bytes(&mut backend, corrupt.clone());
+        assert!(output.sends.is_empty() && output.events.is_empty());
+        for command in [0x64, 0x6e] {
+            let mut firmware = corrupt.clone();
+            firmware[1] = command; // checksum is invalid for either firmware report
+            let output = receive_bytes(&mut backend, firmware);
+            assert!(output.sends.is_empty() && output.events.is_empty());
+        }
+        assert_eq!(backend.snapshot(), before);
+        let mut valid = corrupt.clone();
+        valid[17] ^= 8; // correct checksum for zero current
+        let output = receive_bytes(&mut backend, valid);
+        assert!(matches!(
+            send_frames(&output).as_slice(),
+            [OutboundFrame::StartConstantCurrentDischarge(..)]
+        ));
+        assert_eq!(backend.cycle.status().step_index, 1);
+        assert_eq!(
+            backend
+                .cycle_history
+                .last()
+                .expect("boundary sample")
+                .cycle_state,
+            CycleState::Settling
+        );
+        let old = Instant::now()
+            .checked_sub(REPORT_FRESHNESS_TIMEOUT)
+            .expect("old report");
+        backend.report_at(report(ReportState::Idle, 1), true, old);
+        receive_bytes(&mut backend, corrupt);
+        backend.tick();
+        assert!(!backend.controller.device().activity_known);
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
     }
 
     #[test]

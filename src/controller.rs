@@ -297,6 +297,9 @@ pub struct TestController {
     test: TestStatus,
     lifecycle: Lifecycle,
     stopping_owns_metrics: bool,
+    // Deduplicate only until a new report evaluates this Stop intent. A later
+    // Active report means it is still unconfirmed and an explicit retry may write.
+    stop_awaiting_report: bool,
     physical: PhysicalState,
     connection_generation: u64,
     authority_generation: u64,
@@ -342,6 +345,7 @@ impl TestController {
             test,
             lifecycle,
             stopping_owns_metrics: false,
+            stop_awaiting_report: false,
             physical: PhysicalState::Unknown,
             connection_generation: 0,
             authority_generation: 0,
@@ -452,6 +456,7 @@ impl TestController {
         self.physical = PhysicalState::Unknown;
         self.stopping_owns_metrics = false;
         self.report_generation = None;
+        self.stop_awaiting_report = false;
         self.report_freshness_deadline = None;
         self.device.activity_known = false;
         self.device.active = false;
@@ -502,6 +507,7 @@ impl TestController {
         };
         self.stopping_owns_metrics = false;
         let running = test.state == TestState::Running && device.activity_known && device.active;
+        self.stop_awaiting_report = false;
         self.clock.replace(test.elapsed_seconds, running);
         self.energy = EnergyAccumulator::from_state(&test, None);
         self.capacity = CapacityAccumulator::from_state(&device, &test, None);
@@ -529,7 +535,7 @@ impl TestController {
             && live_voltage
             && self.test.state == TestState::Stopped;
         let show_stop = self.requires_stop_before_disconnect();
-        let stop = show_stop && self.lifecycle != Lifecycle::Stopping && self.connected;
+        let stop = show_stop && !self.stop_is_deduplicated_at(now) && self.connected;
         let adjust = self.lifecycle == Lifecycle::RunningOwned
             && fresh_active
             && self.test.state == TestState::Running
@@ -617,7 +623,7 @@ impl TestController {
                 )
             }
             ApiCommand::Stop => {
-                if self.lifecycle == Lifecycle::Stopping {
+                if self.stop_is_deduplicated_at(now) {
                     (None, CommandKind::Stop)
                 } else {
                     if !self.capabilities_at(now).stop {
@@ -735,6 +741,11 @@ impl TestController {
         if prepared.authority_generation != self.authority_generation {
             return Err(REPORT_TIMEOUT_REASON.to_owned());
         }
+        if prepared.kind == CommandKind::Stop && !self.stop_is_deduplicated_at(now) {
+            // A no-frame acknowledgement is never a substitute for a real retry
+            // once observation expires, even before the next backend tick.
+            return Err(REPORT_TIMEOUT_REASON.to_owned());
+        }
         self.prepare_command_at(prepared.command, now).map(|_| ())
     }
 
@@ -826,6 +837,9 @@ impl TestController {
             },
             ApiCommand::Connect | ApiCommand::Disconnect | ApiCommand::Stop => {}
         }
+        if prepared.kind == CommandKind::Stop && prepared.frame.is_some() {
+            self.stop_awaiting_report = true;
+        }
         true
     }
 
@@ -862,6 +876,9 @@ impl TestController {
         }
         self.report_freshness_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
         let previous_lifecycle = self.lifecycle;
+        // Neither a wire write nor a still-Active report confirms inactivity.
+        // This affects pending intent only, never restores owned metrics/time.
+        self.stop_awaiting_report = false;
         let active = report.state == ReportState::Active;
         self.report_generation = Some(self.connection_generation);
         self.physical = if active {
@@ -1036,6 +1053,15 @@ impl TestController {
         self.clock.accumulated = Duration::from_secs(seconds);
     }
 
+    fn stop_is_deduplicated_at(&self, now: Instant) -> bool {
+        // Unknown observation cannot confirm whether a submitted Stop worked.
+        // Explicit retries remain wire actions without granting fresh authority.
+        self.lifecycle == Lifecycle::Stopping
+            && self.stop_awaiting_report
+            && (self.has_fresh_report(PhysicalState::Active, now)
+                || self.has_fresh_report(PhysicalState::Inactive, now))
+    }
+
     fn has_fresh_report(&self, physical: PhysicalState, now: Instant) -> bool {
         self.connected
             && self
@@ -1172,6 +1198,32 @@ mod tests {
             .prepare_command_at(command, now)
             .expect("prepare");
         controller.commit_command_at(prepared, None, now);
+    }
+
+    #[test]
+    fn no_frame_stop_loses_authorization_at_deadline_even_without_expiry_tick() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut controller, ApiCommand::Start(config()), t0);
+        controller.report_at(report(ReportState::Active, 1), t0);
+        commit_at(&mut controller, ApiCommand::Stop, t0);
+        let before = t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1));
+        let ack = controller
+            .prepare_command_at(ApiCommand::Stop, before)
+            .expect("no-frame Stop");
+        assert!(ack.frame().is_none());
+        assert!(controller.validate_prepared_at(ack, before).is_ok());
+        let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+        assert!(controller.validate_prepared_at(ack, boundary).is_err());
+        assert!(controller.capabilities_at(boundary).stop);
+        let retry = controller
+            .prepare_command_at(ApiCommand::Stop, boundary)
+            .expect("real retry");
+        assert!(matches!(retry.frame(), Some(OutboundFrame::Stop)));
+        assert!(controller.commit_command_at(retry, None, boundary));
+        assert!(!controller.device().activity_known);
+        assert!(!controller.is_running_owned());
     }
 
     #[test]
