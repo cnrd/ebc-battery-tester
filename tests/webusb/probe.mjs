@@ -77,6 +77,14 @@ export default async ({ page, context = {} }) => {
   for (const outcome of ['ok', 'reject', 'short', 'stall']) {
     for (const states of [[0], [10], [100], [110], [0, 10, 100, 0]]) {
       await setup();
+      // Retain a real stopped configuration in the Idle/full-success case, so
+      // Resume rejection cannot pass merely because configuration is absent.
+      if (outcome === 'ok' && states.length === 1 && states[0] === 0) {
+        await command('start', { config }); await report(10, 1);
+        await command('stop'); await report();
+      }
+      const prior = await capture();
+      const startsBefore = count(prior, 1), stopsBefore = count(prior, 2);
       await page.evaluate(() => { mockUsb.hold = true; });
       await command('start', { config });
       await page.waitForFunction(() => mockUsb.held.length === 1);
@@ -90,9 +98,9 @@ export default async ({ page, context = {} }) => {
       await command('start', { config }); await command('resume', config);
       await command('api', { command: 'adjust', payload: config });
       await command('api', { command: 'calibration', payload: { operation: 'voltage_low', value: 4000 } });
-      r = await capture(); assert(count(r, 1) === 1 && count(r, 8) === 0 && count(r, 7) === 0 && count(r, 4) === 0, 'stale observations authorized another physical command');
+      r = await capture(); assert(count(r, 1) === startsBefore + 1 && count(r, 8) === 0 && count(r, 7) === 0 && count(r, 4) === 0, 'stale observations authorized another physical command');
       if (outcome === 'ok') {
-        await command('stop'); r = await capture(); assert(count(r, 2) === 1, 'explicit Stop must survive discarded input');
+        await command('stop'); r = await capture(); assert(count(r, 2) === stopsBefore + 1, 'explicit Stop must survive discarded input');
       }
       await command('connect'); await report(); r = await capture();
       assert(latest(r).device.activity_known, 'actual fresh report after reconnect must restore observation');

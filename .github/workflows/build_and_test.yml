@@ -99,6 +99,12 @@ jobs:
         run: cargo build --locked --no-default-features --features server --bin ebc-server
       - name: Production HTTP and PTY physical-authority regressions
         run: python tests/physical_authority.py target/debug/ebc-server "$RUNNER_TEMP/physical-authority"
+      - name: Preserve physical-authority failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-authority-failure
+          path: ${{ runner.temp }}/physical-authority
 
   trunk-build:
     runs-on: ubuntu-latest

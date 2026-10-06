@@ -21,6 +21,7 @@ CONFIGS = [
     dict(mode="discharge_constant_power", power_w=1, cutoff_voltage_mv=3000, cutoff_time_min=0),
     dict(mode="charge_constant_voltage", current_ma=100, voltage_mv=4200, cutoff_current_ma=10),
 ]
+MODES = ["DischargeConstantCurrent", "DischargeConstantPower", "ChargeConstantVoltage"]
 STOP = bytes.fromhex("fa0200000000000002f8")
 DISCONNECT = bytes.fromhex("fa0600000000000006f8")
 
@@ -84,9 +85,17 @@ class Rig:
         return code, value
 
     def post(self, path, body=None):
+        command = {"/test/stop": 2, "/disconnect": 6}.get(path)
+        if path == "/test/start":
+            command = 1 + 16 * next(i for i, config in enumerate(CONFIGS) if config["mode"] == body["config"]["mode"])
+        elif path == "/cycle/start" and body["recipe"]["steps"][0]["type"] == "device":
+            config = body["recipe"]["steps"][0]["config"]
+            command = 1 + 16 * next(i for i, value in enumerate(CONFIGS) if value["mode"] == config["mode"])
+        before = self.count(command) if command is not None else None
         code, value = self.request(path, body, True)
         assert code == 200, (path, code, value)
-        time.sleep(.05)
+        if command is not None:
+            self.wait(lambda: self.count(command) > before, f"wire command {command:#x} after {path}")
         return value
 
     def status(self):
@@ -94,7 +103,24 @@ class Rig:
 
     def observe(self, state=0, capacity=0):
         os.write(self.master, frame(state, capacity))
-        time.sleep(.08)
+        active = state in (10, 11, 12, 110, 111, 112)
+
+        def observed():
+            device = self.status()["device"]
+            return (device["activity_known"] and device["active"] == active
+                    and device["mode"] == MODES[state % 10] and device["capacity_mah"] == capacity)
+
+        # HTTP commands and serial reads share an actor, not an 80ms fixture
+        # timer. Wait for the actual observation; never inject extra recovery data.
+        self.wait(observed, f"physical report state={state} capacity={capacity}")
+
+    def wait(self, predicate, description):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(.025)
+        raise AssertionError((description, self.status(), bytes(self.wire).hex()))
 
     def count(self, command):
         return sum(self.wire[i + 1] == command for i in range(0, len(self.wire) - 9, 10))
@@ -124,7 +150,7 @@ def safety_stop(rig, state):
             if state == "stopped":
                 rig.post("/test/stop")
             rig.observe(20 if state == "completed" else 0, 1)
-            assert rig.status()["test"]["state"] == state
+            assert rig.status()["test"]["state"] == state, rig.status()
         # Fresh inactive is proven, so no safety Stop is needed until it expires.
         assert not rig.status()["capabilities"]["stop"]
     else:
@@ -190,7 +216,7 @@ def receive_batch(rig):
     # Active must not acknowledge the next child merely because it is processed
     # after that write while iterating the already-parsed serial batch.
     os.write(rig.master, frame(20, 1) + frame(0, 1) + frame(10, 30))
-    time.sleep(.2)
+    rig.wait(lambda: rig.count(1) == 2, "next child Start from serial batch")
     status = rig.status()
     assert rig.count(1) == 2 and status["cycle"]["state"] == "starting_step"
     assert status["test"]["state"] == "starting" and not status["device"]["activity_known"]
