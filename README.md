@@ -358,8 +358,10 @@ rejected while a cycle owns orchestration, including Rest and Settling.
 This safety Stop policy also applies to a newly opened connection before its
 first report, and to stale previously inactive state. Deferred reports retain
 their monotonic receipt time: dequeueing never renews their ten-second authority,
-and reports received before a command's write completion cannot acknowledge that
-later intent. A report whose mode contradicts the owned configuration revokes
+and reports received before a Start/Resume/Stop write completion cannot acknowledge
+that later lifecycle intent. Fresh queued reports during Adjust or calibration
+still observe the existing run and can revoke its ownership. A report whose mode
+contradicts the owned configuration revokes
 ownership before any owned measurements or TimerSync; live observation remains
 visible, cycles interrupt, and returning to the expected mode does not reclaim
 the run. Explicit Stop remains available. These rules are shared by server,

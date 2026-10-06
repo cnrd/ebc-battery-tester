@@ -779,9 +779,17 @@ impl TestController {
         now: Instant,
     ) -> bool {
         self.expire_report_freshness(now);
-        if prepared.frame.is_some() {
+        if prepared.frame.is_some()
+            && matches!(
+                prepared.kind,
+                CommandKind::Start | CommandKind::Resume | CommandKind::Stop
+            )
+        {
             // Even a late successful write may have affected the hardware. An
             // observation received during/before that write cannot confirm it.
+            // Adjust/calibration do not establish a new lifecycle: their queued
+            // fresh reports must still observe (and possibly contradict) the
+            // existing owned run rather than being discarded at completion.
             self.report_not_before = Some(now);
         }
         if self.validate_prepared_at(prepared, now).is_err() {
@@ -915,10 +923,9 @@ impl TestController {
         if !self.connected {
             return (ReportOutcome::default(), None);
         }
-        if (matches!(
-            self.lifecycle,
-            Lifecycle::Starting | Lifecycle::RunningOwned
-        ) || (self.lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics))
+        if (self.lifecycle == Lifecycle::RunningOwned
+            || (self.lifecycle == Lifecycle::Starting && report.state == ReportState::Active)
+            || (self.lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics))
             && self
                 .test
                 .config
@@ -926,6 +933,8 @@ impl TestController {
         {
             // Revoke ownership before attributing any measurements. Keep the
             // fresh live observation below; it is not proof of owned work.
+            // While awaiting the first Active, inactive reports may still name
+            // the prior operation's mode; they neither confirm nor revoke Start.
             self.invalidate_for_gap_at(MODE_CONTRADICTION_REASON, now);
         }
         self.report_freshness_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
@@ -1344,6 +1353,94 @@ mod tests {
                     .1
                     .is_some()
             );
+        }
+    }
+
+    #[test]
+    fn fresh_queued_contradiction_during_non_lifecycle_write_revokes_existing_ownership() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for command in [
+                ApiCommand::Adjust(config()),
+                ApiCommand::Calibration(CalibrationCommand::VoltageLow(4000)),
+            ] {
+                let mut controller = connected_at(mode, t0);
+                controller.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut controller, ApiCommand::Start(config()), t0);
+                controller.report_at(report(ReportState::Active, 1), t0 + Duration::from_secs(1));
+                let prepared = controller
+                    .prepare_command_at(command, t0 + Duration::from_secs(2))
+                    .expect("non-lifecycle write");
+                assert!(controller.commit_command_at(prepared, None, t0 + Duration::from_secs(4)));
+                let mut contradiction = report(ReportState::Active, 30);
+                contradiction.mode = DeviceMode::DischargeConstantPower;
+                let (outcome, measurement) = controller.report_received_at(
+                    contradiction,
+                    t0 + Duration::from_secs(3),
+                    t0 + Duration::from_secs(4),
+                );
+                assert!(
+                    outcome.accepted,
+                    "fresh pre-completion reports still observe the existing physical run"
+                );
+                assert!(measurement.is_none());
+                assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+                assert!(controller.device.active);
+                assert!(!controller.timer_sync_authorized_at(t0 + Duration::from_secs(4)));
+                assert_eq!(controller.test.capacity_mah, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn starting_ignores_other_mode_inactive_reports_until_expected_active_confirmation() {
+        let t0 = Instant::now();
+        let configs = [
+            config(),
+            TestConfiguration::DischargeConstantPower {
+                power_w: 25,
+                cutoff_voltage_mv: 3000,
+                cutoff_time_min: 0,
+            },
+            TestConfiguration::ChargeConstantVoltage {
+                current_ma: 1000,
+                voltage_mv: 4200,
+                cutoff_current_ma: 100,
+            },
+        ];
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for wanted in configs {
+                for observed in configs {
+                    for state in [
+                        ReportState::Idle,
+                        ReportState::Finished,
+                        ReportState::InactiveUnknown,
+                    ] {
+                        let mut controller = connected_at(mode, t0);
+                        controller.report_at(report(ReportState::Idle, 0), t0);
+                        commit_at(&mut controller, ApiCommand::Start(wanted), t0);
+                        let mut inactive = report(state, 30);
+                        inactive.mode = observed.mode();
+                        let at = t0 + Duration::from_secs(1);
+                        let (outcome, measurement) =
+                            controller.report_received_at(inactive, at, at);
+                        assert!(outcome.accepted);
+                        assert!(measurement.is_none());
+                        assert_eq!(
+                            controller.test.state,
+                            TestState::Starting,
+                            "inactive reports of a prior mode cannot resolve pending Start"
+                        );
+                        assert_eq!(controller.test.capacity_mah, None);
+                        assert!(controller.capabilities_at(at).stop);
+                        let mut active = report(ReportState::Active, 1);
+                        active.mode = wanted.mode();
+                        let at = t0 + Duration::from_secs(2);
+                        assert!(controller.report_received_at(active, at, at).1.is_some());
+                        assert!(controller.is_running_owned());
+                    }
+                }
+            }
         }
     }
 

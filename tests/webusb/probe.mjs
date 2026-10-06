@@ -43,6 +43,10 @@ export default async ({ page, context = {} }) => {
     };
   });
   const config = { mode: 'discharge_constant_current', current_ma: 100, cutoff_voltage_mv: 3000, cutoff_time_min: 0 };
+  const configs = [config,
+    { mode: 'discharge_constant_power', power_w: 1, cutoff_voltage_mv: 3000, cutoff_time_min: 0 },
+    { mode: 'charge_constant_voltage', current_ma: 100, voltage_mv: 4200, cutoff_current_ma: 10 },
+  ];
   const command = async (kind, body = {}) => {
     await page.evaluate((k, b) => wasmBindings.boundary_command(k, JSON.stringify(b)), kind, body);
     await pause(100);
@@ -129,6 +133,43 @@ export default async ({ page, context = {} }) => {
   }
   results.push('fresh but pre-command queued observations never acknowledge Start; genuine recovery and Stop dedup');
 
+  for (let wanted = 0; wanted < 3; wanted++) {
+    for (let previous = 0; previous < 3; previous++) {
+      if (wanted === previous) continue;
+      for (const state of [previous, 20 + previous, 100 + previous]) {
+        await setup(); await report(previous);
+        const cycle = state >= 20;
+        if (cycle) await command('cycle', { recipe: { steps: [{ type: 'device', config: configs[wanted], completion: 'hardware' }], repeat_count: 1 } });
+        else await command('start', { config: configs[wanted] });
+        await report(state, 30); r = await capture();
+        assert(latest(r).test.state === 'starting' && !r.events.some(e => e.sample), 'prior-mode inactive report revoked pending Start or owned its metrics');
+        if (cycle) assert(latest(r).cycle.state === 'starting_step', 'prior-mode inactive report interrupted pending cycle Start');
+        await report(10 + wanted, 1); r = await capture(); assert(latest(r).test.state === 'running', 'expected-mode Active must confirm pending Start');
+        await command('shutdown');
+      }
+    }
+  }
+  results.push('CC/CP/CV pending Start tolerates prior-mode Idle/Finished/firmware-inactive until expected Active, without owned metrics');
+
+  for (const intent of [
+    { command: 'adjust', payload: config },
+    { command: 'calibration', payload: { operation: 'voltage_low', value: 4000 } },
+  ]) {
+    for (const state of [11, 111]) {
+      await setup(); await command('start', { config }); await report(10, 1); await capture();
+      await page.evaluate(() => { mockUsb.hold = true; });
+      await command('api', intent); await page.waitForFunction(() => mockUsb.held.length === 1);
+      await report(state, 30); await advance(100); await page.evaluate(() => release('ok')); await pause(200);
+      r = await capture();
+      assert(latest(r).test.state === 'recovered_uncertain' && latest(r).device.active, 'fresh queued contradiction during Adjust/calibration retained ownership');
+      assert(!r.events.some(e => e.sample), 'queued contradiction became an owned sample');
+      await report(10, 100); r = await capture(); assert(latest(r).test.state === 'recovered_uncertain', 'return to expected mode reclaimed queued contradictory work');
+      await command('stop'); r = await capture(); assert(count(r, 2) === 1, 'queued contradiction lost safety Stop');
+      await command('shutdown');
+    }
+  }
+  results.push('fresh queued ordinary/firmware contradiction during Adjust/calibration revokes ownership without acknowledging new lifecycle intent');
+
   await setup();
   await command('cycle', { recipe: { steps: [{ type: 'device', config, completion: 'hardware' }, { type: 'device', config, completion: 'hardware' }], repeat_count: 1 } });
   await report(10, 1);
@@ -157,10 +198,6 @@ export default async ({ page, context = {} }) => {
   }
 
   if (context.section !== 'queue') {
-  const configs = [config,
-    { mode: 'discharge_constant_power', power_w: 1, cutoff_voltage_mv: 3000, cutoff_time_min: 0 },
-    { mode: 'charge_constant_voltage', current_ma: 100, voltage_mv: 4200, cutoff_current_ma: 10 },
-  ];
   for (let owned = 0; owned < 3; owned++) {
     for (let observed = 0; observed < 3; observed++) {
       if (owned === observed) continue;
