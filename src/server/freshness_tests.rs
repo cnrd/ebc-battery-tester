@@ -169,7 +169,7 @@ fn actor_commands_expire_old_observation_without_a_periodic_tick() {
         .expect("idle stale Disconnect");
     assert!(matches!(
         actor.sent_frames.as_slice(),
-        [OutboundFrame::Disconnect]
+        [OutboundFrame::Stop, OutboundFrame::Disconnect]
     ));
     fs::remove_dir_all(directory).expect("cleanup");
 }

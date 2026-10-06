@@ -645,10 +645,30 @@ impl LocalBackend {
         output
     }
 
+    #[cfg(test)]
     pub(crate) fn frame(&mut self, frame: InboundFrame, raw_bytes: Vec<u8>) -> LocalOutput {
+        self.frame_received_at(frame, raw_bytes, Instant::now())
+    }
+
+    pub(crate) fn frame_received_at(
+        &mut self,
+        frame: InboundFrame,
+        raw_bytes: Vec<u8>,
+        received_at: Instant,
+    ) -> LocalOutput {
+        self.frame_received_at_time(frame, raw_bytes, received_at, Instant::now())
+    }
+
+    fn frame_received_at_time(
+        &mut self,
+        frame: InboundFrame,
+        raw_bytes: Vec<u8>,
+        received_at: Instant,
+        now: Instant,
+    ) -> LocalOutput {
         let label = format!("{frame:?}");
         let mut output = match frame {
-            InboundFrame::Firmware(report) => self.report(
+            InboundFrame::Firmware(report) => self.report_received_at(
                 DeviceReport {
                     mode: report.device_mode,
                     state: if report.in_progress {
@@ -663,8 +683,10 @@ impl LocalBackend {
                     firmware_version: Some(report.firmware_version),
                 },
                 false,
+                received_at,
+                now,
             ),
-            InboundFrame::Charge(report) => self.report(
+            InboundFrame::Charge(report) => self.report_received_at(
                 DeviceReport {
                     mode: device::DeviceMode::ChargeConstantVoltage,
                     state: report.state.into(),
@@ -675,8 +697,10 @@ impl LocalBackend {
                     firmware_version: None,
                 },
                 true,
+                received_at,
+                now,
             ),
-            InboundFrame::DischargeConstantCurrent(report) => self.report(
+            InboundFrame::DischargeConstantCurrent(report) => self.report_received_at(
                 DeviceReport {
                     mode: device::DeviceMode::DischargeConstantCurrent,
                     state: report.state.into(),
@@ -687,8 +711,10 @@ impl LocalBackend {
                     firmware_version: None,
                 },
                 true,
+                received_at,
+                now,
             ),
-            InboundFrame::DischargeConstantPower(report) => self.report(
+            InboundFrame::DischargeConstantPower(report) => self.report_received_at(
                 DeviceReport {
                     mode: device::DeviceMode::DischargeConstantPower,
                     state: report.state.into(),
@@ -699,6 +725,8 @@ impl LocalBackend {
                     firmware_version: None,
                 },
                 true,
+                received_at,
+                now,
             ),
         };
         output.events.insert(
@@ -712,25 +740,55 @@ impl LocalBackend {
         output
     }
 
+    #[cfg(test)]
     fn report(&mut self, report: DeviceReport, sample_report: bool) -> LocalOutput {
         self.report_at(report, sample_report, Instant::now())
     }
 
+    #[cfg(test)]
     fn report_at(
         &mut self,
         report: DeviceReport,
         sample_report: bool,
         now: Instant,
     ) -> LocalOutput {
+        self.process_report_at(report, sample_report, now, now, false)
+    }
+
+    fn report_received_at(
+        &mut self,
+        report: DeviceReport,
+        sample_report: bool,
+        received_at: Instant,
+        now: Instant,
+    ) -> LocalOutput {
+        self.process_report_at(report, sample_report, received_at, now, true)
+    }
+
+    fn process_report_at(
+        &mut self,
+        report: DeviceReport,
+        sample_report: bool,
+        received_at: Instant,
+        now: Instant,
+        receipt_fenced: bool,
+    ) -> LocalOutput {
         let mut output = self.expire_report_freshness(now);
-        if self.connection_error.as_deref() == Some(REPORT_TIMEOUT_REASON) {
-            self.connection_error = None;
-        }
         let mode = report.mode;
         let voltage_mv = report.voltage_mv;
         let current_ma = report.current_ma;
         let device_capacity_mah = report.capacity_mah;
-        let (_, measurement) = self.controller.report_at(report, now);
+        let (outcome, measurement) = if receipt_fenced {
+            self.controller.report_received_at(report, received_at, now)
+        } else {
+            self.controller.report_at(report, now)
+        };
+        if !outcome.accepted {
+            return output;
+        }
+        if self.connection_error.as_deref() == Some(REPORT_TIMEOUT_REASON) {
+            self.connection_error = None;
+        }
         let cycle_sample = if sample_report && self.cycle.is_executing() {
             let status = self.cycle.status();
             status.execution_id.clone().map(|execution_id| CycleSample {
@@ -1212,6 +1270,126 @@ mod tests {
             output.extend(backend.frame(frame, raw));
         }
         output
+    }
+
+    fn parsed_report(command: u8) -> (InboundFrame, Vec<u8>) {
+        let mut bytes = vec![
+            0xfa, command, 0, 10, 0x10, 0xa0, 0, 30, 0, 0, 0, 10, 1, 0x3c, 0, 0, 9, 0, 0xf8,
+        ];
+        bytes[17] = bytes[1..17].iter().fold(0, |sum, byte| sum ^ byte);
+        device::process_buffer(&mut bytes)
+            .pop()
+            .expect("parsed report")
+    }
+
+    #[test]
+    fn receive_queue_expiry_discards_normal_firmware_and_settling_reports_at_equality() {
+        use crate::controller::REPORT_FRESHNESS_TIMEOUT;
+        for command in [0, 10, 20, 0x64, 0x6e] {
+            let mut backend = connected_backend();
+            let start = backend.start_cycle(cycle_request(recipe(vec![
+                device_step(100),
+                device_step(100),
+            ])));
+            finish_success(&mut backend, &start);
+            let received_at = Instant::now();
+            backend.report_at(report(ReportState::Active, 1), true, received_at);
+            let now = received_at + REPORT_FRESHNESS_TIMEOUT;
+            for _ in 0..3 {
+                let (frame, raw) = parsed_report(command);
+                let output = backend.frame_received_at_time(frame, raw, received_at, now);
+                assert!(output.sends.is_empty());
+                assert!(!output.events.iter().any(|event| matches!(
+                    event,
+                    BackendEvent::Sample(_) | BackendEvent::CycleSample(_)
+                )));
+                assert!(!backend.controller.device().activity_known);
+                assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+                assert!(!backend.controller.capabilities_at(now).start);
+            }
+            assert!(
+                backend
+                    .tick_at(now + web_time::Duration::from_secs(60))
+                    .sends
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_firmware_refreshes_observation_without_sampling_and_mode_mismatch_revokes_ownership()
+    {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+        finish_success(&mut backend, &start);
+        let (frame, raw) = parsed_report(0x6e);
+        let output = backend.frame(frame, raw);
+        assert!(backend.controller.is_running_owned());
+        assert!(backend.controller.device().activity_known);
+        assert!(!output.events.iter().any(|event| matches!(
+            event,
+            BackendEvent::Sample(_) | BackendEvent::CycleSample(_)
+        )));
+        let before = backend.controller.test().clone();
+        let (frame, raw) = parsed_report(0x6f);
+        let output = backend.frame(frame, raw);
+        assert_eq!(
+            backend.controller.test().state,
+            TestState::RecoveredUncertain
+        );
+        assert!(backend.controller.device().active);
+        assert_eq!(backend.controller.test().capacity_mah, before.capacity_mah);
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+        assert!(!output.events.iter().any(|event| matches!(
+            event,
+            BackendEvent::Sample(_) | BackendEvent::CycleSample(_)
+        )));
+        let mut now = Instant::now();
+        for _ in 0..13 {
+            now += web_time::Duration::from_secs(5);
+            let (frame, raw) = parsed_report(11);
+            let output = backend.frame_received_at_time(frame, raw, now, now);
+            assert!(
+                !output
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::Sample(_)))
+            );
+            assert!(backend.tick_at(now).sends.is_empty());
+        }
+        let (frame, raw) = parsed_report(10);
+        backend.frame_received_at_time(frame, raw, now, now);
+        assert!(!backend.controller.is_running_owned());
+        assert_eq!(backend.controller.test().capacity_mah, before.capacity_mah);
+        assert_eq!(backend.controller.test().energy_wh, before.energy_wh);
+        assert!(matches!(
+            send_frames(&backend.command(ApiCommand::Stop)).as_slice(),
+            [OutboundFrame::Stop]
+        ));
+    }
+
+    #[test]
+    fn real_stop_from_replaced_connection_is_rejected_at_authorization_and_completion() {
+        let mut backend = connected_backend();
+        let start = backend.start_test(start_request(None));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        let old = backend.command(ApiCommand::Stop).sends[0];
+        assert!(matches!(old.frame(), OutboundFrame::Stop));
+        backend.begin_connection();
+        backend.connection_established();
+        // Unknown Stop is eligible on the replacement, isolating connection
+        // generation from freshness/authority rejection of state-dependent Start.
+        assert!(backend.controller.capabilities().stop);
+        assert!(!backend.authorize_send(old).1);
+        let completion = backend.finish_send(old, Ok(()));
+        assert!(
+            completion
+                .events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::CommandError(_)))
+        );
+        assert!(!backend.controller.is_stopping());
     }
 
     #[test]

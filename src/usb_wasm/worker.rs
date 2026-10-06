@@ -18,6 +18,7 @@ const BACKEND_TICK_MS: u32 = 100;
 enum InputEvent {
     Frame {
         generation: u64,
+        received_at: web_time::Instant,
         frame: InboundFrame,
         raw: Vec<u8>,
     },
@@ -246,10 +247,10 @@ pub(super) async fn local_backend_task(
                 }
             }
             input = input => match input {
-                Some(InputEvent::Frame { generation: event_generation, frame, raw })
+                Some(InputEvent::Frame { generation: event_generation, received_at, frame, raw })
                     if event_generation == generation => {
                     publish(
-                        backend.frame(frame, raw),
+                        backend.frame_received_at(frame, raw, received_at),
                         &mut backend,
                         &mut generation,
                         &mut device,
@@ -420,10 +421,12 @@ async fn reading_task(
                         break;
                     }
                     if let Some(data) = result.data() {
+                        let received_at = web_time::Instant::now();
                         buffer.extend_from_slice(&js_sys::Uint8Array::new(&data.buffer()).to_vec());
                         for (frame, raw) in crate::device::process_buffer(&mut buffer) {
                             input_tx.unbounded_send(InputEvent::Frame {
                                 generation,
+                                received_at,
                                 frame,
                                 raw,
                             }).ok();

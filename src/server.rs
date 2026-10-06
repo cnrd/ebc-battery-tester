@@ -2689,9 +2689,10 @@ impl DeviceActor {
         let mut bytes = [0_u8; 64];
         match port.read(&mut bytes) {
             Ok(count) if count > 0 => {
+                let received_at = Instant::now();
                 self.serial_buffer.extend_from_slice(&bytes[..count]);
                 for (frame, _) in device::process_buffer(&mut self.serial_buffer) {
-                    self.handle_frame(frame);
+                    self.handle_frame_received_at(frame, received_at);
                 }
             }
             Ok(_) => {}
@@ -2700,9 +2701,15 @@ impl DeviceActor {
         }
     }
 
+    #[cfg(test)]
     fn handle_frame(&mut self, frame: InboundFrame) {
+        self.handle_frame_received_at(frame, Instant::now());
+    }
+
+    fn handle_frame_received_at(&mut self, frame: InboundFrame, received_at: Instant) {
         match frame {
-            InboundFrame::Firmware(report) => self.record_report_with_source(
+            InboundFrame::Firmware(report) => self.record_received_report_with_source(
+                received_at,
                 report.device_mode,
                 report.voltage_mv,
                 report.current_ma,
@@ -2716,7 +2723,8 @@ impl DeviceActor {
                 &report.device_type,
                 Some(report.firmware_version),
             ),
-            InboundFrame::Charge(report) => self.record_report_with_source(
+            InboundFrame::Charge(report) => self.record_received_report_with_source(
+                received_at,
                 device::DeviceMode::ChargeConstantVoltage,
                 report.voltage_mv,
                 report.current_ma,
@@ -2726,26 +2734,30 @@ impl DeviceActor {
                 &report.device_type,
                 None,
             ),
-            InboundFrame::DischargeConstantCurrent(report) => self.record_report_with_source(
-                device::DeviceMode::DischargeConstantCurrent,
-                report.voltage_mv,
-                report.current_ma,
-                report.milli_ampere_hours,
-                report.state.into(),
-                true,
-                &report.device_type,
-                None,
-            ),
-            InboundFrame::DischargeConstantPower(report) => self.record_report_with_source(
-                device::DeviceMode::DischargeConstantPower,
-                report.voltage_mv,
-                report.current_ma,
-                report.milli_ampere_hours,
-                report.state.into(),
-                true,
-                &report.device_type,
-                None,
-            ),
+            InboundFrame::DischargeConstantCurrent(report) => self
+                .record_received_report_with_source(
+                    received_at,
+                    device::DeviceMode::DischargeConstantCurrent,
+                    report.voltage_mv,
+                    report.current_ma,
+                    report.milli_ampere_hours,
+                    report.state.into(),
+                    true,
+                    &report.device_type,
+                    None,
+                ),
+            InboundFrame::DischargeConstantPower(report) => self
+                .record_received_report_with_source(
+                    received_at,
+                    device::DeviceMode::DischargeConstantPower,
+                    report.voltage_mv,
+                    report.current_ma,
+                    report.milli_ampere_hours,
+                    report.state.into(),
+                    true,
+                    &report.device_type,
+                    None,
+                ),
         }
     }
 
@@ -2785,6 +2797,32 @@ impl DeviceActor {
         model: &str,
         firmware: Option<String>,
     ) {
+        self.record_received_report_with_source(
+            Instant::now(),
+            mode,
+            voltage_mv,
+            current_ma,
+            capacity_mah,
+            report_state,
+            normal_report,
+            model,
+            firmware,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn record_received_report_with_source(
+        &mut self,
+        received_at: Instant,
+        mode: device::DeviceMode,
+        voltage_mv: u16,
+        current_ma: u16,
+        capacity_mah: u16,
+        report_state: ReportState,
+        normal_report: bool,
+        model: &str,
+        firmware: Option<String>,
+    ) {
         let report = DeviceReport {
             mode,
             state: report_state,
@@ -2794,22 +2832,42 @@ impl DeviceActor {
             model: model.to_owned(),
             firmware_version: firmware,
         };
-        self.record_device_report_at(&report, normal_report, Instant::now());
+        self.process_device_report_at(&report, normal_report, received_at, Instant::now(), true);
     }
 
+    #[cfg(test)]
     fn record_device_report_at(
         &mut self,
         report: &DeviceReport,
         normal_report: bool,
         now: Instant,
     ) {
+        self.process_device_report_at(report, normal_report, now, now, false);
+    }
+
+    fn process_device_report_at(
+        &mut self,
+        report: &DeviceReport,
+        normal_report: bool,
+        received_at: Instant,
+        now: Instant,
+        receipt_fenced: bool,
+    ) {
         self.expire_report_freshness(now);
+        let (outcome, measurement) = if receipt_fenced {
+            self.controller
+                .report_received_at(report.clone(), received_at, now)
+        } else {
+            self.controller.report_at(report.clone(), now)
+        };
+        if !outcome.accepted {
+            return;
+        }
         if self.snapshot.connection_error.as_deref() == Some(REPORT_TIMEOUT_REASON) {
             self.snapshot.connection_error = None;
         }
         let active = report.state == ReportState::Active;
         let timestamp_utc = Utc::now().to_rfc3339();
-        let (outcome, measurement) = self.controller.report_at(report.clone(), now);
         self.sync_controller_state();
         if normal_report && self.cycle.is_executing() {
             self.record_cycle_sample(report, &timestamp_utc, now);

@@ -355,6 +355,16 @@ is fresh. A successful write is not confirmation of inactivity. An interrupted
 cycle does not own a later manual run or intercept its Stop. Manual Start is
 rejected while a cycle owns orchestration, including Rest and Settling.
 
+This safety Stop policy also applies to a newly opened connection before its
+first report, and to stale previously inactive state. Deferred reports retain
+their monotonic receipt time: dequeueing never renews their ten-second authority,
+and reports received before a command's write completion cannot acknowledge that
+later intent. A report whose mode contradicts the owned configuration revokes
+ownership before any owned measurements or TimerSync; live observation remains
+visible, cycles interrupt, and returning to the expected mode does not reclaim
+the run. Explicit Stop remains available. These rules are shared by server,
+native direct, and WebUSB backends. See [boundary regression tests](tests/README.md).
+
 Inbound reports must pass normal XOR or the validated high-XOR firmware checksum
 variant. Invalid checksums cannot refresh observation, record telemetry, or
 satisfy the zero-current settling barrier for the next cycle step.

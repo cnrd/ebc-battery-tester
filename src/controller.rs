@@ -20,6 +20,7 @@ const CAPACITY_WRAP_LOW_WATER: u16 = 14_400;
 /// At the exact deadline authority expires. This is runtime-only monotonic state.
 pub const REPORT_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REPORT_TIMEOUT_REASON: &str = "device reports timed out; physical state is uncertain";
+pub const MODE_CONTRADICTION_REASON: &str = "physical device mode contradicts the owned test";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControllerMode {
@@ -75,6 +76,7 @@ pub struct Measurement {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReportOutcome {
+    pub accepted: bool,
     pub transitioned_to_inactive: bool,
 }
 
@@ -99,6 +101,7 @@ pub enum CommandKind {
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedCommand {
     command: ApiCommand,
+    resume_config: Option<TestConfiguration>,
     frame: Option<OutboundFrame>,
     kind: CommandKind,
     connection_generation: u64,
@@ -307,6 +310,9 @@ pub struct TestController {
     // Also bounds the initial wait for observation after connecting. A deadline
     // alone never grants authority: a current-generation report is still required.
     report_freshness_deadline: Option<Instant>,
+    // Strict receipt-time fence: buffered observations cannot acknowledge later
+    // intent, including timestamp ties on coarse-resolution browser clocks.
+    report_not_before: Option<Instant>,
     calibration_staging: CalibrationStaging,
     clock: TestClock,
     energy: EnergyAccumulator,
@@ -351,6 +357,7 @@ impl TestController {
             authority_generation: 0,
             report_generation: None,
             report_freshness_deadline: None,
+            report_not_before: None,
             calibration_staging: CalibrationStaging::default(),
         }
     }
@@ -399,7 +406,12 @@ impl TestController {
     }
 
     pub fn requires_stop_before_disconnect(&self) -> bool {
-        self.device.active
+        self.requires_stop_at(Instant::now())
+    }
+
+    fn requires_stop_at(&self, now: Instant) -> bool {
+        (self.connected && !self.has_fresh_report(PhysicalState::Inactive, now))
+            || self.device.active
             || matches!(
                 self.test.state,
                 TestState::Starting
@@ -426,6 +438,7 @@ impl TestController {
         }
         self.connected = true;
         self.report_freshness_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
+        self.report_not_before = Some(now);
     }
 
     pub fn disconnect(&mut self, reason: &str) {
@@ -534,7 +547,7 @@ impl TestController {
             && fresh_inactive
             && live_voltage
             && self.test.state == TestState::Stopped;
-        let show_stop = self.requires_stop_before_disconnect();
+        let show_stop = self.requires_stop_at(now);
         let stop = show_stop && !self.stop_is_deduplicated_at(now) && self.connected;
         let adjust = self.lifecycle == Lifecycle::RunningOwned
             && fresh_active
@@ -684,6 +697,7 @@ impl TestController {
         };
         Ok(PreparedCommand {
             command,
+            resume_config: None,
             frame,
             kind,
             connection_generation: self.connection_generation,
@@ -713,6 +727,7 @@ impl TestController {
         config.validate().map_err(|error| error.to_string())?;
         Ok(PreparedCommand {
             command: ApiCommand::Resume,
+            resume_config: Some(config),
             frame: Some(test_frame(&config, true)),
             kind: CommandKind::Resume,
             connection_generation: self.connection_generation,
@@ -764,6 +779,11 @@ impl TestController {
         now: Instant,
     ) -> bool {
         self.expire_report_freshness(now);
+        if prepared.frame.is_some() {
+            // Even a late successful write may have affected the hardware. An
+            // observation received during/before that write cannot confirm it.
+            self.report_not_before = Some(now);
+        }
         if self.validate_prepared_at(prepared, now).is_err() {
             // The frame may already have reached hardware. Do not treat a late
             // successful write as fresh intent with newly owned authority.
@@ -809,6 +829,7 @@ impl TestController {
             }
             ApiCommand::Adjust(config) => self.test.config = Some(config),
             ApiCommand::Resume => {
+                self.test.config = prepared.resume_config;
                 self.lifecycle = Lifecycle::Starting;
                 self.stopping_owns_metrics = false;
                 self.physical = PhysicalState::Unknown;
@@ -862,6 +883,26 @@ impl TestController {
         self.report_at(report, Instant::now())
     }
 
+    /// Apply an observation using its transport receipt time, not dequeue time.
+    /// Callers must also retain connection identity across asynchronous queues.
+    pub fn report_received_at(
+        &mut self,
+        report: DeviceReport,
+        received_at: Instant,
+        now: Instant,
+    ) -> (ReportOutcome, Option<Measurement>) {
+        self.expire_report_freshness(now);
+        if received_at > now
+            || now >= received_at + REPORT_FRESHNESS_TIMEOUT
+            || self
+                .report_not_before
+                .is_some_and(|floor| received_at <= floor)
+        {
+            return (ReportOutcome::default(), None);
+        }
+        self.report_at(report, received_at)
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn report_at(
         &mut self,
@@ -873,6 +914,19 @@ impl TestController {
         self.expire_report_freshness(now);
         if !self.connected {
             return (ReportOutcome::default(), None);
+        }
+        if (matches!(
+            self.lifecycle,
+            Lifecycle::Starting | Lifecycle::RunningOwned
+        ) || (self.lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics))
+            && self
+                .test
+                .config
+                .is_some_and(|config| config.mode() != report.mode)
+        {
+            // Revoke ownership before attributing any measurements. Keep the
+            // fresh live observation below; it is not proof of owned work.
+            self.invalidate_for_gap_at(MODE_CONTRADICTION_REASON, now);
         }
         self.report_freshness_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
         let previous_lifecycle = self.lifecycle;
@@ -897,7 +951,10 @@ impl TestController {
             self.device.firmware_version = report.firmware_version;
         }
 
-        let mut outcome = ReportOutcome::default();
+        let mut outcome = ReportOutcome {
+            accepted: true,
+            ..ReportOutcome::default()
+        };
         let measurement = if active {
             let owns_metrics = match previous_lifecycle {
                 Lifecycle::Starting => {
@@ -912,9 +969,7 @@ impl TestController {
                     self.clock.resume(now);
                     true
                 }
-                Lifecycle::Idle | Lifecycle::RecoveredUncertain
-                    if self.mode == ControllerMode::Server =>
-                {
+                Lifecycle::Idle if self.mode == ControllerMode::Server => {
                     self.lifecycle = Lifecycle::RecoveredUncertain;
                     self.test.state = TestState::RecoveredUncertain;
                     self.test.result =
@@ -1191,6 +1246,105 @@ mod tests {
         controller.begin_connection("connect");
         controller.connection_established_at(now);
         controller
+    }
+
+    #[test]
+    fn unknown_and_stale_inactive_stop_eligibility_is_independent_of_run_metadata() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            for state in [TestState::Idle, TestState::Stopped, TestState::Completed] {
+                let mut controller = connected_at(mode, t0);
+                controller.test.state = state;
+                for now in [
+                    t0,
+                    t0 + REPORT_FRESHNESS_TIMEOUT,
+                    t0 + Duration::from_secs(60),
+                ] {
+                    controller.expire_report_freshness(now);
+                    assert!(controller.capabilities_at(now).stop);
+                    let stop = controller
+                        .prepare_command_at(ApiCommand::Stop, now)
+                        .expect("unknown Stop");
+                    assert!(matches!(stop.frame(), Some(OutboundFrame::Stop)));
+                    assert!(controller.commit_command_at(stop, None, now));
+                    assert!(!controller.device.activity_known);
+                    assert!(!controller.is_running_owned());
+                }
+                controller.report_at(report(ReportState::Idle, 0), t0);
+                assert!(!controller.capabilities_at(t0).stop);
+                assert!(
+                    controller
+                        .capabilities_at(t0 + REPORT_FRESHNESS_TIMEOUT)
+                        .stop
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receive_age_is_inclusive_and_pre_command_reports_cannot_acknowledge_intent() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            for age in [
+                REPORT_FRESHNESS_TIMEOUT
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("deadline minus one nanosecond"),
+                REPORT_FRESHNESS_TIMEOUT,
+                REPORT_FRESHNESS_TIMEOUT + Duration::from_nanos(1),
+            ] {
+                let mut controller = connected_at(
+                    mode,
+                    t0.checked_sub(Duration::from_nanos(1))
+                        .expect("connection before receipt"),
+                );
+                let (outcome, _) =
+                    controller.report_received_at(report(ReportState::Idle, 0), t0, t0 + age);
+                assert_eq!(outcome.accepted, age < REPORT_FRESHNESS_TIMEOUT);
+                assert_eq!(
+                    controller.capabilities_at(t0 + age).start,
+                    age < REPORT_FRESHNESS_TIMEOUT
+                );
+                assert!(
+                    controller
+                        .capabilities_at(t0 + REPORT_FRESHNESS_TIMEOUT)
+                        .stop
+                );
+            }
+            let mut controller = connected_at(
+                mode,
+                t0.checked_sub(Duration::from_nanos(1))
+                    .expect("connection before receipt"),
+            );
+            controller.report_received_at(report(ReportState::Idle, 0), t0, t0);
+            let start = controller
+                .prepare_command_at(ApiCommand::Start(config()), t0)
+                .expect("prepare");
+            let committed_at = t0 + Duration::from_secs(1);
+            assert!(controller.commit_command_at(start, None, committed_at));
+            for state in [ReportState::Idle, ReportState::Active] {
+                assert!(
+                    !controller
+                        .report_received_at(report(state, 30), t0, committed_at)
+                        .0
+                        .accepted
+                );
+                assert_eq!(controller.test.state, TestState::Starting);
+                assert!(
+                    !controller
+                        .report_received_at(report(state, 30), committed_at, committed_at)
+                        .0
+                        .accepted,
+                    "a timestamp tie cannot acknowledge a command"
+                );
+            }
+            let post_command = committed_at + Duration::from_nanos(1);
+            assert!(
+                controller
+                    .report_received_at(report(ReportState::Active, 1), post_command, post_command)
+                    .1
+                    .is_some()
+            );
+        }
     }
 
     fn commit_at(controller: &mut TestController, command: ApiCommand, now: Instant) {
@@ -2126,5 +2280,10 @@ mod tests {
             prepared.frame().expect("resume frame").into();
         let expected: [u8; device::OUTBOUND_FRAME_SIZE] = test_frame(&updated, true).into();
         assert_eq!(actual, expected);
+        assert!(controller.commit_command(prepared, None));
+        let mut active = report(ReportState::Active, 2);
+        active.mode = updated.mode();
+        assert!(controller.report(active).1.is_some());
+        assert_eq!(controller.test().config, Some(updated));
     }
 }

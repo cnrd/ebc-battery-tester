@@ -95,6 +95,10 @@ jobs:
         run: cargo test --quiet --no-default-features --features server --all-targets
       - name: Run doc tests
         run: cargo test --quiet --workspace --doc
+      - name: Build production server for physical-authority regressions
+        run: cargo build --locked --no-default-features --features server --bin ebc-server
+      - name: Production HTTP and PTY physical-authority regressions
+        run: python tests/physical_authority.py target/debug/ebc-server "$RUNNER_TEMP/physical-authority"
 
   trunk-build:
     runs-on: ubuntu-latest
@@ -112,6 +116,24 @@ jobs:
         run: wget -qO- "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xzf-
       - name: Build
         run: EBC_WASM_DEFAULT_TRANSPORT=webusb ./trunk build --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install browser test dependencies
+        run: npm ci --prefix tests/webusb
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+      - name: Prepare worker visibility adapter in disposable source copy
+        run: python tests/webusb/prepare.py "$RUNNER_TEMP/webusb-source"
+      - name: Build actual WebUSB worker for Promise-boundary regressions
+        working-directory: ${{ runner.temp }}/webusb-source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/webusb-target
+        run: EBC_WASM_DEFAULT_TRANSPORT=remote "$GITHUB_WORKSPACE/trunk" build --locked --dist "$RUNNER_TEMP/webusb-dist"
+      - name: Browser worker and USB Promise physical-authority regressions
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: node tests/webusb/run.mjs "$RUNNER_TEMP/webusb-dist"
 
   container-policy:
     runs-on: ubuntu-latest
