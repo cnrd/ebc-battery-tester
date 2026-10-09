@@ -1,4 +1,4 @@
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2 AS builder
 
 ARG TRUNK_VERSION=0.21.14
 ARG TARGETARCH
@@ -22,7 +22,7 @@ COPY . .
 RUN cargo build --locked --release --no-default-features --features server --bin ebc-server
 RUN EBC_WASM_DEFAULT_TRANSPORT=remote trunk build --locked --release
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 LABEL org.opencontainers.image.source="https://github.com/cnrd/ebc-battery-tester" \
       org.opencontainers.image.licenses="MIT" \

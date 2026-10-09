@@ -127,6 +127,15 @@ docker pull ghcr.io/cnrd/ebc-battery-tester:0.5.0
 
 ### Local source build
 
+The Dockerfile pins the official Rust and Debian multiarchitecture base-image
+digests. Hosted container CI uses Google's managed `mirror.gcr.io` cache for both
+the host Docker daemon's digest-pinned BuildKit bootstrap image and BuildKit's
+base-image pulls. Validation and publication use the same configuration, without
+registry secrets or a project-maintained mirror. Cache misses can still fall back
+to Docker Hub; this mitigates throttling rather than guaranteeing independence
+from Docker Hub. Base-image updates require reviewed digest changes and native
+amd64/arm64 smoke tests. Local builds do not change your host's mirror settings.
+
 Local builds remain available separately; they do not publish anything:
 
 ```bash
