@@ -15,6 +15,12 @@ use wasm_bindgen_futures::JsFuture;
 const INBOUND_BUFFER_SIZE: u32 = 64;
 const BACKEND_TICK_MS: u32 = 100;
 
+fn advance_generation(generation: &mut u64) {
+    *generation = generation
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("WebUSB connection identities exhausted"));
+}
+
 enum InputEvent {
     Frame {
         generation: u64,
@@ -39,8 +45,28 @@ pub(super) async fn local_backend_task(
     let mut device: Option<web_sys::UsbDevice> = None;
     let mut out_endpoint_num: Option<u8> = None;
     let mut generation = 0_u64;
+    let mut last_service = connection::ClockSample::now();
 
     loop {
+        let mut available = check_clock(&mut last_service, &mut backend);
+        available.extend(reconcile_prefix(
+            &mut input_rx,
+            None,
+            &mut backend,
+            generation,
+        ));
+        available.extend(check_clock(&mut last_service, &mut backend));
+        publish(
+            &mut input_rx,
+            available,
+            &mut backend,
+            &mut generation,
+            &mut device,
+            &mut out_endpoint_num,
+            &mut stop_reading_tx,
+            &event_tx,
+        )
+        .await;
         let command = command_rx.next().fuse();
         let input = input_rx.next().fuse();
         let tick = TimeoutFuture::new(BACKEND_TICK_MS).fuse();
@@ -48,13 +74,18 @@ pub(super) async fn local_backend_task(
         futures::select! {
             command = command => {
                 let Some(command) = command else { break };
+                TimeoutFuture::new(0).await;
+                let mut available = check_clock(&mut last_service, &mut backend);
+                available.extend(reconcile_prefix(&mut input_rx, None, &mut backend, generation));
+                available.extend(check_clock(&mut last_service, &mut backend));
+                publish(&mut input_rx, available, &mut backend, &mut generation, &mut device, &mut out_endpoint_num, &mut stop_reading_tx, &event_tx).await;
                 match command {
                     BackendCommand::RefreshDevices => super::enumerate_devices(&event_tx).await,
                     BackendCommand::Connect(index) => {
-                        generation = generation.wrapping_add(1);
+                        advance_generation(&mut generation);
                         if device.is_some() {
-                            disconnect_device(
-                                LocalBackend::safe_disconnect(),
+                            let _retired = disconnect_device(
+                                backend.request_disconnect(),
                                 &mut backend,
                                 &mut device,
                                 &mut out_endpoint_num,
@@ -63,6 +94,7 @@ pub(super) async fn local_backend_task(
                             ).await;
                         }
                         publish(
+                            &mut input_rx,
                             backend.begin_connection(),
                             &mut backend,
                             &mut generation,
@@ -87,6 +119,7 @@ pub(super) async fn local_backend_task(
                                 ));
                                 device = Some(dev);
                                 publish(
+                                    &mut input_rx,
                                     backend.connection_established(),
                                     &mut backend,
                                     &mut generation,
@@ -98,6 +131,7 @@ pub(super) async fn local_backend_task(
                             }
                             Err(error) => {
                                 publish(
+                                    &mut input_rx,
                                     backend.connection_failed(error),
                                     &mut backend,
                                     &mut generation,
@@ -110,8 +144,8 @@ pub(super) async fn local_backend_task(
                         }
                     }
                     BackendCommand::Disconnect => {
-                        generation = generation.wrapping_add(1);
-                        disconnect_device(
+                        advance_generation(&mut generation);
+                        let retirement = disconnect_device(
                             backend.request_disconnect(),
                             &mut backend,
                             &mut device,
@@ -119,8 +153,13 @@ pub(super) async fn local_backend_task(
                             &mut stop_reading_tx,
                             &event_tx,
                         ).await;
+                        let output = match retirement {
+                            Ok(()) => backend.disconnected(),
+                            Err(error) => backend.connection_failed(error),
+                        };
                         publish(
-                            backend.disconnected(),
+                            &mut input_rx,
+                            output,
                             &mut backend,
                             &mut generation,
                             &mut device,
@@ -131,6 +170,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::Api(command) => {
                         publish(
+                            &mut input_rx,
                             backend.command(command),
                             &mut backend,
                             &mut generation,
@@ -142,6 +182,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::StartTest(request) => {
                         publish(
+                            &mut input_rx,
                             backend.start_test(request),
                             &mut backend,
                             &mut generation,
@@ -153,6 +194,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::Resume(config) => {
                         publish(
+                            &mut input_rx,
                             backend.resume(config),
                             &mut backend,
                             &mut generation,
@@ -164,6 +206,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::StartCycle(request) => {
                         publish(
+                            &mut input_rx,
                             backend.start_cycle(request),
                             &mut backend,
                             &mut generation,
@@ -179,6 +222,7 @@ pub(super) async fn local_backend_task(
                         execution_name,
                     } => {
                         publish(
+                            &mut input_rx,
                             backend.start_saved_recipe(recipe, reference, execution_name),
                             &mut backend,
                             &mut generation,
@@ -202,6 +246,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::RenameRun { run_id, request } => {
                         publish(
+                            &mut input_rx,
                             backend.rename_run(&run_id, request),
                             &mut backend,
                             &mut generation,
@@ -213,6 +258,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::RenameCycle { execution_id, request } => {
                         publish(
+                            &mut input_rx,
                             backend.rename_cycle(&execution_id, request),
                             &mut backend,
                             &mut generation,
@@ -224,6 +270,7 @@ pub(super) async fn local_backend_task(
                     }
                     BackendCommand::StopCycle => {
                         publish(
+                            &mut input_rx,
                             backend.stop_cycle(),
                             &mut backend,
                             &mut generation,
@@ -234,7 +281,7 @@ pub(super) async fn local_backend_task(
                         ).await;
                     }
                     BackendCommand::Shutdown => {
-                        disconnect_device(
+                        let _retired = disconnect_device(
                             backend.shutdown(),
                             &mut backend,
                             &mut device,
@@ -246,43 +293,20 @@ pub(super) async fn local_backend_task(
                     }
                 }
             }
-            input = input => match input {
-                Some(InputEvent::Frame { generation: event_generation, received_at, frame, raw })
-                    if event_generation == generation => {
-                    publish(
-                        backend.frame_received_at(frame, raw, received_at),
-                        &mut backend,
-                        &mut generation,
-                        &mut device,
-                        &mut out_endpoint_num,
-                        &mut stop_reading_tx,
-                        &event_tx,
-                    ).await;
-                }
-                Some(InputEvent::Error { generation: event_generation, message })
-                    if event_generation == generation => {
-                    if let Some(current) = device.take()
-                        && let Err(error) = JsFuture::from(current.close()).await
-                    {
-                        log::error!("Failed to close WebUSB device after read error: {error:?}");
-                    }
-                    out_endpoint_num = None;
-                    stop_reading_tx = None;
-                    publish(
-                        backend.connection_failed(message),
-                        &mut backend,
-                        &mut generation,
-                        &mut device,
-                        &mut out_endpoint_num,
-                        &mut stop_reading_tx,
-                        &event_tx,
-                    ).await;
-                }
-                Some(InputEvent::Frame { .. } | InputEvent::Error { .. }) => {}
-                None => break,
+            input = input => {
+                if input.is_none() { break; }
+                let mut available = check_clock(&mut last_service, &mut backend);
+                available.extend(reconcile_prefix(&mut input_rx, input, &mut backend, generation));
+                available.extend(check_clock(&mut last_service, &mut backend));
+                publish(&mut input_rx, available, &mut backend, &mut generation, &mut device, &mut out_endpoint_num, &mut stop_reading_tx, &event_tx).await;
             },
             () = tick => {
+                let mut available = check_clock(&mut last_service, &mut backend);
+                available.extend(reconcile_prefix(&mut input_rx, None, &mut backend, generation));
+                available.extend(check_clock(&mut last_service, &mut backend));
+                publish(&mut input_rx, available, &mut backend, &mut generation, &mut device, &mut out_endpoint_num, &mut stop_reading_tx, &event_tx).await;
                 publish(
+                    &mut input_rx,
                     backend.tick(),
                     &mut backend,
                     &mut generation,
@@ -296,6 +320,58 @@ pub(super) async fn local_backend_task(
     }
 }
 
+fn check_clock(last: &mut connection::ClockSample, backend: &mut LocalBackend) -> LocalOutput {
+    let now = connection::ClockSample::now();
+    let uncertain = now.discontinuity_since(*last);
+    *last = now;
+    if uncertain {
+        backend.connection_failed(
+            "WebUSB host-clock discontinuity; input provenance is uncertain".to_owned(),
+        )
+    } else {
+        LocalOutput::default()
+    }
+}
+
+fn reconcile_prefix(
+    input_rx: &mut UnboundedReceiver<InputEvent>,
+    first: Option<InputEvent>,
+    backend: &mut LocalBackend,
+    generation: u64,
+) -> LocalOutput {
+    // Establish the finite prefix before processing anything or awaiting output.
+    let mut prefix: Vec<_> = first.into_iter().collect();
+    while let Ok(input) = input_rx.try_recv() {
+        prefix.push(input);
+    }
+    if prefix.is_empty() {
+        return LocalOutput::default();
+    }
+    let mut output = LocalOutput::default();
+    backend.begin_receive_prefix();
+    for input in prefix {
+        match input {
+            InputEvent::Frame {
+                generation: incoming,
+                received_at,
+                frame,
+                raw,
+            } if incoming == generation => {
+                output.extend(backend.frame_received_at(frame, raw, received_at));
+            }
+            InputEvent::Error {
+                generation: incoming,
+                message,
+            } if incoming == generation => {
+                output.extend(backend.connection_failed(message));
+            }
+            _ => {}
+        }
+    }
+    output.extend(backend.finish_receive_prefix());
+    output
+}
+
 async fn disconnect_device(
     output: LocalOutput,
     backend: &mut LocalBackend,
@@ -303,11 +379,20 @@ async fn disconnect_device(
     out_endpoint_num: &mut Option<u8>,
     stop_reading_tx: &mut Option<oneshot::Sender<()>>,
     event_tx: &BackendEventSender,
-) {
+) -> Result<(), String> {
+    let mut errors = Vec::new();
     for event in output.events {
         event_tx.send(event);
     }
     for send in output.sends {
+        let (authorization, allowed) = backend.authorize_send(send);
+        for event in authorization.events {
+            event_tx.send(event);
+        }
+        if !allowed {
+            errors.push("cleanup command was retired before the wire boundary".to_owned());
+            continue;
+        }
         let frame = send.frame();
         event_tx.send(outgoing(frame));
         let result = if let (Some(current), Some(endpoint)) = (device.as_ref(), *out_endpoint_num) {
@@ -327,6 +412,15 @@ async fn disconnect_device(
         };
         if let Err(error) = &result {
             log::error!("Failed to send {frame:?}: {error}");
+            errors.push(error.clone());
+            if matches!(frame, OutboundFrame::Stop) {
+                if let Some(current) = device.take()
+                    && let Err(close_error) = connection::close(&current).await
+                {
+                    errors.push(close_error);
+                }
+                *out_endpoint_num = None;
+            }
         }
         for event in backend.finish_send(send, result).events {
             event_tx.send(event);
@@ -334,9 +428,22 @@ async fn disconnect_device(
     }
     *device = None;
     *out_endpoint_num = None;
+    if let Some(stop_tx) = stop_reading_tx.take() {
+        let _stopped = stop_tx.send(());
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one worker owns input, output, retirement and backend state"
+)]
 async fn publish(
+    input_rx: &mut UnboundedReceiver<InputEvent>,
     output: LocalOutput,
     backend: &mut LocalBackend,
     generation: &mut u64,
@@ -345,10 +452,36 @@ async fn publish(
     stop_reading_tx: &mut Option<oneshot::Sender<()>>,
     event_tx: &BackendEventSender,
 ) {
-    for event in output.events {
-        event_tx.send(event);
-    }
-    for send in output.sends {
+    let mut last_service = connection::ClockSample::now();
+    publish_events(
+        output.events,
+        generation,
+        device,
+        out_endpoint_num,
+        stop_reading_tx,
+        event_tx,
+    )
+    .await;
+    let mut sends = std::collections::VecDeque::from(output.sends);
+    while let Some(send) = sends.pop_front() {
+        if !matches!(send.frame(), OutboundFrame::Stop) {
+            // Let already-runnable input continuations reach the finite queue
+            // watermark. This yields once, never waits for a future report.
+            TimeoutFuture::new(0).await;
+            let mut available = check_clock(&mut last_service, backend);
+            available.extend(reconcile_prefix(input_rx, None, backend, *generation));
+            available.extend(check_clock(&mut last_service, backend));
+            publish_events(
+                available.events,
+                generation,
+                device,
+                out_endpoint_num,
+                stop_reading_tx,
+                event_tx,
+            )
+            .await;
+            sends.extend(available.sends);
+        }
         let (authorization, allowed) = backend.authorize_send(send);
         for event in authorization.events {
             event_tx.send(event);
@@ -369,21 +502,79 @@ async fn publish(
             log::error!("Failed to send {frame:?}: {error}");
         }
         let failed = result.is_err();
+        if !failed
+            && matches!(
+                frame,
+                OutboundFrame::AdjustConstantCurrentDischarge(..)
+                    | OutboundFrame::CalibrateVoltageLow(_)
+                    | OutboundFrame::CalibrateVoltageHigh(_)
+                    | OutboundFrame::CalibrateCurrentLow(_)
+                    | OutboundFrame::CalibrateCurrentHigh(_)
+                    | OutboundFrame::CalibrateConfirm
+                    | OutboundFrame::TimerSync(_)
+            )
+        {
+            let available = reconcile_prefix(input_rx, None, backend, *generation);
+            publish_events(
+                available.events,
+                generation,
+                device,
+                out_endpoint_num,
+                stop_reading_tx,
+                event_tx,
+            )
+            .await;
+            sends.extend(available.sends);
+        }
         for event in backend.finish_send(send, result).events {
             event_tx.send(event);
         }
         if failed {
-            *generation = generation.wrapping_add(1);
+            advance_generation(generation);
             if let Some(stop_tx) = stop_reading_tx.take() {
                 let _stopped = stop_tx.send(());
             }
             if let Some(current) = device.take()
-                && let Err(error) = JsFuture::from(current.close()).await
+                && let Err(error) = connection::close(&current).await
             {
                 log::error!("Failed to close WebUSB device after write error: {error:?}");
+                for event in backend
+                    .connection_failed(format!("WebUSB resource retirement failed: {error}"))
+                    .events
+                {
+                    event_tx.send(event);
+                }
             }
             *out_endpoint_num = None;
         }
+    }
+}
+
+async fn publish_events(
+    events: Vec<BackendEvent>,
+    generation: &mut u64,
+    device: &mut Option<web_sys::UsbDevice>,
+    out_endpoint_num: &mut Option<u8>,
+    stop_reading_tx: &mut Option<oneshot::Sender<()>>,
+    event_tx: &BackendEventSender,
+) {
+    for event in events {
+        if matches!(&event, BackendEvent::Update(state) if state.update.connection == crate::core::ServerConnectionState::Error)
+        {
+            advance_generation(generation);
+            if let Some(stop_tx) = stop_reading_tx.take() {
+                let _stopped = stop_tx.send(());
+            }
+            if let Some(current) = device.take()
+                && let Err(error) = connection::close(&current).await
+            {
+                event_tx.send(BackendEvent::CommandError(format!(
+                    "WebUSB resource retirement failed: {error}"
+                )));
+            }
+            *out_endpoint_num = None;
+        }
+        event_tx.send(event);
     }
 }
 
@@ -402,8 +593,12 @@ async fn reading_task(
     mut stop_reading_rx: oneshot::Receiver<()>,
     generation: u64,
 ) {
-    let mut buffer = Vec::new();
+    let mut buffer = crate::device::ReceiveBuffer::default();
     loop {
+        // transferIn has no device timestamp. Its issuance is an earlier,
+        // conservative bound; a delayed continuation cannot mint a new receipt.
+        let started = connection::ClockSample::now();
+        let received_at = started.before;
         let transfer = JsFuture::from(device.transfer_in(in_endpoint, INBOUND_BUFFER_SIZE)).fuse();
         futures::pin_mut!(transfer);
         futures::select! {
@@ -421,14 +616,18 @@ async fn reading_task(
                         break;
                     }
                     if let Some(data) = result.data() {
-                        let received_at = web_time::Instant::now();
-                        buffer.extend_from_slice(&js_sys::Uint8Array::new(&data.buffer()).to_vec());
-                        for (frame, raw) in crate::device::process_buffer(&mut buffer) {
+                        let now = connection::ClockSample::now();
+                        if now.before >= received_at + crate::controller::REPORT_FRESHNESS_TIMEOUT || now.discontinuity_since(started) {
+                            input_tx.unbounded_send(InputEvent::Error { generation, message: "WebUSB receipt provenance uncertain after delayed input continuation".to_owned() }).ok();
+                            return;
+                        }
+                        let bytes = js_sys::Uint8Array::new(&data.buffer()).subarray(data.byte_offset() as u32, (data.byte_offset() + data.byte_length()) as u32).to_vec();
+                        for item in buffer.receive(&bytes, received_at) {
                             input_tx.unbounded_send(InputEvent::Frame {
                                 generation,
-                                received_at,
-                                frame,
-                                raw,
+                                received_at: item.received_at,
+                                frame: item.frame,
+                                raw: item.raw,
                             }).ok();
                         }
                     }

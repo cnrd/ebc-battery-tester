@@ -331,12 +331,16 @@ Stop and Disconnect remain available. Start and Stop are exposed as `starting`
 and `stopping` until hardware reports confirm their result. Because the protocol
 has no command acknowledgement, inactive reports received while Starting are
 treated as potentially buffered pre-command telemetry; only an active report
-confirms Start or Resume. The state remains pending until that confirmation, an
-explicit Stop, or a connection gap. Normal mode reports preserve the device's
+confirms Start or Resume. Acquisition expires ten seconds after successful write
+completion, even if fresh inactive reports continue; later Active is unowned.
+Explicit Stop or earlier observation/connection loss also ends acquisition.
+Normal mode reports preserve the device's
 Idle and Finished states: Idle resolves an owned run to `stopped`, while Finished
 resolves it to `completed`. Firmware-inactive reports do not contain that
-distinction, so the server waits for the interleaved normal mode report when an
-owned run ends. Disconnects,
+distinction, so they immediately end Active control and freeze owned time/energy,
+retaining only terminal classification and one final counter reading. A later
+normal report can distinguish Stopped from Completed; a later Active cannot
+revive the old owner. Disconnects,
 serial errors, and uncertain recovery break the trapezoidal energy accumulator,
 so neither elapsed time nor energy is invented across an observation gap. A
 confirmed backend-owned start/resume starts a fresh clock at zero or resumes
@@ -345,7 +349,12 @@ from the preserved elapsed value, respectively.
 Start and Calibration require telemetry from the current serial connection;
 persisted or pre-disconnect voltage/activity values are never accepted as proof
 that hardware is ready. All four calibration references must be staged on the
-same uninterrupted connection before Confirm is accepted.
+same uninterrupted calibration/connection context before Confirm is accepted,
+in every backend. Unowned Active cannot calibrate. Normal authorized Start/Stop
+may retain staged references; uncertainty, contradiction and reconnect clear them.
+Manual Start, Continue, Adjust and calibration all obey an executing cycle's
+reservation. Rest interrupts on Active or nonzero current; Settling interrupts
+on Active or incompatible mode. Later recovery cannot resume either phase.
 
 When physical observation is unknown, each explicit Stop retry sends a real
 Stop frame, even if an earlier write succeeded and the test still says
@@ -366,6 +375,22 @@ ownership before any owned measurements or TimerSync; live observation remains
 visible, cycles interrupt, and returning to the expected mode does not reclaim
 the run. Explicit Stop remains available. These rules are shared by server,
 native direct, and WebUSB backends. See [boundary regression tests](tests/README.md).
+
+Fragmented input retains the oldest byte's conservative receipt bound. Serial
+driver backlog and outstanding WebUSB reads cannot become post-command evidence
+merely because processing occurred later. Already-available input is reconciled
+in order before ordinary wire actions or autonomous progression. Suspension or
+uncertain receive timing revokes authority instead of refreshing it.
+
+Physical writes and WebUSB resource cleanup have bounded host-side handling
+(at most ten seconds per attempt while runnable). Timeout retires the uncertain
+channel; late completions cannot affect a replacement session. Unresolved USB
+resource cleanup/open quarantines that handle rather than reopening beneath a
+late operation. Disconnect cleanup proceeds despite telemetry persistence errors;
+neither write success nor resource close guarantees an electrically stopped tester.
+Explicit Continue creates a new owned capacity segment in both direct and server
+mode, excluding raw counter growth during unowned intervals. Direct Wh remains a
+voltage-times-owned-capacity estimate, not the server's integrated Wh.
 
 Inbound reports must pass normal XOR or the validated high-XOR firmware checksum
 variant. Invalid checksums cannot refresh observation, record telemetry, or

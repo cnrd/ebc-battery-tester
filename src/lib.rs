@@ -35,6 +35,8 @@ mod remote_native;
 pub mod server;
 #[cfg(feature = "gui")]
 mod session;
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "gui", feature = "server")))]
+mod transport_time;
 #[cfg(feature = "gui")]
 mod ui;
 #[cfg(feature = "gui")]

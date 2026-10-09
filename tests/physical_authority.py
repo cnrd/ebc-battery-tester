@@ -3,6 +3,7 @@
 Usage: python tests/physical_authority.py <ebc-server> <new scratch directory>
 """
 import concurrent.futures
+import csv
 import functools
 import json
 import os
@@ -26,9 +27,9 @@ STOP = bytes.fromhex("fa0200000000000002f8")
 DISCONNECT = bytes.fromhex("fa0600000000000006f8")
 
 
-def frame(state, capacity=0):
+def frame(state, capacity=0, current=None):
     active = state in (10, 11, 12, 110, 111, 112)
-    payload = [state, 0, 10 if active else 0, *divmod(4000, 240), *divmod(capacity, 240), 0, 0, 0, 10, 1, 60, 0, 0, 9]
+    payload = [state, *divmod((10 if active else 0) if current is None else current, 240), *divmod(4000, 240), *divmod(capacity, 240), 0, 0, 0, 10, 1, 60, 0, 0, 9]
     return bytes([250, *payload, functools.reduce(int.__xor__, payload), 248])
 
 
@@ -212,17 +213,193 @@ def receive_batch(rig):
     step = dict(type="device", config=CONFIGS[0], completion="hardware")
     rig.post("/cycle/start", dict(recipe=dict(steps=[step, step], repeat_count=1)))
     rig.observe(10, 1)
-    # All three frames are received before the next Start is written. The final
-    # Active must not acknowledge the next child merely because it is processed
-    # after that write while iterating the already-parsed serial batch.
+    # The finite pre-next-step prefix must be reconciled before progression.
+    # Active contradicts Settling even though zero-current Idle preceded it.
     os.write(rig.master, frame(20, 1) + frame(0, 1) + frame(10, 30))
-    rig.wait(lambda: rig.count(1) == 2, "next child Start from serial batch")
+    rig.wait(lambda: rig.status()["cycle"]["state"] == "interrupted", "batch contradiction interrupts Settling")
     status = rig.status()
-    assert rig.count(1) == 2 and status["cycle"]["state"] == "starting_step"
-    assert status["test"]["state"] == "starting" and not status["device"]["activity_known"]
-    assert status["history"] == []
+    assert rig.count(1) == 1 and status["cycle"]["state"] == "interrupted"
+    assert status["test"]["state"] == "recovered_uncertain" and status["device"]["activity_known"]
+    rig.observe(0, 31)
+    assert rig.count(1) == 1 and rig.status()["cycle"]["state"] == "interrupted"
+
+
+def fragmented(rig, boundary):
+    rig.observe()
+    if boundary == "stop":
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+        rig.observe(10, 1)
+    partial = frame(10, 50)
+    os.write(rig.master, partial[:18])
+    time.sleep(.3)  # prefix crosses the actual serial receive service
+    if boundary == "start":
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    elif boundary == "stop":
+        rig.post("/test/stop")
+    elif boundary == "expiry":
+        time.sleep(10.1)
+    elif boundary == "replacement":
+        rig.post("/disconnect")
+        rig.post("/connect")
+    os.write(rig.master, partial[18:])
+    time.sleep(.3)
+    status = rig.status()
+    assert status["test"]["state"] != "running", (boundary, status)
+    if boundary in ("start", "expiry", "replacement"):
+        assert not status["device"]["activity_known"], (boundary, status)
+    assert len(status["history"]) == (1 if boundary == "stop" else 0)
+    # Recovery parses a valid complete report without inheriting old provenance.
+    rig.observe(0, 51)
+
+
+def acquisition_deadline(rig, cycle):
+    rig.observe()
+    if cycle:
+        step = dict(type="device", config=CONFIGS[0], completion="hardware")
+        rig.post("/cycle/start", dict(recipe=dict(steps=[step], repeat_count=1)))
+    else:
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    for capacity in range(1, 7):
+        time.sleep(1.8)
+        rig.observe(0, capacity)
+    rig.observe(10, 50)
+    status = rig.status()
+    assert status["test"]["state"] == "recovered_uncertain" and status["history"] == []
+    assert status["test"]["capacity_mah"] is None and rig.count(10) == 0
+    if cycle:
+        assert status["cycle"]["state"] == "interrupted"
+    rig.post("/test/stop")
+
+
+def firmware_closing(rig, cycle):
+    rig.observe()
+    if cycle:
+        step = dict(type="device", config=CONFIGS[0], completion="hardware")
+        rig.post("/cycle/start", dict(recipe=dict(steps=[step], repeat_count=1)))
+    else:
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    rig.observe(10, 10)
+    rig.observe(100, 11)
+    before = rig.status()
+    assert not before["capabilities"]["adjust"] and not before["capabilities"]["start"]
+    rig.observe(10, 50)
+    after = rig.status()
+    assert after["test"]["state"] == "recovered_uncertain"
+    assert after["history"] == before["history"] and after["test"]["capacity_mah"] == 11
+    if cycle:
+        assert after["cycle"]["state"] == "interrupted"
+    rig.post("/test/stop")
+
+
+def persistence_disconnect(rig):
+    rig.observe()
+    rig.post("/test/start", dict(config=CONFIGS[0]))
+    # The actor has prepared metadata, but no sample writer is open yet. This
+    # deterministic Linux sink fails the real buffered telemetry flush.
+    samples = rig.directory / "data" / "samples.csv"
+    samples.unlink()
+    samples.symlink_to("/dev/full")
     rig.observe(10, 1)
-    assert rig.status()["test"]["state"] == "running"
+    code, result = rig.request("/disconnect", post=True)
+    assert code >= 400, (code, result)  # persistence error remains visible
+    rig.wait(lambda: rig.count(6) == 1, "Disconnect despite telemetry flush failure")
+    assert bytes(rig.wire[-20:]) == STOP + DISCONNECT
+    status = rig.status()
+    assert status["connection"] == "disconnected" and not status["device"]["activity_known"]
+
+
+def reserved_controls(rig, phase):
+    rig.observe()
+    step = dict(type="device", config=CONFIGS[0], completion="hardware")
+    recipe = dict(steps=[dict(type="rest", duration_seconds=30), step] if phase == "rest" else [step, step], repeat_count=1)
+    code, saved = rig.request("/recipes", dict(name="software fixture", recipe=recipe), True)
+    assert code == 200, (code, saved)
+    rig.post("/cycle/start", dict(recipe=recipe))
+    if phase == "settling":
+        rig.observe(10, 1)
+        rig.observe(20, 1)
+        rig.wait(lambda: rig.status()["cycle"]["state"] == "settling", "Settling")
+    before = rig.status()
+    starts = rig.count(1)
+    commands = [("/test/start", dict(config=CONFIGS[0])), ("/test/adjust", CONFIGS[0]),
+                ("/test/resume", None), ("/cycle/start", dict(recipe=recipe)),
+                (f"/recipes/{saved['id']}/start", {})]
+    commands += [("/calibration", dict(operation=operation, **({} if value is None else dict(value=value))))
+                 for operation, value in (("voltage_low", 1000), ("voltage_high", 4000),
+                                          ("current_low", 100), ("current_high", 1000), ("confirm", None))]
+    for path, body in commands:
+        code, value = rig.request(path, body, True)
+        assert code >= 400, (phase, path, code, value)
+    after = rig.status()
+    assert rig.count(1) == starts and rig.count(7) == rig.count(8) == rig.count(4) == 0
+    assert after["cycle"]["state"] == ("resting" if phase == "rest" else "settling")
+    assert after["current_run"] == before["current_run"] and after["history"] == before["history"]
+
+
+def rest_contradiction(rig, state):
+    rig.observe()
+    step = dict(type="device", config=CONFIGS[0], completion="hardware")
+    rig.post("/cycle/start", dict(recipe=dict(steps=[dict(type="rest", duration_seconds=1), step], repeat_count=1)))
+    os.write(rig.master, frame(state, 50, 10))
+    rig.wait(lambda: rig.status()["cycle"]["state"] == "interrupted", "Rest contradiction")
+    rig.observe()
+    time.sleep(1.2)
+    assert rig.status()["cycle"]["state"] == "interrupted" and rig.count(1) == 0
+
+
+def terminal_contradiction(rig, owned, observed, state, cycle):
+    rig.observe(owned)
+    if cycle:
+        step = dict(type="device", config=CONFIGS[owned], completion="hardware")
+        rig.post("/cycle/start", dict(recipe=dict(steps=[step, step], repeat_count=1)))
+    else:
+        rig.post("/test/start", dict(config=CONFIGS[owned]))
+    rig.observe(10 + owned, 10)
+    before = rig.status()
+    rig.observe(state + observed, 50)
+    after = rig.status()
+    assert after["device"]["activity_known"] and not after["device"]["active"]
+    assert after["test"]["state"] != "completed" and after["history"] == before["history"]
+    assert after["test"]["capacity_mah"] == before["test"]["capacity_mah"]
+    assert after["test"]["energy_wh"] == before["test"]["energy_wh"]
+    if cycle:
+        assert after["cycle"]["state"] == "interrupted"
+    rig.observe(10 + owned, 51)
+    assert rig.status()["test"]["state"] == "recovered_uncertain" and rig.count(10) == 0
+    rig.post("/test/stop")
+
+
+def continue_segments(rig):
+    rig.observe()
+    rig.post("/test/start", dict(config=CONFIGS[0]))
+    rig.observe(10, 10)
+    before = rig.status()["test"]
+    time.sleep(10.2)
+    rig.observe(0, 50)
+    rig.post("/test/resume")
+    rig.wait(lambda: rig.count(8) == 1, "actual Continue frame")
+    rig.observe(10, 51)
+    after = rig.status()
+    assert after["device"]["capacity_mah"] == 51 and after["test"]["capacity_mah"] == 11
+    assert after["test"]["energy_wh"] == before["energy_wh"]
+    rig.post("/disconnect")
+    with (rig.directory / "data" / "samples.csv").open() as samples:
+        rows = list(csv.DictReader(samples))
+    assert [int(row["capacity_mah"]) for row in rows] == [10, 11], rows
+
+
+def closing_classification(rig):
+    rig.observe()
+    step = dict(type="device", config=CONFIGS[0], completion="hardware")
+    rig.post("/cycle/start", dict(recipe=dict(steps=[step, step], repeat_count=1)))
+    rig.observe(10, 10)
+    rig.observe(100, 11)
+    rig.observe(20, 12)
+    assert rig.status()["cycle"]["state"] == "settling" and rig.count(1) == 1
+    assert rig.status()["test"]["capacity_mah"] == 11
+    os.write(rig.master, frame(100, 12))
+    rig.wait(lambda: rig.count(1) == 2, "later firmware settles before next Start")
+    assert rig.status()["test"]["state"] == "starting"
 
 
 def main():
@@ -235,6 +412,16 @@ def main():
               for cycle in (False, True) for first in (False, True)]
     cases.append(("sustained-cc-cp", contradiction, (0, 1, False, True, False, True)))
     cases.append(("pre-command-serial-batch", receive_batch, ()))
+    cases += [(f"fragment-{boundary}", fragmented, (boundary,)) for boundary in ("start", "stop", "expiry", "replacement")]
+    cases += [(f"acquisition-{cycle}", acquisition_deadline, (cycle,)) for cycle in (False, True)]
+    cases += [(f"firmware-closing-{cycle}", firmware_closing, (cycle,)) for cycle in (False, True)]
+    cases.append(("persistence-disconnect", persistence_disconnect, ()))
+    cases += [(f"reserved-{phase}", reserved_controls, (phase,)) for phase in ("rest", "settling")]
+    cases += [(f"rest-contradiction-{state}", rest_contradiction, (state,)) for state in (0, 10, 100, 110)]
+    cases += [(f"terminal-{a}-{b}-{state}-{cycle}", terminal_contradiction, (a, b, state, cycle))
+              for a in range(3) for b in range(3) if a != b for state in (0, 20, 100) for cycle in (False, True)]
+    cases.append(("continue-segments", continue_segments, ()))
+    cases.append(("closing-classification", closing_classification, ()))
 
     def run(case):
         name, test, args = case

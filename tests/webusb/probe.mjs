@@ -6,25 +6,29 @@ export default async ({ page, context = {} }) => {
   const errors = [];
   page.on('pageerror', e => errors.push(String(e)));
   const init = await page.evaluateOnNewDocument(() => {
-    let now = 1000000;
-    Object.defineProperty(performance, 'now', { value: () => now });
-    window.advance = ms => { now += ms; };
-    const usb = window.mockUsb = { writes: [], readers: [], queued: [], held: [], hold: false, closed: 0 };
+     let now = 1000000;
+     let wall = Date.now();
+     Object.defineProperty(performance, 'now', { value: () => now });
+     Object.defineProperty(Date, 'now', { value: () => wall });
+     window.advance = ms => { now += ms; wall += ms; };
+     window.advanceWall = ms => { wall += ms; };
+    const usb = window.mockUsb = { writes: [], readers: [], queued: [], held: [], hold: false, closed: 0, holdClose: false, heldClose: [] };
     const device = {
       productName: 'Software boundary fixture', manufacturerName: 'test', vendorId: 0x1a86, productId: 0x7523,
       configuration: { interfaces: [{ interfaceNumber: 0, alternate: { endpoints: [
         { type: 'bulk', direction: 'in', endpointNumber: 1 }, { type: 'bulk', direction: 'out', endpointNumber: 2 },
       ] } }] },
-      open: async () => {}, selectConfiguration: async () => {}, claimInterface: async () => {},
+       open: async () => { if (usb.holdOpen) { usb.holdOpen = false; await new Promise(resolve => { usb.releaseOpen = resolve; }); } },
+       selectConfiguration: async () => { if (usb.failConfiguration) throw new Error('injected configuration failure'); }, claimInterface: async () => {},
       controlTransferOut: async () => ({ status: 'ok', bytesWritten: 1 }),
-      close: async () => { usb.closed++; while (usb.readers.length) usb.readers.shift().reject(new Error('closed')); },
+      close: async () => { usb.closed++; while (usb.readers.length) usb.readers.shift().reject(new Error('closed')); if (usb.holdClose) { usb.holdClose = false; return new Promise(resolve => usb.heldClose.push(resolve)); } },
       transferIn: () => new Promise((resolve, reject) => {
         if (usb.queued.length) resolve(usb.queued.shift()); else usb.readers.push({ resolve, reject });
       }),
       transferOut: (ep, data) => {
         const bytes = Array.from(new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength));
         usb.writes.push({ time: now, bytes });
-        if (usb.hold) { usb.hold = false; return new Promise((resolve, reject) => usb.held.push({ resolve, reject, length: bytes.length })); }
+         if (usb.hold || usb.holdCode === bytes[1]) { usb.hold = false; usb.holdCode = null; return new Promise((resolve, reject) => usb.held.push({ resolve, reject, length: bytes.length })); }
         return Promise.resolve({ status: 'ok', bytesWritten: bytes.length });
       },
     };
@@ -34,13 +38,16 @@ export default async ({ page, context = {} }) => {
       if (outcome === 'reject') pending.reject(new Error('injected rejection'));
       else pending.resolve({ status: outcome === 'stall' ? 'stall' : 'ok', bytesWritten: outcome === 'short' ? 9 : pending.length });
     };
-    window.inject = (state = 0, capacity = 0) => {
+     window.reportBytes = (state = 0, capacity = 0, current) => {
       const enc = n => [Math.floor(n / 240), n % 240];
-      const p = [state, 0, [10, 11, 12, 110, 111, 112].includes(state) ? 10 : 0, ...enc(4000), ...enc(capacity), 0, 0, 0, 10, 1, 60, 0, 0, 9];
-      const bytes = [250, ...p, p.reduce((a, b) => a ^ b, 0), 248];
+       const p = [state, ...enc(current ?? ([10, 11, 12, 110, 111, 112].includes(state) ? 10 : 0)), ...enc(4000), ...enc(capacity), 0, 0, 0, 10, 1, 60, 0, 0, 9];
+      return [250, ...p, p.reduce((a, b) => a ^ b, 0), 248];
+    };
+    window.injectBytes = bytes => {
       const result = { status: 'ok', data: new DataView(new Uint8Array(bytes).buffer) };
       if (usb.readers.length) usb.readers.shift().resolve(result); else usb.queued.push(result);
     };
+     window.inject = (state = 0, capacity = 0, current) => injectBytes(reportBytes(state, capacity, current));
   });
   const config = { mode: 'discharge_constant_current', current_ma: 100, cutoff_voltage_mv: 3000, cutoff_time_min: 0 };
   const configs = [config,
@@ -52,11 +59,23 @@ export default async ({ page, context = {} }) => {
     await pause(100);
   };
   const advance = ms => page.evaluate(ms => window.advance(ms), ms);
-  const report = async (state = 0, capacity = 0) => { await advance(1); await page.evaluate((s, c) => inject(s, c), state, capacity); await pause(100); };
-  const capture = () => page.evaluate(() => ({ events: JSON.parse(wasmBindings.boundary_events()), writes: mockUsb.writes, closed: mockUsb.closed }));
-  const latest = r => r.events.filter(e => e.update || e.snapshot).at(-1)?.update ?? r.events.filter(e => e.snapshot).at(-1)?.snapshot;
+  // A read issued before a lifecycle write is conservatively pre-fence even
+  // when its callback comes later. Send a separate subsequent observation; do
+  // not retimestamp or reinject the held transfer as post-command evidence.
+  const report = async (state = 0, capacity = 0) => {
+    for (let i = 0; i < 2; i++) { await advance(1); await page.evaluate((s, c) => inject(s, c), state, capacity); await pause(100); }
+  };
+   let currentState;
+   const capture = async () => {
+     const r = await page.evaluate(() => ({ events: JSON.parse(wasmBindings.boundary_events()), writes: mockUsb.writes, closed: mockUsb.closed }));
+     const state = r.events.filter(e => e.update || e.snapshot).at(-1);
+     if (state) currentState = state.update ?? state.snapshot;
+     return {...r, state: currentState};
+   };
+   const latest = r => r.state;
   const count = (r, code) => r.writes.filter(w => w.bytes[1] === code).length;
   async function setup(observe = true) {
+     currentState = undefined;
     await page.goto(context.url ?? 'http://host.containers.internal:18332/', { waitUntil: 'networkidle0' });
     await page.waitForFunction(() => window.wasmBindings?.boundary_start);
     await page.evaluate(() => wasmBindings.boundary_start());
@@ -66,7 +85,7 @@ export default async ({ page, context = {} }) => {
   }
 
   let r;
-  if (context.section !== 'modes') {
+   if (context.section !== 'modes' && context.section !== 'conformance') {
   await setup(false);
   await command('stop');
   r = await capture();
@@ -103,9 +122,9 @@ export default async ({ page, context = {} }) => {
       await command('api', { command: 'adjust', payload: config });
       await command('api', { command: 'calibration', payload: { operation: 'voltage_low', value: 4000 } });
       r = await capture(); assert(count(r, 1) === startsBefore + 1 && count(r, 8) === 0 && count(r, 7) === 0 && count(r, 4) === 0, 'stale observations authorized another physical command');
-      if (outcome === 'ok') {
-        await command('stop'); r = await capture(); assert(count(r, 2) === stopsBefore + 1, 'explicit Stop must survive discarded input');
-      }
+       // Full success delivered after the attempt deadline is retired too. Stop
+       // remains a finite error on that unusable channel, not a fabricated write.
+       await command('stop'); r = await capture(); assert(count(r, 2) === stopsBefore && r.closed > 0, 'retired timeout channel must not issue a fake Stop');
       await command('connect'); await report(); r = await capture();
       assert(latest(r).device.activity_known, 'actual fresh report after reconnect must restore observation');
       assert(!r.events.some(e => e.sample), 'reconnect must not reclaim metrics');
@@ -197,7 +216,7 @@ export default async ({ page, context = {} }) => {
   await command('shutdown'); await cdp.detach(); results.push('tab suspension/resumption expiry before autonomous Rest Start');
   }
 
-  if (context.section !== 'queue') {
+   if (context.section !== 'queue' && context.section !== 'conformance') {
   for (let owned = 0; owned < 3; owned++) {
     for (let observed = 0; observed < 3; observed++) {
       if (owned === observed) continue;
@@ -224,8 +243,196 @@ export default async ({ page, context = {} }) => {
       }
     }
   }
-  results.push('CC/CP/CV contradictions: first Active/running, ordinary/firmware, manual/cycle, sustained beyond TimerSync, Stop/recovery');
-  }
+   results.push('CC/CP/CV contradictions: first Active/running, ordinary/firmware, manual/cycle, sustained beyond TimerSync, Stop/recovery');
+   }
+
+   if (context.section === 'conformance') {
+     await setup(false); await command('disconnect'); await capture();
+     await page.evaluate(() => { mockUsb.holdOpen = true; }); await command('connect');
+     await advance(10000); await pause(400); r = await capture();
+     const closedBeforeRetry = r.closed;
+     assert(latest(r).connection === 'error' && closedBeforeRetry >= 2, 'timed-out open skipped bounded resource retirement');
+     await command('connect'); r = await capture(); assert(latest(r).connection === 'error', 'unresolved old open allowed replacement handle use');
+     await page.evaluate(() => mockUsb.releaseOpen()); await pause(200); r = await capture();
+     assert(!r.events.some(e => e.update || e.snapshot), 'late old open mutated replacement authority');
+     await command('shutdown'); results.push('never-resolving setup open attempts close and quarantines handle against a late open');
+
+     await setup(false); await command('disconnect');
+     await page.evaluate(() => { mockUsb.failConfiguration = true; }); await command('connect'); r = await capture();
+     assert(latest(r).connection === 'error' && r.closed >= 2, 'failed setup after successful open leaked resource without close');
+     await command('shutdown'); results.push('configuration failure after successful open still attempts bounded local close');
+
+     await setup(); await command('start', {config}); await report(10, 1); await capture();
+     // Model a browser whose runtime monotonic clock excludes host sleep. UTC
+     // discontinuity may revoke authority, never create or refresh an observation.
+     await page.evaluate(() => advanceWall(11000));
+     await command('api', {command:'calibration',payload:{operation:'voltage_low',value:4000}});
+     r = await capture();
+     assert(count(r, 4) === 0 && latest(r).connection === 'error' && r.closed > 0,
+       'sleep excluded by performance clock retained ordinary physical authority');
+     await command('shutdown'); results.push('suspend-excluding host clock revokes before ordinary action and quarantines input');
+
+     await setup(false); await report(10, 50); await capture();
+     for (const operation of ['voltage_low', 'confirm']) {
+       await command('api', {command:'calibration',payload:{operation,...(operation === 'confirm' ? {} : {value:4000})}});
+     }
+     r = await capture(); assert(count(r, 4) === 0 && latest(r).test.state === 'recovered_uncertain', 'unowned Active enabled calibration or Confirm');
+     await command('stop'); r = await capture(); assert(count(r, 2) === 1, 'unowned Active lost safety Stop');
+     await command('shutdown'); results.push('unowned Active rejects voltage calibration and Confirm through worker command queue');
+
+     const calibration = (operation, value) => command('api', {command:'calibration',payload:{operation,...(value === undefined ? {} : {value})}});
+     await setup(); await calibration('confirm'); r = await capture(); assert(count(r, 4) === 0, 'direct Confirm bypassed four-reference staging');
+     await calibration('voltage_low', 1000); await calibration('voltage_high', 4000);
+     await command('start', {config}); await report(10, 1);
+     await calibration('current_low', 100); await calibration('current_high', 1000);
+     await command('stop'); await report(); await calibration('confirm'); r = await capture();
+     assert(count(r, 4) === 5 && latest(r).capabilities.confirm_calibration === false, 'normal Start/Stop did not preserve and consume legitimate staging');
+     await command('connect'); await report(); await calibration('confirm'); r = await capture(); assert(count(r, 4) === 5, 'reconnect retained calibration staging');
+     await command('shutdown'); results.push('shared four-reference staging survives authorized Start/Stop, Confirm consumes, reconnect clears');
+
+     for (const phase of ['rest', 'settling']) {
+       await setup();
+       const steps = phase === 'rest' ? [{type:'rest',duration_seconds:30},{type:'device',config,completion:'hardware'}]
+         : [{type:'device',config,completion:'hardware'},{type:'device',config,completion:'hardware'}];
+       await command('cycle', {recipe:{steps,repeat_count:1}});
+       if (phase === 'settling') { await report(10, 1); await advance(1); await page.evaluate(() => inject(20, 1)); await pause(150); }
+       const before = await capture();
+       await command('start', {config}); await command('api', {command:'start',payload:config});
+       await command('resume', config); await command('api', {command:'adjust',payload:config});
+       for (const [operation,value] of [['voltage_low',1000],['voltage_high',4000],['current_low',100],['current_high',1000],['confirm',undefined]]) await calibration(operation,value);
+       r = await capture();
+       assert(count(r,1) === count(before,1) && count(r,8) === 0 && count(r,7) === 0 && count(r,4) === 0,
+         `manual command bypassed ${phase} orchestration reservation`);
+       assert(latest(r).cycle.state === (phase === 'rest' ? 'resting' : 'settling'), 'rejected manual intent changed cycle');
+       await command('shutdown');
+     }
+     results.push('all manual Start/Continue/Adjust/calibration entry points deny reserved Rest and Settling without wire changes');
+
+     for (const state of [0, 10, 100, 110]) {
+       await setup(); await command('cycle', {recipe:{steps:[{type:'rest',duration_seconds:30},{type:'device',config,completion:'hardware'}],repeat_count:1}});
+       await advance(1); await page.evaluate(s => inject(s, 50, 10), state); await pause(200); r = await capture();
+       assert(latest(r).cycle.state === 'interrupted' && count(r,1) === 0, 'Rest tolerated active/nonzero ordinary/firmware evidence');
+       await report(); await advance(30000); await pause(200); r = await capture();
+       assert(latest(r).cycle.state === 'interrupted' && count(r,1) === 0, 'Rest silently resumed after recovered zero current');
+       await command('shutdown');
+     }
+     results.push('Rest Active and inactive/nonzero contradictions, ordinary/firmware, remain latched across zero recovery and timer expiry');
+
+     await setup(); await command('start',{config}); await report(10,10);
+     await advance(10000); await pause(200); await command('connect'); await report(0,50);
+     await command('resume',config); await report(10,51); r = await capture();
+     assert(count(r,8) === 1 && latest(r).test.capacity_mah === 11 && Math.abs(latest(r).test.energy_wh - .044) < 1e-9,
+       'Continue imported unowned raw capacity/estimated energy after gap/reconnect');
+     assert(r.events.some(e => e.sample?.capacity_mah === 11) && !r.events.some(e => e.sample?.capacity_mah === 51), 'direct owned sample used raw counter history');
+     await command('shutdown'); results.push('direct Continue after gap/reconnect excludes unowned +40 mAh from metrics and delivered samples');
+
+     await setup(); await command('cycle',{recipe:{steps:[{type:'device',config,completion:'hardware'},{type:'device',config,completion:'hardware'}],repeat_count:1}});
+     await report(10,10); await report(100,11); await capture();
+     await advance(1); await page.evaluate(() => inject(20,12)); await pause(150); r = await capture();
+     assert(latest(r).cycle.state === 'settling' && count(r,1) === 1 && latest(r).test.capacity_mah === 11,
+       'closing ordinary Finished failed classification or renewed final-counter attribution');
+     await advance(1); await page.evaluate(() => inject(100,12)); await pause(200); r = await capture();
+     assert(count(r,1) === 2 && latest(r).test.state === 'starting' && !r.events.some(e => e.cycle_sample || e.sample),
+       'later firmware zero did not satisfy Settling or fabricated telemetry');
+     await command('shutdown'); results.push('firmware closing then ordinary Finished classifies; later firmware zero advances without firmware rows');
+
+     await setup(); await page.evaluate(() => { mockUsb.hold = true; }); await command('start',{config});
+     await command('stop'); await command('disconnect');
+     const frozen = await page.createCDPSession(); await frozen.send('Page.setWebLifecycleState',{state:'frozen'});
+     await frozen.send('Page.setWebLifecycleState',{state:'active'});
+     await page.evaluate(() => { advanceWall(11000); release('ok'); }); await pause(400); r = await capture();
+     assert(latest(r).connection === 'error' && r.closed > 0 && count(r,2) === 0 && !latest(r).device.activity_known,
+       'freeze/resume delivered late ordinary completion before timeout/retirement');
+     await command('shutdown'); await frozen.detach(); results.push('actual tab freeze/resume with held output and suspend-excluding clock retires before late completion');
+     for (const boundary of ['start', 'stop', 'expiry', 'replacement']) {
+       await setup();
+       if (boundary === 'stop') { await command('start', {config}); await report(10, 1); }
+       await advance(1);
+       await page.evaluate(() => { window.fragment = reportBytes(10, 50); injectBytes(fragment.slice(0, 18)); });
+       await pause(100);
+       if (boundary === 'start') await command('start', {config});
+       if (boundary === 'stop') await command('stop');
+       if (boundary === 'replacement') await command('connect');
+       if (boundary === 'expiry') await advance(10000);
+       await advance(1); await page.evaluate(() => injectBytes(fragment.slice(18))); await pause(300);
+       r = await capture();
+       assert(latest(r).test.state !== 'running', `fragment across ${boundary} acquired/revived ownership`);
+       assert(!r.events.some(e => e.sample && e.sample.capacity_mah === 50), 'old prefix attributed capacity');
+       await command('shutdown');
+     }
+     results.push('fragment oldest-byte age and Start/Stop/replacement fences through actual transferIn');
+
+     await setup();
+     await command('cycle', {recipe: {steps: [{type:'device',config,completion:'hardware'}, {type:'device',config,completion:'hardware'}],repeat_count:1}});
+     await report(10, 1); await capture();
+     await advance(1); await page.evaluate(() => inject(20, 1)); await pause(150);
+     r = await capture(); assert(latest(r).cycle.state === 'settling', 'single Finished must enter Settling');
+     await advance(1); await page.evaluate(() => injectBytes([...reportBytes(0, 1), ...reportBytes(10, 30), ...reportBytes(0, 31)])); await pause(250);
+     r = await capture();
+     assert(latest(r).cycle.state === 'interrupted' && count(r, 1) === 1, 'available Idle/Active/Idle prefix emitted next child Start or hid contradiction');
+     await command('shutdown'); results.push('available prefix barrier retains intermediate Settling contradiction and emits no next Start');
+
+     for (const cycle of [false, true]) {
+       await setup();
+       if (cycle) await command('cycle', {recipe:{steps:[{type:'device',config,completion:'hardware'}],repeat_count:1}});
+       else await command('start', {config});
+       const started = (await capture()).writes.filter(w => w.bytes[1] === 1).at(-1).time;
+       for (let i = 0; i < 9; i++) { await advance(990); await report(0, i); }
+       await page.evaluate(started => { advance(started + 10000 - performance.now()); inject(10, 50); }, started);
+       await pause(300); r = await capture();
+       assert(latest(r).test.state === 'recovered_uncertain' && latest(r).test.capacity_mah === null, 'inactive telemetry extended acquisition or equality acquired');
+       if (cycle) assert(latest(r).cycle.state === 'interrupted', 'child acquisition deadline did not interrupt cycle');
+       await command('shutdown');
+     }
+     results.push('manual and child acquisition exact equality despite healthy inactive transferIn');
+
+     for (const cycle of [false, true]) {
+       await setup();
+       if (cycle) await command('cycle', {recipe:{steps:[{type:'device',config,completion:'hardware'}],repeat_count:1}});
+       else await command('start', {config});
+       await report(10, 10); await report(100, 11); await capture();
+       await report(10, 50); r = await capture();
+       assert(latest(r).test.state === 'recovered_uncertain' && latest(r).test.capacity_mah === 11 && !r.events.some(e => e.sample), 'firmware-inactive retained dormant ownership');
+       if (cycle) assert(latest(r).cycle.state === 'interrupted', 'firmware-inactive then Active kept cycle');
+       await command('shutdown');
+     }
+     results.push('firmware-inactive closes manual/child control without metric restart');
+
+     for (const intent of ['start', 'stop']) {
+       await setup();
+       if (intent === 'stop') { await command('start',{config}); await report(10, 1); }
+       await page.evaluate(() => { mockUsb.hold = true; });
+       await command(intent, intent === 'start' ? {config} : {});
+       await command('stop'); await command('disconnect');
+       await advance(10000); await pause(600); r = await capture();
+       assert(r.closed > 0 && latest(r).connection === 'error', 'hung output trapped Disconnect/retirement');
+       assert(count(r, 1) === 1 && count(r, 2) === (intent === 'stop' ? 1 : 0), 'hung ordinary/Stop output raced another writer');
+       await command('connect'); await report(); await command('start',{config}); await report(10, 2); await capture();
+       await page.evaluate(() => release('ok')); await pause(250); r = await capture();
+       assert(!r.events.some(e => e.snapshot || e.update || e.sample), 'late retired successful Promise mutated replacement operation');
+       await command('shutdown');
+     }
+     results.push('never-resolving ordinary/Stop output; queued Stop/Disconnect; exact timeout; late success has zero replacement effects');
+
+     await setup(); await page.evaluate(() => { mockUsb.holdCode = 6; });
+     await command('disconnect'); await page.waitForFunction(() => mockUsb.held.length === 1);
+     await page.evaluate(() => release('reject')); await pause(250); r = await capture();
+     assert(r.closed === 1 && latest(r).connection === 'error', 'failed protocol Disconnect skipped local close');
+     results.push('rejected protocol Disconnect still attempts local resource close');
+
+     await setup(false); await page.evaluate(() => { mockUsb.holdClose = true; });
+     await command('disconnect'); await advance(10000); await pause(350); r = await capture();
+     assert(r.closed === 1 && latest(r).connection === 'error', 'never-resolving close trapped finite retirement');
+     await command('connect'); r = await capture(); assert(latest(r).connection === 'error', 'unretired handle reopened under a late close');
+     await page.evaluate(() => mockUsb.heldClose.shift()()); await pause(250); r = await capture();
+     assert(!r.events.some(e => e.snapshot || e.update), 'late close resurrected retired connection');
+     results.push('bounded close timeout and quarantine of unresolved handle; late close has zero authority');
+
+     await setup(); await command('start',{config}); await report(10, 1); await capture();
+     await page.evaluate(() => { inject(10, 50); advance(10000); }); await pause(300); r = await capture();
+     assert(latest(r).connection === 'error' && !r.events.some(e => e.sample), 'delayed input continuation manufactured freshness');
+     await command('shutdown'); results.push('already-resolved input Promise continuation delayed across receipt boundary fails closed');
+   }
   await page.removeScriptToEvaluateOnNewDocument(init.identifier);
   assert(errors.length === 0, `browser exceptions: ${errors}`);
   return { data: { passed: results }, type: 'application/json' };

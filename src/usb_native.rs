@@ -1,4 +1,7 @@
-use std::io::{Read as _, Write as _};
+#[cfg(test)]
+use std::io::Read as _;
+#[cfg(test)]
+use std::io::Write as _;
 
 use crate::backend::{
     BackendCommand, BackendEvent, BackendEventSender, DiagnosticDirection, DiagnosticEvent,
@@ -60,31 +63,78 @@ fn connect(idx: usize) -> Result<Box<dyn serialport::SerialPort>, String> {
         .timeout(std::time::Duration::from_millis(10))
         .open()
         .map_err(|e| format!("Failed to open {name}: {e}"))?;
-    let bytes: [u8; OUTBOUND_FRAME_SIZE] = OutboundFrame::Connect(idx).into();
-    port.write_all(&bytes)
-        .map_err(|e| format!("Failed to send connect command: {e}"))?;
+    crate::transport_time::write_frame(port.as_mut(), OutboundFrame::Connect(idx))?;
     Ok(port)
+}
+
+fn backend_thread(command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
+    backend_runtime(command_rx, event_tx, None);
 }
 
 #[expect(clippy::needless_pass_by_value)]
 #[expect(
     clippy::too_many_lines,
-    reason = "the native transport loop handles all backend command variants"
+    reason = "single native executor owns physical command and receive boundaries"
 )]
-fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: BackendEventSender) {
+fn backend_runtime(
+    mut command_rx: UnboundedReceiver<BackendCommand>,
+    event_tx: BackendEventSender,
+    mut port: Option<Box<dyn serialport::SerialPort>>,
+) {
     let mut backend = LocalBackend::default();
-    let mut port: Option<Box<dyn serialport::SerialPort>> = None;
-    let mut buffer: Vec<u8> = Vec::new();
+    let mut ingress = crate::device::SerialIngress::default();
+    let mut ingress_context = (0, None);
+    // A supplied port is a software-test seam for opening, not an alternate
+    // controller/queue/receive implementation. Production starts with None.
+    if port.is_some() {
+        publish(
+            backend.begin_connection(),
+            &mut port,
+            &event_tx,
+            &mut backend,
+        );
+        publish(
+            backend.connection_established(),
+            &mut port,
+            &event_tx,
+            &mut backend,
+        );
+    }
 
     'runtime: loop {
+        let mut publish = |output,
+                           port: &mut Option<Box<dyn serialport::SerialPort>>,
+                           events: &BackendEventSender,
+                           backend: &mut LocalBackend| {
+            publish_serial(
+                output,
+                port,
+                events,
+                backend,
+                &mut ingress,
+                &mut ingress_context,
+            );
+        };
+        publish(LocalOutput::default(), &mut port, &event_tx, &mut backend);
         loop {
-            match command_rx.try_recv() {
+            let command = command_rx.try_recv();
+            if command.as_ref().is_ok_and(|command| {
+                !matches!(
+                    command,
+                    BackendCommand::Api(crate::core::ApiCommand::Stop)
+                        | BackendCommand::StopCycle
+                        | BackendCommand::Disconnect
+                        | BackendCommand::Shutdown
+                )
+            }) {
+                publish(LocalOutput::default(), &mut port, &event_tx, &mut backend);
+            }
+            match command {
                 Ok(BackendCommand::RefreshDevices) => {
                     event_tx.send(BackendEvent::DevicesUpdated(available_devices()));
                 }
                 Ok(BackendCommand::Connect(idx)) => {
                     retire_existing_port(&mut backend, &mut port, &event_tx);
-                    buffer.clear();
                     publish(
                         backend.begin_connection(),
                         &mut port,
@@ -121,7 +171,6 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
                         &mut backend,
                     );
                     port = None;
-                    buffer.clear();
                     publish(backend.disconnected(), &mut port, &event_tx, &mut backend);
                 }
                 Ok(BackendCommand::Api(command)) => {
@@ -201,40 +250,84 @@ fn backend_thread(mut command_rx: UnboundedReceiver<BackendCommand>, event_tx: B
             }
         }
 
-        if let Some(ref mut p) = port {
-            let mut temp_buffer = [0u8; 64];
-            match p.read(&mut temp_buffer) {
-                Ok(n) if n > 0 => {
-                    let received_at = web_time::Instant::now();
-                    buffer.extend_from_slice(&temp_buffer[..n]);
-                    for (frame, raw) in crate::device::process_buffer(&mut buffer) {
-                        publish(
-                            backend.frame_received_at(frame, raw, received_at),
-                            &mut port,
-                            &event_tx,
-                            &mut backend,
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    log::error!("Serial read error: {e}");
-                    port = None;
-                    buffer.clear();
-                    publish(
-                        backend.connection_failed("Read error: connection lost".to_owned()),
-                        &mut port,
-                        &event_tx,
-                        &mut backend,
-                    );
-                }
-            }
-        } else {
-            std::thread::sleep(SLEEP_DURATION);
-        }
-        publish(backend.tick(), &mut port, &event_tx, &mut backend);
+        std::thread::sleep(SLEEP_DURATION);
+        tick_serial(
+            &mut port,
+            &event_tx,
+            &mut backend,
+            &mut ingress,
+            &mut ingress_context,
+        );
     }
+}
+
+fn tick_serial(
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    event_tx: &BackendEventSender,
+    backend: &mut LocalBackend,
+    ingress: &mut crate::device::SerialIngress,
+    context: &mut (u64, Option<web_time::Instant>),
+) {
+    publish_serial(
+        LocalOutput::default(),
+        port,
+        event_tx,
+        backend,
+        ingress,
+        context,
+    );
+    publish_serial(backend.tick(), port, event_tx, backend, ingress, context);
+}
+
+fn publish_serial(
+    output: LocalOutput,
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    event_tx: &BackendEventSender,
+    backend: &mut LocalBackend,
+    ingress: &mut crate::device::SerialIngress,
+    context: &mut (u64, Option<web_time::Instant>),
+) {
+    publish_inner(output, port, event_tx, backend, Some((ingress, context)));
+}
+
+fn reconcile_serial(
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    backend: &mut LocalBackend,
+    ingress: &mut crate::device::SerialIngress,
+    context: &mut (u64, Option<web_time::Instant>),
+    receive: bool,
+) -> LocalOutput {
+    let mut output = LocalOutput::default();
+    if let Some(current) = port.as_mut() {
+        let new_context = backend.ingress_context();
+        if *context != new_context {
+            if let Err(error) = ingress.quarantine(current.as_mut()) {
+                *port = None;
+                return backend.connection_failed(error);
+            }
+            *context = new_context;
+        }
+        if receive {
+            let prefix = match ingress.receive_prefix(current.as_mut()) {
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    *port = None;
+                    return backend.connection_failed(error);
+                }
+            };
+            if !prefix.is_empty() {
+                backend.begin_receive_prefix();
+                for item in prefix {
+                    let received =
+                        backend.frame_received_at(item.frame, item.raw, item.received_at);
+                    output.extend(received);
+                }
+                let reconciled = backend.finish_receive_prefix();
+                output.extend(reconciled);
+            }
+        }
+    }
+    output
 }
 
 fn retire_existing_port(
@@ -243,7 +336,7 @@ fn retire_existing_port(
     event_tx: &BackendEventSender,
 ) {
     if port.is_some() {
-        publish(LocalBackend::safe_disconnect(), port, event_tx, backend);
+        publish(backend.request_disconnect(), port, event_tx, backend);
         *port = None;
     }
 }
@@ -254,10 +347,39 @@ fn publish(
     event_tx: &BackendEventSender,
     backend: &mut LocalBackend,
 ) {
+    publish_inner(output, port, event_tx, backend, None);
+}
+
+fn publish_inner(
+    mut output: LocalOutput,
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    event_tx: &BackendEventSender,
+    backend: &mut LocalBackend,
+    mut ingress: Option<(
+        &mut crate::device::SerialIngress,
+        &mut (u64, Option<web_time::Instant>),
+    )>,
+) {
+    // Empty publication is the runnable receive service path. Actual Stop sends
+    // bypass ordinary input work, but still synchronize connection provenance.
+    if let Some((buffer, context)) = ingress.as_mut() {
+        let receive = output.sends.is_empty();
+        output.extend(reconcile_serial(port, backend, buffer, context, receive));
+    }
     for event in output.events {
         event_tx.send(event);
     }
-    for send in output.sends {
+    let mut sends = std::collections::VecDeque::from(output.sends);
+    while let Some(send) = sends.pop_front() {
+        if !matches!(send.frame(), OutboundFrame::Stop)
+            && let Some((buffer, context)) = ingress.as_mut()
+        {
+            let available = reconcile_serial(port, backend, buffer, context, true);
+            for event in available.events {
+                event_tx.send(event);
+            }
+            sends.extend(available.sends);
+        }
         let (authorization, allowed) = backend.authorize_send(send);
         for event in authorization.events {
             event_tx.send(event);
@@ -268,9 +390,7 @@ fn publish(
         let frame = send.frame();
         event_tx.send(outgoing(frame));
         let result = if let Some(port) = port {
-            let bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
-            port.write_all(&bytes)
-                .map_err(|error| format!("serial write failed: {error}"))
+            crate::transport_time::write_frame(port.as_mut(), frame)
         } else {
             Err("serial port is not open".to_owned())
         };
@@ -278,12 +398,39 @@ fn publish(
             log::error!("Failed to send {frame:?}: {error}");
         }
         let failed = result.is_err();
+        if !failed
+            && matches!(
+                frame,
+                OutboundFrame::AdjustConstantCurrentDischarge(..)
+                    | OutboundFrame::CalibrateVoltageLow(_)
+                    | OutboundFrame::CalibrateVoltageHigh(_)
+                    | OutboundFrame::CalibrateCurrentLow(_)
+                    | OutboundFrame::CalibrateCurrentHigh(_)
+                    | OutboundFrame::CalibrateConfirm
+                    | OutboundFrame::TimerSync(_)
+            )
+            && let Some((buffer, context)) = ingress.as_mut()
+        {
+            let available = reconcile_serial(port, backend, buffer, context, true);
+            for event in available.events {
+                event_tx.send(event);
+            }
+            sends.extend(available.sends);
+        }
         let completion = backend.finish_send(send, result);
         for event in completion.events {
             event_tx.send(event);
         }
         if failed {
             *port = None;
+        }
+        // Lifecycle fences also quarantine driver and partial input immediately,
+        // before the next queued command can read across that boundary.
+        if let Some((buffer, context)) = ingress.as_mut() {
+            let quarantined = reconcile_serial(port, backend, buffer, context, false);
+            for event in quarantined.events {
+                event_tx.send(event);
+            }
         }
     }
 }
@@ -307,6 +454,182 @@ mod tests {
     use futures::channel::mpsc;
     use serialport::SerialPort as _;
 
+    fn raw_report(state: u8, capacity: u16) -> Vec<u8> {
+        let mut bytes = vec![
+            0xfa,
+            state,
+            0,
+            0,
+            0x10,
+            0xa0,
+            (capacity / 240) as u8,
+            (capacity % 240) as u8,
+            0,
+            0,
+            0,
+            10,
+            1,
+            0x3c,
+            0,
+            0,
+            9,
+            0,
+            0xf8,
+        ];
+        bytes[17] = bytes[1..17].iter().fold(0, |sum, byte| sum ^ byte);
+        bytes
+    }
+
+    fn wait_update(
+        rx: &mut futures::channel::mpsc::UnboundedReceiver<BackendEvent>,
+        predicate: impl Fn(&crate::core::SnapshotUpdate) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            while let Ok(event) = rx.try_recv() {
+                let update = match event {
+                    BackendEvent::Update(state) => state.update,
+                    BackendEvent::Snapshot(snapshot) => {
+                        crate::core::SnapshotUpdate::from(&snapshot)
+                    }
+                    _ => continue,
+                };
+                if predicate(&update) {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("native runtime did not publish expected state");
+    }
+
+    #[test]
+    fn native_terminal_rest_tick_reconciles_available_active_before_completion() {
+        let (mut backend, mut port, mut peer, events, mut rx) = fixture();
+        let mut ingress = crate::device::SerialIngress::default();
+        let mut context = (0, None);
+        publish_serial(
+            LocalOutput::default(),
+            &mut port,
+            &events,
+            &mut backend,
+            &mut ingress,
+            &mut context,
+        );
+        peer.write_all(&raw_report(0, 0)).expect("Idle input");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        publish_serial(
+            LocalOutput::default(),
+            &mut port,
+            &events,
+            &mut backend,
+            &mut ingress,
+            &mut context,
+        );
+        let output = backend.start_cycle(StartCycleRequest {
+            recipe: CycleRecipe {
+                steps: vec![CycleStep::Rest {
+                    duration_seconds: 1,
+                }],
+                repeat_count: 1,
+            },
+            name: None,
+        });
+        publish_serial(
+            output,
+            &mut port,
+            &events,
+            &mut backend,
+            &mut ingress,
+            &mut context,
+        );
+        while rx.try_recv().is_ok() {}
+        std::thread::sleep(std::time::Duration::from_millis(1010));
+        peer.write_all(&raw_report(10, 50))
+            .expect("Active available before due tick");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        tick_serial(&mut port, &events, &mut backend, &mut ingress, &mut context);
+        let mut interrupted = false;
+        while let Ok(event) = rx.try_recv() {
+            if let BackendEvent::Update(state) = event {
+                assert_ne!(
+                    state.update.cycle.state,
+                    crate::core::CycleState::Completed,
+                    "autonomous completion cannot precede available contradictory evidence"
+                );
+                interrupted |= state.update.cycle.state == crate::core::CycleState::Interrupted;
+            }
+        }
+        assert!(interrupted);
+        let mut wire = [0; OUTBOUND_FRAME_SIZE];
+        assert!(
+            peer.read(&mut wire).is_err(),
+            "Rest contradiction emits no physical action"
+        );
+    }
+
+    #[test]
+    fn native_runtime_queue_and_serial_fragments_obey_start_and_stop_fences() {
+        let (port, mut peer) = serialport::TTYPort::pair().expect("software PTY");
+        peer.set_timeout(std::time::Duration::from_millis(200))
+            .expect("timeout");
+        let (tx, commands) = mpsc::unbounded();
+        let (events, mut rx) = mpsc::unbounded();
+        let event_sender = BackendEventSender::new(events, || {});
+        let thread = std::thread::spawn(move || {
+            backend_runtime(commands, event_sender, Some(Box::new(port)));
+        });
+        wait_update(&mut rx, |s| {
+            s.connection == crate::core::ServerConnectionState::Connected
+        });
+        peer.write_all(&raw_report(0, 0)).expect("Idle input");
+        wait_update(&mut rx, |s| s.device.activity_known && !s.device.active);
+        let partial = raw_report(10, 50);
+        peer.write_all(&partial[..18]).expect("old prefix");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let config = TestConfiguration::DischargeConstantCurrent {
+            current_ma: 100,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        };
+        tx.unbounded_send(BackendCommand::StartTest(StartTestRequest {
+            config,
+            name: None,
+        }))
+        .expect("public command queue Start");
+        read_frame(
+            &mut peer,
+            OutboundFrame::StartConstantCurrentDischarge(100, 3000, 0),
+        );
+        peer.write_all(&partial[18..])
+            .expect("old suffix after Start");
+        wait_update(&mut rx, |s| {
+            s.test.state == TestState::Starting && !s.device.activity_known
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, BackendEvent::Sample(_)));
+        }
+        peer.write_all(&raw_report(10, 1))
+            .expect("new zero-current Active");
+        wait_update(&mut rx, |s| {
+            s.test.state == TestState::Running && s.device.current_ma == Some(0)
+        });
+        peer.write_all(&partial[..18]).expect("prefix before Stop");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        tx.unbounded_send(BackendCommand::Api(ApiCommand::Stop))
+            .expect("public Stop queue");
+        read_frame(&mut peer, OutboundFrame::Stop);
+        peer.write_all(&partial[18..])
+            .expect("old suffix after Stop");
+        wait_update(&mut rx, |s| {
+            s.test.state == TestState::Stopping && s.test.capacity_mah == Some(1)
+        });
+        tx.unbounded_send(BackendCommand::Shutdown)
+            .expect("shutdown queue");
+        thread.join().expect("native runtime retired");
+    }
+
     fn fixture() -> (
         LocalBackend,
         Option<Box<dyn serialport::SerialPort>>,
@@ -323,6 +646,116 @@ mod tests {
         backend.begin_connection();
         backend.connection_established();
         (backend, Some(Box::new(write)), read, events, rx)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "paired PTY schedules exercise the full completion boundary"
+    )]
+    fn native_serial_completion_reconciles_adjust_and_calibration_input() {
+        for command in [
+            ApiCommand::Adjust(TestConfiguration::DischargeConstantCurrent {
+                current_ma: 100,
+                cutoff_voltage_mv: 3000,
+                cutoff_time_min: 0,
+            }),
+            ApiCommand::Calibration(crate::core::CalibrationCommand::VoltageLow(4000)),
+        ] {
+            let (mut backend, mut port, mut peer, events, mut rx) = fixture();
+            let mut ingress = crate::device::SerialIngress::default();
+            let mut context = (0, None);
+            publish_serial(
+                LocalOutput::default(),
+                &mut port,
+                &events,
+                &mut backend,
+                &mut ingress,
+                &mut context,
+            );
+            peer.write_all(&raw_report(0, 0)).expect("Idle input");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            publish_serial(
+                LocalOutput::default(),
+                &mut port,
+                &events,
+                &mut backend,
+                &mut ingress,
+                &mut context,
+            );
+            let config = TestConfiguration::DischargeConstantCurrent {
+                current_ma: 100,
+                cutoff_voltage_mv: 3000,
+                cutoff_time_min: 0,
+            };
+            let output = backend.start_test(StartTestRequest { config, name: None });
+            assert_eq!(output.sends.len(), 1, "fixture must authorize Start");
+            publish_serial(
+                output,
+                &mut port,
+                &events,
+                &mut backend,
+                &mut ingress,
+                &mut context,
+            );
+            read_frame(
+                &mut peer,
+                OutboundFrame::StartConstantCurrentDischarge(100, 3000, 0),
+            );
+            peer.write_all(&raw_report(10, 1)).expect("Active input");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            publish_serial(
+                LocalOutput::default(),
+                &mut port,
+                &events,
+                &mut backend,
+                &mut ingress,
+                &mut context,
+            );
+            while rx.try_recv().is_ok() {}
+            let mut input = peer.try_clone().expect("PTY input clone");
+            port = Some(Box::new(crate::transport_time::fixture::WriteHook {
+                port: port.take().expect("open port"),
+                hook: Box::new(move || {
+                    input
+                        .write_all(&raw_report(11, 50))
+                        .expect("CP during write");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }),
+            }));
+            let output = backend.command(command);
+            assert_eq!(output.sends.len(), 1);
+            let frame = output.sends[0].frame();
+            publish_serial(
+                output,
+                &mut port,
+                &events,
+                &mut backend,
+                &mut ingress,
+                &mut context,
+            );
+            read_frame(&mut peer, frame);
+            let mut observed = false;
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(
+                        event,
+                        BackendEvent::CommandSucceeded | BackendEvent::Sample(_)
+                    ),
+                    "contradictory write cannot claim continuing owned success"
+                );
+                if let BackendEvent::Update(state) = event {
+                    observed |= state.update.device.active
+                        && state.update.device.mode
+                            == Some(crate::device::DeviceMode::DischargeConstantPower)
+                        && state.update.test.state == TestState::RecoveredUncertain;
+                }
+            }
+            assert!(
+                observed,
+                "completion must preserve independently fresh contradictory knowledge"
+            );
+        }
     }
 
     fn read_frame(read: &mut serialport::TTYPort, expected: OutboundFrame) {
@@ -465,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn native_batch_received_before_next_child_start_cannot_acknowledge_that_start() {
+    fn native_full_receive_prefix_prevents_next_start_and_preserves_fragments() {
         let (mut backend, mut port, mut read, events, mut rx) = fixture();
         let config = TestConfiguration::DischargeConstantCurrent {
             current_ma: 100,
@@ -491,6 +924,11 @@ mod tests {
         );
         publish(report(&mut backend, 10), &mut port, &events, &mut backend);
         while rx.try_recv().is_ok() {}
+        let mut ingress = crate::device::SerialIngress::default();
+        ingress
+            .quarantine(port.as_mut().expect("port").as_mut())
+            .expect("input quarantine");
+        let mut context = backend.ingress_context();
         let mut batch = Vec::new();
         for state in [20, 0, 10] {
             let mut bytes = vec![
@@ -499,33 +937,46 @@ mod tests {
             bytes[17] = bytes[1..17].iter().fold(0, |sum, byte| sum ^ byte);
             batch.extend(bytes);
         }
-        let received_at = web_time::Instant::now();
-        for (frame, raw) in crate::device::process_buffer(&mut batch) {
-            publish(
-                backend.frame_received_at(frame, raw, received_at),
-                &mut port,
-                &events,
-                &mut backend,
-            );
-        }
-        read_frame(
-            &mut read,
-            OutboundFrame::StartConstantCurrentDischarge(100, 3000, 0),
+        // Actual PTY input, shared production SerialIngress, production
+        // reconciliation/authorization/write/completion path, not report injection.
+        read.write_all(&batch[..18]).expect("fragment prefix");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        publish_serial(
+            LocalOutput::default(),
+            &mut port,
+            &events,
+            &mut backend,
+            &mut ingress,
+            &mut context,
         );
-        let mut starting = false;
+        read.write_all(&batch[18..])
+            .expect("split/coalesced suffix");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        publish_serial(
+            LocalOutput::default(),
+            &mut port,
+            &events,
+            &mut backend,
+            &mut ingress,
+            &mut context,
+        );
+        assert!(
+            read.read(&mut [0; OUTBOUND_FRAME_SIZE]).is_err(),
+            "queued Active forbids next Start"
+        );
+        let mut interrupted = false;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, BackendEvent::Sample(_)),
                 "pre-command Active cannot sample next child"
             );
-            if let BackendEvent::Snapshot(snapshot) = event {
-                starting =
-                    snapshot.test.state == TestState::Starting && !snapshot.device.activity_known;
+            if let BackendEvent::Update(state) = event {
+                interrupted |= state.update.cycle.state == crate::core::CycleState::Interrupted;
             }
         }
         assert!(
-            starting,
-            "next child must still await a new physical observation"
+            interrupted,
+            "intermediate contradiction must interrupt before any next Start"
         );
     }
 }

@@ -22,7 +22,7 @@ let browser;
 try {
   // Hosted CI has no physical GPU; allow Chromium's software WebGL renderer.
   browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH, headless: true, args: ['--no-sandbox', '--enable-unsafe-swiftshader'] });
-  for (const section of ['queue', 'modes']) {
+  for (const section of ['queue', 'modes', 'conformance']) {
     const page = await browser.newPage();
     try {
       const result = await probe({ page, context: { section, url: `http://127.0.0.1:${server.address().port}/` } });

@@ -21,6 +21,7 @@ const CAPACITY_WRAP_LOW_WATER: u16 = 14_400;
 pub const REPORT_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REPORT_TIMEOUT_REASON: &str = "device reports timed out; physical state is uncertain";
 pub const MODE_CONTRADICTION_REASON: &str = "physical device mode contradicts the owned test";
+pub const ACQUISITION_TIMEOUT_REASON: &str = "physical acquisition timed out; operation is unowned";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControllerMode {
@@ -86,6 +87,8 @@ enum Lifecycle {
     RecoveredUncertain,
     Starting,
     RunningOwned,
+    // Terminal reason is unresolved, but Active control has already ended.
+    Closing,
     Stopping,
 }
 
@@ -106,9 +109,32 @@ pub struct PreparedCommand {
     kind: CommandKind,
     connection_generation: u64,
     authority_generation: u64,
+    operation_epoch: u64,
+    attempt_id: u64,
+    orchestration_epoch: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorityToken {
+    connection: u64,
+    operation: u64,
+    authority: u64,
 }
 
 impl PreparedCommand {
+    pub(crate) fn bind_cycle(mut self, epoch: u64) -> Self {
+        self.orchestration_epoch = Some(epoch);
+        self
+    }
+
+    pub(crate) fn cycle_epoch(self) -> Option<u64> {
+        self.orchestration_epoch
+    }
+
+    pub(crate) fn command(self) -> ApiCommand {
+        self.command
+    }
+
     pub fn frame(&self) -> Option<OutboundFrame> {
         self.frame
     }
@@ -162,6 +188,7 @@ impl TestClock {
         }
     }
 
+    #[cfg(test)]
     fn replace(&mut self, elapsed_seconds: u64, running: bool) {
         self.accumulated = Duration::from_secs(elapsed_seconds);
         self.running_since = running.then(Instant::now);
@@ -306,6 +333,9 @@ pub struct TestController {
     physical: PhysicalState,
     connection_generation: u64,
     authority_generation: u64,
+    operation_epoch: u64,
+    next_attempt: std::cell::Cell<u64>,
+    completed_attempt: u64,
     report_generation: Option<u64>,
     // Also bounds the initial wait for observation after connecting. A deadline
     // alone never grants authority: a current-generation report is still required.
@@ -313,31 +343,110 @@ pub struct TestController {
     // Strict receipt-time fence: buffered observations cannot acknowledge later
     // intent, including timestamp ties on coarse-resolution browser clocks.
     report_not_before: Option<Instant>,
+    acquisition_deadline: Option<Instant>,
+    resume_capacity_baseline: Option<u16>,
     calibration_staging: CalibrationStaging,
     clock: TestClock,
     energy: EnergyAccumulator,
     capacity: CapacityAccumulator,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "runtime identities must never wrap; exhaustion fails closed"
+)]
 impl TestController {
+    fn allocate_attempt(&self) -> u64 {
+        let next = self
+            .next_attempt
+            .get()
+            .checked_add(1)
+            .expect("command attempt identities exhausted");
+        self.next_attempt.set(next);
+        next
+    }
+
+    pub(crate) fn authority_token(&self) -> AuthorityToken {
+        AuthorityToken {
+            connection: self.connection_generation,
+            operation: self.operation_epoch,
+            authority: self.authority_generation,
+        }
+    }
+
+    pub(crate) fn token_is_current(&self, token: AuthorityToken) -> bool {
+        token == self.authority_token() && self.connected
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn safety_token_is_current(&self, token: AuthorityToken) -> bool {
+        token.connection == self.connection_generation
+            && token.operation == self.operation_epoch
+            && self.connected
+    }
+
+    pub(crate) fn completion_is_current(&self, prepared: PreparedCommand) -> bool {
+        prepared.connection_generation == self.connection_generation
+            && prepared.operation_epoch == self.operation_epoch
+            && prepared.attempt_id > self.completed_attempt
+            && self.connected
+    }
+
+    /// Accepted safety intent cancels ordinary control before the write is
+    /// awaited. Retain at most the final-counter attribution, not Active control.
+    pub(crate) fn accept_stop_at(&mut self, prepared: PreparedCommand, now: Instant) {
+        if !matches!(prepared.frame, Some(OutboundFrame::Stop))
+            || !self.completion_is_current(prepared)
+        {
+            return;
+        }
+        if self.lifecycle != Lifecycle::Stopping {
+            self.stopping_owns_metrics = self.lifecycle == Lifecycle::RunningOwned;
+            self.clock.stop(now);
+            self.energy.break_gap();
+            self.acquisition_deadline = None;
+            self.lifecycle = Lifecycle::Stopping;
+            self.test.state = TestState::Stopping;
+            self.authority_generation = self
+                .authority_generation
+                .checked_add(1)
+                .expect("authority generations exhausted");
+            self.update_elapsed_at(now);
+        }
+    }
+
+    #[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
+    pub(crate) fn ingress_context(&self) -> (u64, Option<Instant>) {
+        (self.connection_generation, self.report_not_before)
+    }
+
     pub fn new(mode: ControllerMode) -> Self {
         Self::from_state(mode, DeviceState::default(), TestStatus::default(), None)
     }
 
     pub fn from_state(
         mode: ControllerMode,
-        device: DeviceState,
-        test: TestStatus,
+        mut device: DeviceState,
+        mut test: TestStatus,
         last_sample: Option<&Sample>,
     ) -> Self {
-        let lifecycle = if test.state == TestState::RecoveredUncertain {
+        // Restored DTOs are history, never evidence of a write or observation.
+        // Sanitize here as well as in persistence so an alternate constructor
+        // caller cannot reconstruct a live acquisition or integration endpoint.
+        device.activity_known = false;
+        device.active = false;
+        let lifecycle = if matches!(
+            test.state,
+            TestState::Starting
+                | TestState::Running
+                | TestState::Stopping
+                | TestState::RecoveredUncertain
+        ) {
+            test.state = TestState::RecoveredUncertain;
+            test.result.get_or_insert_with(|| {
+                "restored physical work is unowned and uncertain".to_owned()
+            });
             Lifecycle::RecoveredUncertain
-        } else if test.state == TestState::Starting {
-            Lifecycle::Starting
-        } else if test.state == TestState::Stopping {
-            Lifecycle::Stopping
-        } else if test.state == TestState::Running && device.active {
-            Lifecycle::RunningOwned
         } else {
             Lifecycle::Idle
         };
@@ -345,7 +454,7 @@ impl TestController {
             mode,
             connected: false,
             clock: TestClock::new(test.elapsed_seconds),
-            energy: EnergyAccumulator::from_state(&test, last_sample),
+            energy: EnergyAccumulator::from_state(&test, None),
             capacity: CapacityAccumulator::from_state(&device, &test, last_sample),
             device,
             test,
@@ -355,9 +464,14 @@ impl TestController {
             physical: PhysicalState::Unknown,
             connection_generation: 0,
             authority_generation: 0,
+            operation_epoch: 0,
+            next_attempt: std::cell::Cell::new(0),
+            completed_attempt: 0,
             report_generation: None,
             report_freshness_deadline: None,
             report_not_before: None,
+            acquisition_deadline: None,
+            resume_capacity_baseline: None,
             calibration_staging: CalibrationStaging::default(),
         }
     }
@@ -423,7 +537,10 @@ impl TestController {
 
     pub fn begin_connection(&mut self, reason: &str) {
         self.invalidate_for_gap(reason);
-        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .expect("connection generations exhausted");
         self.connected = false;
     }
 
@@ -451,13 +568,17 @@ impl TestController {
     }
 
     fn invalidate_for_gap_at(&mut self, reason: &str, now: Instant) {
-        self.authority_generation = self.authority_generation.wrapping_add(1);
+        self.authority_generation = self
+            .authority_generation
+            .checked_add(1)
+            .expect("authority generations exhausted");
         let contradiction = self.lifecycle == Lifecycle::Idle
             && (self.physical == PhysicalState::Active || self.device.active);
         if matches!(
             self.lifecycle,
             Lifecycle::Starting
                 | Lifecycle::RunningOwned
+                | Lifecycle::Closing
                 | Lifecycle::Stopping
                 | Lifecycle::RecoveredUncertain
         ) || contradiction
@@ -468,6 +589,8 @@ impl TestController {
         }
         self.physical = PhysicalState::Unknown;
         self.stopping_owns_metrics = false;
+        self.acquisition_deadline = None;
+        self.resume_capacity_baseline = None;
         self.report_generation = None;
         self.stop_awaiting_report = false;
         self.report_freshness_deadline = None;
@@ -492,9 +615,28 @@ impl TestController {
             self.invalidate_for_gap_at(REPORT_TIMEOUT_REASON, deadline);
             return true;
         }
+        if let Some(deadline) = self.acquisition_deadline
+            && now >= deadline
+        {
+            // Knowledge has its own deadline. Healthy inactive telemetry does
+            // not renew the transmitted intent's attribution window.
+            self.authority_generation = self
+                .authority_generation
+                .checked_add(1)
+                .expect("authority generations exhausted");
+            self.acquisition_deadline = None;
+            self.lifecycle = Lifecycle::RecoveredUncertain;
+            self.test.state = TestState::RecoveredUncertain;
+            self.test.result = Some(ACQUISITION_TIMEOUT_REASON.to_owned());
+            self.calibration_staging = CalibrationStaging::default();
+            self.clock.stop(deadline);
+            self.energy.break_gap();
+            return true;
+        }
         false
     }
 
+    #[cfg(test)]
     pub fn replace_authoritative(
         &mut self,
         connected: bool,
@@ -557,8 +699,11 @@ impl TestController {
             self.lifecycle,
             Lifecycle::RecoveredUncertain | Lifecycle::Starting | Lifecycle::Stopping
         );
-        let calibrate_voltage =
-            (fresh_inactive || fresh_active) && calibration_state_allowed && live_voltage;
+        let calibrate_voltage = (fresh_inactive
+            || (fresh_active && self.lifecycle == Lifecycle::RunningOwned))
+            && calibration_state_allowed
+            && self.lifecycle != Lifecycle::Closing
+            && live_voltage;
         let calibrate_current = calibrate_voltage
             && self.lifecycle == Lifecycle::RunningOwned
             && fresh_active
@@ -571,8 +716,7 @@ impl TestController {
             adjust,
             calibrate_voltage,
             calibrate_current,
-            confirm_calibration: calibrate_voltage
-                && (self.mode == ControllerMode::Direct || self.calibration_staging.complete()),
+            confirm_calibration: calibrate_voltage && self.calibration_staging.complete(),
         }
     }
 
@@ -702,6 +846,9 @@ impl TestController {
             kind,
             connection_generation: self.connection_generation,
             authority_generation: self.authority_generation,
+            operation_epoch: self.operation_epoch,
+            attempt_id: self.allocate_attempt(),
+            orchestration_epoch: None,
         })
     }
 
@@ -732,6 +879,9 @@ impl TestController {
             kind: CommandKind::Resume,
             connection_generation: self.connection_generation,
             authority_generation: self.authority_generation,
+            operation_epoch: self.operation_epoch,
+            attempt_id: self.allocate_attempt(),
+            orchestration_epoch: None,
         })
     }
 
@@ -747,10 +897,10 @@ impl TestController {
         prepared: PreparedCommand,
         now: Instant,
     ) -> Result<(), String> {
-        if prepared.connection_generation != self.connection_generation || !self.connected {
+        if !self.completion_is_current(prepared) {
             return Err("command belongs to an old physical connection".to_owned());
         }
-        if prepared.kind == CommandKind::Stop && prepared.frame.is_some() {
+        if matches!(prepared.frame, Some(OutboundFrame::Stop)) {
             return Ok(());
         }
         if prepared.authority_generation != self.authority_generation {
@@ -772,12 +922,21 @@ impl TestController {
         self.commit_command_at(prepared, started_at_utc, Instant::now())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one completion boundary validates and commits exact command semantics"
+    )]
     pub fn commit_command_at(
         &mut self,
         prepared: PreparedCommand,
         started_at_utc: Option<String>,
         now: Instant,
     ) -> bool {
+        // A retired connection's completion has zero authority, even to expire
+        // or move the new session's receipt fence.
+        if !self.completion_is_current(prepared) {
+            return false;
+        }
         self.expire_report_freshness(now);
         if prepared.frame.is_some()
             && matches!(
@@ -792,10 +951,19 @@ impl TestController {
             // existing owned run rather than being discarded at completion.
             self.report_not_before = Some(now);
         }
-        if self.validate_prepared_at(prepared, now).is_err() {
+        let authorized = self.validate_prepared_at(prepared, now).is_ok();
+        // Outcome handling consumes the attempt even when semantic authority
+        // was revoked. A duplicate late success has zero later live effects.
+        self.completed_attempt = prepared.attempt_id;
+        if !authorized {
             // The frame may already have reached hardware. Do not treat a late
             // successful write as fresh intent with newly owned authority.
-            self.invalidate_for_gap_at(REPORT_TIMEOUT_REASON, now);
+            if !matches!(
+                prepared.kind,
+                CommandKind::Adjust | CommandKind::Calibration
+            ) {
+                self.invalidate_for_gap_at(REPORT_TIMEOUT_REASON, now);
+            }
             if matches!(
                 prepared.kind,
                 CommandKind::Start | CommandKind::Resume | CommandKind::Stop
@@ -808,10 +976,16 @@ impl TestController {
         }
         match prepared.command {
             ApiCommand::Start(config) => {
+                self.resume_capacity_baseline = None;
+                self.operation_epoch = self
+                    .operation_epoch
+                    .checked_add(1)
+                    .expect("operation identities exhausted");
                 self.clock.start_fresh();
                 self.energy.reset();
                 self.capacity.reset();
                 self.lifecycle = Lifecycle::Starting;
+                self.acquisition_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
                 self.stopping_owns_metrics = false;
                 self.physical = PhysicalState::Unknown;
                 self.report_generation = None;
@@ -827,6 +1001,7 @@ impl TestController {
                 self.test.energy_wh = 0.0;
             }
             ApiCommand::Stop if self.lifecycle != Lifecycle::Stopping => {
+                self.acquisition_deadline = None;
                 self.clock.stop(now);
                 self.stopping_owns_metrics = self.lifecycle == Lifecycle::RunningOwned;
                 self.lifecycle = Lifecycle::Stopping;
@@ -837,8 +1012,19 @@ impl TestController {
             }
             ApiCommand::Adjust(config) => self.test.config = Some(config),
             ApiCommand::Resume => {
+                self.operation_epoch = self
+                    .operation_epoch
+                    .checked_add(1)
+                    .expect("operation identities exhausted");
+                // Only a current inactive counter supplies the new segment's
+                // baseline. It never imports raw growth during revoked work.
+                if let Some(raw) = self.device.capacity_mah {
+                    self.capacity.rebase(raw);
+                    self.resume_capacity_baseline = Some(raw);
+                }
                 self.test.config = prepared.resume_config;
                 self.lifecycle = Lifecycle::Starting;
+                self.acquisition_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
                 self.stopping_owns_metrics = false;
                 self.physical = PhysicalState::Unknown;
                 self.report_generation = None;
@@ -887,6 +1073,7 @@ impl TestController {
         ));
     }
 
+    #[cfg(test)]
     pub fn report(&mut self, report: DeviceReport) -> (ReportOutcome, Option<Measurement>) {
         self.report_at(report, Instant::now())
     }
@@ -908,11 +1095,20 @@ impl TestController {
         {
             return (ReportOutcome::default(), None);
         }
-        self.report_at(report, received_at)
+        self.apply_report_at(report, received_at)
+    }
+
+    #[cfg(test)]
+    pub fn report_at(
+        &mut self,
+        report: DeviceReport,
+        now: Instant,
+    ) -> (ReportOutcome, Option<Measurement>) {
+        self.apply_report_at(report, now)
     }
 
     #[expect(clippy::too_many_lines)]
-    pub fn report_at(
+    fn apply_report_at(
         &mut self,
         report: DeviceReport,
         now: Instant,
@@ -923,7 +1119,7 @@ impl TestController {
         if !self.connected {
             return (ReportOutcome::default(), None);
         }
-        if (self.lifecycle == Lifecycle::RunningOwned
+        if (matches!(self.lifecycle, Lifecycle::RunningOwned | Lifecycle::Closing)
             || (self.lifecycle == Lifecycle::Starting && report.state == ReportState::Active)
             || (self.lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics))
             && self
@@ -967,6 +1163,17 @@ impl TestController {
         let measurement = if active {
             let owns_metrics = match previous_lifecycle {
                 Lifecycle::Starting => {
+                    if let Some(baseline) = self.resume_capacity_baseline.take()
+                        && report.capacity_mah < baseline
+                        && !(baseline >= CAPACITY_WRAP_HIGH_WATER
+                            && report.capacity_mah <= CAPACITY_WRAP_LOW_WATER)
+                    {
+                        // A reset at reacquisition cannot supply an invented
+                        // cross-gap increment. Begin at this counter; later
+                        // owned deltas remain attributable.
+                        self.capacity.rebase(report.capacity_mah);
+                    }
+                    self.acquisition_deadline = None;
                     self.lifecycle = Lifecycle::RunningOwned;
                     self.stopping_owns_metrics = false;
                     self.test.state = TestState::Running;
@@ -978,16 +1185,22 @@ impl TestController {
                     self.clock.resume(now);
                     true
                 }
-                Lifecycle::Idle if self.mode == ControllerMode::Server => {
+                Lifecycle::Idle | Lifecycle::Closing => {
+                    self.calibration_staging = CalibrationStaging::default();
+                    self.authority_generation = self
+                        .authority_generation
+                        .checked_add(1)
+                        .expect("authority identities exhausted");
                     self.lifecycle = Lifecycle::RecoveredUncertain;
                     self.test.state = TestState::RecoveredUncertain;
-                    self.test.result =
-                        Some("hardware reports an active test not owned by this server".to_owned());
+                    self.test.result = Some(
+                        "hardware reports an active test not owned by this backend".to_owned(),
+                    );
                     self.clock.stop(now);
                     self.energy.break_gap();
                     false
                 }
-                Lifecycle::Stopping | Lifecycle::Idle | Lifecycle::RecoveredUncertain => {
+                Lifecycle::Stopping | Lifecycle::RecoveredUncertain => {
                     self.clock.stop(now);
                     self.energy.break_gap();
                     false
@@ -995,9 +1208,10 @@ impl TestController {
             };
             if owns_metrics {
                 let elapsed = self.clock.elapsed(now);
+                let capacity_mah = self.capacity.observe(report.capacity_mah, true);
                 let (capacity_mah, energy_wh) = if self.mode == ControllerMode::Server {
                     (
-                        self.capacity.observe(report.capacity_mah, true),
+                        capacity_mah,
                         self.energy.add(
                             elapsed.as_secs_f64(),
                             report.voltage_mv,
@@ -1006,8 +1220,8 @@ impl TestController {
                     )
                 } else {
                     (
-                        u64::from(report.capacity_mah),
-                        report.voltage_mv as f64 * report.capacity_mah as f64 / 1_000_000.0,
+                        capacity_mah,
+                        report.voltage_mv as f64 * capacity_mah as f64 / 1_000_000.0,
                     )
                 };
                 self.test.capacity_mah = Some(capacity_mah);
@@ -1030,18 +1244,13 @@ impl TestController {
             let owns_metrics = previous_lifecycle == Lifecycle::RunningOwned
                 || (previous_lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics);
             if owns_metrics {
-                self.test.capacity_mah = Some(if self.mode == ControllerMode::Server {
-                    self.capacity.observe(report.capacity_mah, true)
-                } else {
-                    u64::from(report.capacity_mah)
-                });
+                let owned_capacity = self.capacity.observe(report.capacity_mah, true);
+                self.test.capacity_mah = Some(owned_capacity);
                 if self.mode == ControllerMode::Direct {
                     self.test.energy_wh =
-                        report.voltage_mv as f64 * report.capacity_mah as f64 / 1_000_000.0;
+                        report.voltage_mv as f64 * owned_capacity as f64 / 1_000_000.0;
                 }
-            } else if self.mode == ControllerMode::Server
-                && previous_lifecycle != Lifecycle::Starting
-            {
+            } else if previous_lifecycle != Lifecycle::Starting {
                 self.capacity.rebase(report.capacity_mah);
             }
             match previous_lifecycle {
@@ -1049,12 +1258,13 @@ impl TestController {
                     self.lifecycle = Lifecycle::Idle;
                     self.stopping_owns_metrics = false;
                     self.test.state = TestState::Stopped;
-                    self.test.result =
-                        Some("recovered previous test; hardware reports inactive".to_owned());
+                    self.test.result.get_or_insert_with(|| {
+                        "recovered previous test; hardware reports inactive".to_owned()
+                    });
                     outcome.transitioned_to_inactive = true;
                 }
                 Lifecycle::Starting | Lifecycle::Idle => {}
-                Lifecycle::RunningOwned => match report.state {
+                Lifecycle::RunningOwned | Lifecycle::Closing => match report.state {
                     ReportState::Finished => {
                         self.lifecycle = Lifecycle::Idle;
                         self.stopping_owns_metrics = false;
@@ -1069,7 +1279,15 @@ impl TestController {
                         self.test.result = Some("device reported test idle".to_owned());
                         outcome.transitioned_to_inactive = true;
                     }
-                    ReportState::InactiveUnknown => {}
+                    ReportState::InactiveUnknown => {
+                        if previous_lifecycle == Lifecycle::RunningOwned {
+                            self.authority_generation = self
+                                .authority_generation
+                                .checked_add(1)
+                                .expect("authority identities exhausted");
+                        }
+                        self.lifecycle = Lifecycle::Closing;
+                    }
                     ReportState::Active => unreachable!(),
                 },
                 Lifecycle::Stopping => {
@@ -1210,6 +1428,205 @@ pub fn test_frame(config: &TestConfiguration, resume: bool) -> OutboundFrame {
 #[expect(clippy::expect_used, reason = "controller tests should fail fast")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continue_segments_reconnect_wrap_and_reset_without_importing_raw_history() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for (baseline, first, expected) in
+                [(50, 51, 11), (57_599, 0, 11), (50, 0, 10), (0, 1, 11)]
+            {
+                let t0 = Instant::now();
+                let mut c = connected_at(mode, t0);
+                c.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut c, ApiCommand::Start(config()), t0);
+                c.report_at(report(ReportState::Active, 10), t0);
+                c.begin_connection("replacement");
+                c.connection_established_at(t0 + Duration::from_secs(1));
+                c.report_at(
+                    report(ReportState::Idle, baseline),
+                    t0 + Duration::from_secs(2),
+                );
+                commit_at(&mut c, ApiCommand::Resume, t0 + Duration::from_secs(2));
+                let first = c
+                    .report_at(
+                        report(ReportState::Active, first),
+                        t0 + Duration::from_secs(3),
+                    )
+                    .1
+                    .expect("new acquisition");
+                assert_eq!(first.capacity_mah, expected);
+                let next = c
+                    .report_at(
+                        report(
+                            ReportState::Active,
+                            if baseline == 50 && expected == 11 {
+                                52
+                            } else if baseline == 0 {
+                                2
+                            } else {
+                                1
+                            },
+                        ),
+                        t0 + Duration::from_secs(4),
+                    )
+                    .1
+                    .expect("new increment");
+                assert_eq!(next.capacity_mah, expected + 1);
+                if mode == ControllerMode::Direct {
+                    assert!((next.energy_wh - (expected + 1) as f64 * 0.004).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_retired_attempt_has_zero_effect_on_independently_owned_replacement() {
+        let t0 = Instant::now();
+        let mut c = connected_at(ControllerMode::Server, t0);
+        let old = c
+            .prepare_command_at(ApiCommand::Stop, t0)
+            .expect("old real Stop");
+        c.begin_connection("replace");
+        c.connection_established_at(t0);
+        c.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut c, ApiCommand::Start(config()), t0);
+        c.report_at(report(ReportState::Active, 1), t0);
+        let state = c.test.clone();
+        let device = c.device.clone();
+        let fence = c.report_not_before;
+        let deadline = c.report_freshness_deadline;
+        assert!(!c.commit_command_at(old, None, t0 + Duration::from_secs(100)));
+        assert_eq!(c.test, state);
+        assert_eq!(c.device, device);
+        assert_eq!(c.report_not_before, fence);
+        assert_eq!(c.report_freshness_deadline, deadline);
+        assert!(c.is_running_owned());
+    }
+
+    #[test]
+    fn continue_excludes_unowned_raw_capacity_in_both_modes() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for contradiction in [false, true] {
+                let t0 = Instant::now();
+                let mut c = connected_at(mode, t0);
+                c.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut c, ApiCommand::Start(config()), t0);
+                c.report_at(report(ReportState::Active, 10), t0);
+                if contradiction {
+                    let mut wrong = report(ReportState::Active, 50);
+                    wrong.mode = DeviceMode::DischargeConstantPower;
+                    c.report_at(wrong, t0 + Duration::from_secs(1));
+                } else {
+                    c.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT);
+                }
+                let recovered = t0 + Duration::from_secs(11);
+                c.report_at(report(ReportState::Idle, 50), recovered);
+                commit_at(&mut c, ApiCommand::Resume, recovered);
+                let first = c
+                    .report_at(
+                        report(ReportState::Active, 51),
+                        recovered + Duration::from_secs(1),
+                    )
+                    .1
+                    .expect("new owned segment");
+                assert_eq!(first.capacity_mah, 11, "unowned +40 must not be imported");
+                let next = c
+                    .report_at(
+                        report(ReportState::Active, 52),
+                        recovered + Duration::from_secs(2),
+                    )
+                    .1
+                    .expect("owned increment");
+                assert_eq!(next.capacity_mah, 12);
+                if mode == ControllerMode::Direct {
+                    assert!((first.energy_wh - 0.044).abs() < 1e-10);
+                    assert!((next.energy_wh - 0.048).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_expires_at_write_deadline_despite_fresh_inactive_reports() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            let t0 = Instant::now();
+            let mut c = TestController::new(mode);
+            c.begin_connection("connect");
+            c.connection_established_at(t0);
+            c.report_at(report(ReportState::Idle, 0), t0);
+            let start = c
+                .prepare_command_at(ApiCommand::Start(config()), t0)
+                .expect("Start");
+            assert!(c.commit_command_at(start, None, t0));
+            for second in 1..10 {
+                c.report_at(
+                    report(ReportState::Idle, 0),
+                    t0 + Duration::from_secs(second),
+                );
+                assert!(c.is_starting());
+            }
+            c.report_at(report(ReportState::Active, 1), t0 + Duration::from_secs(10));
+            assert!(!c.is_running_owned(), "equality must abandon acquisition");
+            assert!(!c.is_starting());
+            assert_eq!(c.test().capacity_mah, None);
+            assert!(c.device().active);
+        }
+    }
+
+    #[test]
+    fn firmware_inactive_closes_control_without_losing_terminal_classification() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for terminal in [
+                ReportState::Active,
+                ReportState::Finished,
+                ReportState::Idle,
+            ] {
+                let mut c = controller();
+                c.mode = mode;
+                commit(&mut c, ApiCommand::Start(config()));
+                c.report(report(ReportState::Active, 10));
+                c.report(report(ReportState::InactiveUnknown, 11));
+                assert!(
+                    !c.is_running_owned(),
+                    "inactive firmware is not dormant ownership"
+                );
+                assert!(!c.timer_sync_authorized_at(Instant::now()));
+                assert!(!c.capabilities().start);
+                let (_, measurement) = c.report(report(terminal, 12));
+                assert!(measurement.is_none());
+                assert!(!c.is_running_owned());
+                if terminal == ReportState::Finished {
+                    assert_eq!(c.test().state, TestState::Completed);
+                } else if terminal == ReportState::Idle {
+                    assert_eq!(c.test().state, TestState::Stopped);
+                } else {
+                    assert_eq!(c.test().capacity_mah, Some(11));
+                    assert!(c.capabilities().stop);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unowned_active_and_confirm_calibration_have_identical_guards() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            let mut c = controller();
+            c.mode = mode;
+            assert!(
+                c.prepare_command(ApiCommand::Calibration(CalibrationCommand::Confirm))
+                    .is_err()
+            );
+            c.report(report(ReportState::Active, 50));
+            assert!(!c.capabilities().calibrate_voltage);
+            assert!(
+                c.prepare_command(ApiCommand::Calibration(CalibrationCommand::VoltageLow(
+                    4000
+                )))
+                .is_err()
+            );
+            assert!(c.capabilities().stop);
+        }
+    }
 
     fn controller() -> TestController {
         let mut controller = TestController::new(ControllerMode::Server);
@@ -1555,6 +1972,82 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_constructor_cannot_recreate_transmitted_intent_or_running_authority() {
+        let now = Instant::now();
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for state in [TestState::Starting, TestState::Running, TestState::Stopping] {
+                let device = DeviceState {
+                    activity_known: true,
+                    active: true,
+                    ..DeviceState::default()
+                };
+                let test = TestStatus {
+                    state,
+                    config: Some(config()),
+                    capacity_mah: Some(10),
+                    energy_wh: 1.0,
+                    ..TestStatus::default()
+                };
+                let mut controller = TestController::from_state(mode, device, test, None);
+                controller.connection_established_at(now);
+                let (_, measurement) = controller.report_received_at(
+                    report(ReportState::Active, 50),
+                    now + Duration::from_secs(1),
+                    now + Duration::from_secs(1),
+                );
+                assert!(
+                    measurement.is_none(),
+                    "a historical status is not a successful new acquisition"
+                );
+                assert!(!controller.is_running_owned());
+                assert_eq!(controller.test.capacity_mah, Some(10));
+                assert_eq!(controller.test.energy_wh, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn contradictory_inactive_preserves_the_revocation_reason() {
+        let now = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, now);
+        controller.report_at(report(ReportState::Idle, 0), now);
+        commit_at(&mut controller, ApiCommand::Start(config()), now);
+        controller.report_at(report(ReportState::Active, 10), now);
+        let mut contrary = report(ReportState::Idle, 50);
+        contrary.mode = DeviceMode::DischargeConstantPower;
+        controller.report_at(contrary, now + Duration::from_secs(1));
+        assert!(controller.device.activity_known && !controller.device.active);
+        assert!(!controller.is_running_owned());
+        assert_eq!(
+            controller.test.result.as_deref(),
+            Some(MODE_CONTRADICTION_REASON)
+        );
+    }
+
+    #[test]
+    fn denied_lifecycle_completion_is_consumed_before_any_replay() {
+        let now = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, now);
+        controller.report_at(report(ReportState::Idle, 0), now);
+        let prepared = controller
+            .prepare_command_at(ApiCommand::Start(config()), now)
+            .expect("Start token");
+        let late = now + REPORT_FRESHNESS_TIMEOUT;
+        assert!(!controller.commit_command_at(prepared, None, late));
+        controller.report_at(report(ReportState::Idle, 10), late + Duration::from_secs(1));
+        let device = controller.device.clone();
+        let test = controller.test.clone();
+        let fence = controller.report_not_before;
+        assert!(!controller.commit_command_at(prepared, None, late + Duration::from_secs(2)));
+        assert_eq!(
+            controller.device, device,
+            "retired completion cannot revoke recovered knowledge"
+        );
+        assert_eq!(controller.test, test);
+        assert_eq!(controller.report_not_before, fence);
+    }
+
+    #[test]
     fn delayed_command_commits_cannot_restore_revoked_authority() {
         let t0 = Instant::now();
         let late = t0 + REPORT_FRESHNESS_TIMEOUT;
@@ -1582,7 +2075,14 @@ mod tests {
             controller.report_at(report(ReportState::Idle, 0), late);
             assert!(controller.validate_prepared_at(prepared, late).is_err());
             assert!(!controller.commit_command_at(prepared, None, late));
-            assert!(!controller.device.activity_known);
+            if matches!(command, ApiCommand::Adjust(_) | ApiCommand::Calibration(_)) {
+                // These writes do not establish a lifecycle fence. The recovered
+                // Idle is independent valid knowledge, not renewed ownership.
+                assert!(controller.device.activity_known);
+                assert_eq!(controller.physical_state(), PhysicalState::Inactive);
+            } else {
+                assert!(!controller.device.activity_known);
+            }
             assert!(!controller.is_running_owned());
             assert_eq!(controller.calibration_staging.references, [false; 4]);
             if matches!(command, ApiCommand::Start(_) | ApiCommand::Resume) {
@@ -1623,6 +2123,9 @@ mod tests {
             assert!(repeated.frame().is_none());
             assert!(controller.commit_command_at(repeated, None, before));
             assert_eq!(controller.test.state, TestState::Stopping);
+            let repeated = controller
+                .prepare_command_at(ApiCommand::Stop, before)
+                .expect("new no-frame attempt at the same deadline");
             assert!(!controller.commit_command_at(repeated, None, boundary));
             assert_eq!(controller.test.state, TestState::RecoveredUncertain);
             assert_eq!(
@@ -1659,8 +2162,12 @@ mod tests {
         controller.connection_established_at(t0);
         controller.report_at(report(ReportState::Idle, 0), t0);
         assert!(controller.validate_prepared_at(old_start, t0).is_err());
+        let replacement = controller.test.clone();
         assert!(!controller.commit_command_at(old_start, None, t0));
-        assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+        assert_eq!(
+            controller.test, replacement,
+            "old completion must not mutate replacement"
+        );
         controller.report_at(report(ReportState::Active, 0), t0);
         let stop = controller
             .prepare_command_at(ApiCommand::Stop, t0)

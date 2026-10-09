@@ -1018,6 +1018,7 @@ dependencies = [
  "log",
  "mdns-sd",
  "rfd",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serialport",

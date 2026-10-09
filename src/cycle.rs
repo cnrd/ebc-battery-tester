@@ -2,10 +2,10 @@
 
 use web_time::{Duration, Instant};
 
-use crate::controller::{REPORT_TIMEOUT_REASON, TestController};
+use crate::controller::{PreparedCommand, REPORT_TIMEOUT_REASON, TestController};
 use crate::core::{
-    CycleRecipe, CycleState, CycleStatus, CycleStep, DeviceState, SavedRecipeReference,
-    TestConfiguration, TestState, TestStatus, ValidationError,
+    ApiCommand, Capabilities, CycleRecipe, CycleState, CycleStatus, CycleStep, DeviceState,
+    SavedRecipeReference, TestConfiguration, TestState, TestStatus, ValidationError,
 };
 
 const RESTART_REASON: &str = "cycle interrupted by process restart";
@@ -26,9 +26,13 @@ struct RestClock {
 pub struct CycleEngine {
     status: CycleStatus,
     cycle_started: Option<Instant>,
+    cycle_ended: Option<Instant>,
     pending_action: Option<CycleAction>,
     rest_clock: Option<RestClock>,
     start_committed: bool,
+    receive_prefix: bool,
+    settled_advance: Option<Instant>,
+    epoch: u64,
 }
 
 impl Default for CycleEngine {
@@ -43,9 +47,13 @@ impl CycleEngine {
         Self {
             status: CycleStatus::default(),
             cycle_started: None,
+            cycle_ended: None,
             pending_action: None,
             rest_clock: None,
             start_committed: false,
+            receive_prefix: false,
+            settled_advance: None,
+            epoch: 0,
         }
     }
 
@@ -61,9 +69,13 @@ impl CycleEngine {
         Self {
             status,
             cycle_started: None,
+            cycle_ended: None,
             pending_action: None,
             rest_clock: None,
             start_committed: false,
+            receive_prefix: false,
+            settled_advance: None,
+            epoch: 0,
         }
     }
 
@@ -80,7 +92,12 @@ impl CycleEngine {
     /// Replaces status using the same conservative recovery behavior as
     /// [`Self::from_status`].
     pub fn replace_status(&mut self, status: CycleStatus) {
+        let epoch = self
+            .epoch
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("cycle scheduling identities exhausted"));
         *self = Self::from_status(status);
+        self.epoch = epoch;
     }
 
     #[must_use]
@@ -98,10 +115,93 @@ impl CycleEngine {
         self.is_executing()
     }
 
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn validate_prepared(
+        &self,
+        controller: &TestController,
+        prepared: PreparedCommand,
+        now: Instant,
+    ) -> Result<(), String> {
+        if matches!(prepared.frame(), Some(crate::device::OutboundFrame::Stop)) {
+            return controller.validate_prepared_at(prepared, now);
+        }
+        if let Some(epoch) = prepared.cycle_epoch() {
+            if epoch != self.epoch
+                || self
+                    .pending_action
+                    .as_ref()
+                    .is_none_or(|action| match action {
+                        CycleAction::Start(config) => {
+                            prepared.command() != ApiCommand::Start(*config)
+                                || !self.owns_orchestration()
+                                || controller.device().current_ma != Some(0)
+                        }
+                        CycleAction::Stop => prepared.command() != ApiCommand::Stop,
+                    })
+            {
+                return Err("command belongs to a retired cycle action".to_owned());
+            }
+        } else {
+            self.authorize_manual(prepared.command())?;
+        }
+        controller.validate_prepared_at(prepared, now)
+    }
+
+    /// One backend-independent reservation rule. Capabilities are a projection,
+    /// never a bypass credential for a physical command.
+    pub(crate) fn authorize_manual(&self, command: ApiCommand) -> Result<(), String> {
+        if self.owns_orchestration()
+            && matches!(
+                command,
+                ApiCommand::Start(_)
+                    | ApiCommand::Resume
+                    | ApiCommand::Adjust(_)
+                    | ApiCommand::Calibration(_)
+            )
+        {
+            return Err("the active cycle owns test orchestration".to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capabilities(&self, controller: &TestController, now: Instant) -> Capabilities {
+        let mut capabilities = controller.capabilities_at(now);
+        if self.owns_orchestration() {
+            capabilities.start = false;
+            capabilities.resume = false;
+            capabilities.stop = true;
+            capabilities.show_stop = true;
+            capabilities.adjust = false;
+            capabilities.calibrate_voltage = false;
+            capabilities.calibrate_current = false;
+            capabilities.confirm_calibration = false;
+        }
+        capabilities
+    }
+
+    pub(crate) fn begin_receive_prefix(&mut self) {
+        self.receive_prefix = true;
+    }
+
+    pub(crate) fn finish_receive_prefix(&mut self) -> Option<CycleAction> {
+        self.receive_prefix = false;
+        if let Some(now) = self.settled_advance.take()
+            && self.status.state == CycleState::Settling
+        {
+            return self.advance(now);
+        }
+        None
+    }
+
     #[must_use]
     pub fn elapsed(&self, now: Instant) -> Duration {
         self.cycle_started.map_or(Duration::ZERO, |started| {
-            now.saturating_duration_since(started)
+            self.cycle_ended
+                .unwrap_or(now)
+                .saturating_duration_since(started)
         })
     }
 
@@ -139,7 +239,13 @@ impl CycleEngine {
             result: None,
             rest_remaining_seconds: None,
         };
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("cycle scheduling identities exhausted"));
+        self.settled_advance = None;
         self.cycle_started = Some(now);
+        self.cycle_ended = None;
         self.pending_action = None;
         self.rest_clock = None;
         self.start_committed = false;
@@ -155,14 +261,31 @@ impl CycleEngine {
         test: &TestStatus,
         fresh_report: bool,
     ) -> Option<CycleAction> {
+        if fresh_report && device.activity_known {
+            let rest_violation = self.status.state == CycleState::Resting
+                && (device.active || device.current_ma != Some(0));
+            let settling_violation = self.status.state == CycleState::Settling
+                && (device.active
+                    || self
+                        .current_device_mode()
+                        .is_some_and(|mode| device.mode != Some(mode)));
+            if rest_violation || settling_violation {
+                self.set_interrupted_at(
+                    "physical activity/current/mode contradicts cycle phase expectations",
+                    now,
+                );
+                return None;
+            }
+        }
         if test.state == TestState::RecoveredUncertain && self.is_executing() {
-            self.set_interrupted("physical state is uncertain");
+            self.set_interrupted_at("physical state is uncertain", now);
             return None;
         }
 
         if self.status.state == CycleState::Stopping {
             if test.state == TestState::Stopped {
                 self.status.state = CycleState::Stopped;
+                self.freeze_elapsed(now);
                 self.status.rest_remaining_seconds = None;
                 self.pending_action = None;
             }
@@ -182,14 +305,17 @@ impl CycleEngine {
                 .current_device_mode()
                 .is_some_and(|mode| device.mode != Some(mode))
         {
-            self.set_interrupted("physical device mode contradicts the current cycle step");
+            self.set_interrupted_at(
+                "physical device mode contradicts the current cycle step",
+                now,
+            );
             return None;
         }
 
         let expects_active_operation = self.status.state == CycleState::RunningStep
             || (self.status.state == CycleState::StartingStep && self.start_committed);
         if expects_active_operation && test.state == TestState::Stopped {
-            self.set_interrupted("physical test stopped unexpectedly");
+            self.set_interrupted_at("physical test stopped unexpectedly", now);
             return None;
         }
 
@@ -208,6 +334,10 @@ impl CycleEngine {
                     && !device.active
                     && device.current_ma == Some(0) =>
             {
+                if self.receive_prefix {
+                    self.settled_advance = Some(now);
+                    return None;
+                }
                 return self.advance(now);
             }
             _ => {}
@@ -233,6 +363,7 @@ impl CycleEngine {
                     && self.status.state != CycleState::Interrupted =>
             {
                 self.status.state = CycleState::Stopped;
+                self.freeze_elapsed(Instant::now());
             }
             CycleAction::Stop => {}
         }
@@ -253,7 +384,7 @@ impl CycleEngine {
                 return None;
             }
             let Some(clock) = self.rest_clock.clone() else {
-                self.set_interrupted("rest timer is unavailable");
+                self.set_interrupted_at("rest timer is unavailable", now);
                 return None;
             };
             let elapsed = now.saturating_duration_since(clock.started);
@@ -301,6 +432,7 @@ impl CycleEngine {
         {
             self.pending_action = None;
             self.status.state = CycleState::Stopped;
+            self.freeze_elapsed(Instant::now());
             return None;
         }
         if may_be_active {
@@ -314,6 +446,7 @@ impl CycleEngine {
 
         self.pending_action = None;
         self.status.state = CycleState::Stopped;
+        self.freeze_elapsed(Instant::now());
         None
     }
 
@@ -337,7 +470,9 @@ impl CycleEngine {
         if !controller.expire_report_freshness(now) {
             return false;
         }
-        self.interrupt_for_gap(REPORT_TIMEOUT_REASON);
+        if self.is_executing() {
+            self.set_interrupted_at(REPORT_TIMEOUT_REASON, now);
+        }
         true
     }
 
@@ -378,6 +513,10 @@ impl CycleEngine {
     }
 
     fn advance(&mut self, now: Instant) -> Option<CycleAction> {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("cycle scheduling identities exhausted"));
         let recipe = self.status.recipe.as_ref()?;
         if self.status.step_index + 1 < recipe.steps.len() {
             self.status.step_index += 1;
@@ -386,6 +525,7 @@ impl CycleEngine {
             self.status.step_index = 0;
         } else {
             self.status.state = CycleState::Completed;
+            self.freeze_elapsed(now);
             self.status.rest_remaining_seconds = None;
             self.rest_clock = None;
             self.pending_action = None;
@@ -409,6 +549,22 @@ impl CycleEngine {
     }
 
     fn set_interrupted(&mut self, reason: impl Into<String>) {
+        self.set_interrupted_at(reason, Instant::now());
+    }
+
+    fn freeze_elapsed(&mut self, now: Instant) {
+        if self.cycle_ended.is_none() {
+            self.cycle_ended = Some(now);
+        }
+    }
+
+    fn set_interrupted_at(&mut self, reason: impl Into<String>, now: Instant) {
+        self.freeze_elapsed(now);
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("cycle scheduling identities exhausted"));
+        self.settled_advance = None;
         self.status.state = CycleState::Interrupted;
         self.status.result = Some(reason.into());
         self.status.rest_remaining_seconds = None;
@@ -442,6 +598,111 @@ mod tests {
     use super::*;
     use crate::core::CycleStepCompletion;
 
+    #[test]
+    fn final_completion_waits_for_prefix_and_latches_intermediate_activity() {
+        let now = Instant::now();
+        let mut engine = CycleEngine::new();
+        let action =
+            start(&mut engine, recipe(vec![device_step(100)], 1), now).expect("child Start");
+        engine.on_action_committed(&action, &status(TestState::Starting));
+        let mut device = settled_device();
+        device.active = true;
+        engine.on_physical_state(now, &device, &status(TestState::Running), true);
+        device.active = false;
+        engine.on_physical_state(now, &device, &status(TestState::Completed), true);
+        engine.begin_receive_prefix();
+        engine.on_physical_state(now, &device, &status(TestState::Completed), true);
+        assert_eq!(
+            engine.status().state,
+            CycleState::Settling,
+            "zero-current report cannot commit terminal progress before prefix reconciliation"
+        );
+        device.active = true;
+        engine.on_physical_state(now, &device, &status(TestState::Completed), true);
+        device.active = false;
+        engine.on_physical_state(now, &device, &status(TestState::Completed), true);
+        assert_eq!(engine.finish_receive_prefix(), None);
+        assert_eq!(engine.status().state, CycleState::Interrupted);
+    }
+
+    #[test]
+    fn terminal_cycle_duration_is_frozen_at_completion_or_interruption() {
+        let now = Instant::now();
+        let mut completed = CycleEngine::new();
+        start(
+            &mut completed,
+            recipe(
+                vec![CycleStep::Rest {
+                    duration_seconds: 2,
+                }],
+                1,
+            ),
+            now,
+        );
+        assert_eq!(completed.tick(now + Duration::from_secs(2)), None);
+        assert_eq!(completed.status().state, CycleState::Completed);
+        assert_eq!(
+            completed.elapsed(now + Duration::from_secs(100)),
+            Duration::from_secs(2)
+        );
+
+        let mut interrupted = CycleEngine::new();
+        start(
+            &mut interrupted,
+            recipe(
+                vec![CycleStep::Rest {
+                    duration_seconds: 20,
+                }],
+                1,
+            ),
+            now,
+        );
+        let mut active = settled_device();
+        active.active = true;
+        interrupted.on_physical_state(
+            now + Duration::from_secs(3),
+            &active,
+            &status(TestState::RecoveredUncertain),
+            true,
+        );
+        assert_eq!(interrupted.status().state, CycleState::Interrupted);
+        assert_eq!(
+            interrupted.elapsed(now + Duration::from_secs(100)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn rest_and_settling_reject_activity_independently_of_test_presentation() {
+        for phase in [CycleState::Resting, CycleState::Settling] {
+            for active in [false, true] {
+                let now = Instant::now();
+                let mut engine = CycleEngine::new();
+                start(
+                    &mut engine,
+                    recipe(vec![device_step(100), device_step(100)], 1),
+                    now,
+                );
+                engine.status.state = phase;
+                let mut device = settled_device();
+                device.mode = Some(crate::device::DeviceMode::DischargeConstantCurrent);
+                device.active = active;
+                device.current_ma = Some(1);
+                engine.on_physical_state(now, &device, &status(TestState::Completed), true);
+                if active || phase == CycleState::Resting {
+                    assert_eq!(engine.status().state, CycleState::Interrupted);
+                    device.active = false;
+                    device.current_ma = Some(0);
+                    assert_eq!(
+                        engine.on_physical_state(now, &device, &status(TestState::Completed), true),
+                        None
+                    );
+                    assert_eq!(engine.status().state, CycleState::Interrupted);
+                }
+            }
+        }
+    }
+
     fn config(current_ma: u16) -> TestConfiguration {
         TestConfiguration::DischargeConstantCurrent {
             current_ma,
@@ -473,6 +734,7 @@ mod tests {
 
     fn settled_device() -> DeviceState {
         DeviceState {
+            mode: Some(crate::device::DeviceMode::DischargeConstantCurrent),
             activity_known: true,
             active: false,
             current_ma: Some(0),

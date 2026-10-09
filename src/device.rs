@@ -492,10 +492,157 @@ impl TryFrom<&[u8]> for InboundFrame {
 
 pub fn process_buffer(buf: &mut Vec<u8>) -> Vec<(InboundFrame, Vec<u8>)> {
     let mut frames = Vec::new();
+    extract_frames(buf, |frame, raw, _| frames.push((frame, raw)));
+    frames
+}
+
+/// Integrity-validated input with conservative oldest-byte provenance. The
+/// adapter owns this buffer for exactly one connection; it must clear it on
+/// replacement and quarantine it at lifecycle/uncertain-service boundaries.
+#[derive(Default)]
+pub(crate) struct ReceiveBuffer {
+    bytes: Vec<u8>,
+    receipts: Vec<web_time::Instant>,
+}
+
+pub(crate) struct ReceivedFrame {
+    pub(crate) frame: InboundFrame,
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) raw: Vec<u8>,
+    pub(crate) received_at: web_time::Instant,
+}
+
+impl ReceiveBuffer {
+    #[cfg(test)]
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        self.receipts
+            .extend(std::iter::repeat_n(web_time::Instant::now(), bytes.len()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn clear(&mut self) {
+        self.bytes.clear();
+        self.receipts.clear();
+    }
+
+    pub(crate) fn receive(
+        &mut self,
+        bytes: &[u8],
+        received_at: web_time::Instant,
+    ) -> Vec<ReceivedFrame> {
+        self.bytes.extend_from_slice(bytes);
+        self.receipts
+            .extend(std::iter::repeat_n(received_at, bytes.len()));
+        let old_len = self.bytes.len();
+        let mut frames = Vec::new();
+        extract_frames(&mut self.bytes, |frame, raw, start| {
+            #[cfg(not(any(feature = "gui", test)))]
+            drop(raw);
+            frames.push(ReceivedFrame {
+                frame,
+                #[cfg(any(feature = "gui", test))]
+                raw,
+                received_at: self.receipts[start],
+            });
+        });
+        self.receipts.drain(..old_len - self.bytes.len());
+        frames
+    }
+}
+
+/// Finite driver-input watermark, shared by both serial executors. Receipt is
+/// bounded by the preceding serviced/drained boundary, not this read's callback.
+/// A receive gap therefore ages buffered input rather than rejuvenating it.
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "gui", feature = "server")))]
+#[derive(Default)]
+pub(crate) struct SerialIngress {
+    pub(crate) buffer: ReceiveBuffer,
+    boundary: Option<web_time::Instant>,
+    service_time: Option<crate::transport_time::ServiceTime>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "gui", feature = "server")))]
+impl SerialIngress {
+    pub(crate) fn clear(&mut self) {
+        self.buffer.clear();
+        self.boundary = None;
+        self.service_time = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub(crate) fn quarantine(&mut self, port: &dyn serialport::SerialPort) -> Result<(), String> {
+        let boundary = web_time::Instant::now();
+        let service_time = crate::transport_time::ServiceTime::now();
+        port.clear(serialport::ClearBuffer::Input)
+            .map_err(|e| format!("cannot quarantine serial input: {e}"))?;
+        self.buffer.clear();
+        self.boundary = Some(boundary);
+        self.service_time = Some(service_time);
+        Ok(())
+    }
+
+    pub(crate) fn receive_prefix(
+        &mut self,
+        port: &mut dyn serialport::SerialPort,
+    ) -> Result<Vec<ReceivedFrame>, String> {
+        let boundary = web_time::Instant::now();
+        let service_time = crate::transport_time::ServiceTime::now();
+        if self
+            .service_time
+            .is_some_and(|previous| service_time.discontinuity_since(previous))
+        {
+            return Err(
+                "serial receive-service clock discontinuity; input provenance is uncertain"
+                    .to_owned(),
+            );
+        }
+        let mut remaining =
+            port.bytes_to_read()
+                .map_err(|e| format!("serial ingress watermark failed: {e}"))? as usize;
+        let Some(received_at) = self.boundary else {
+            return Err("serial receipt provenance has not been initialized".to_owned());
+        };
+        let mut frames = Vec::new();
+        let mut bytes = [0; 4096];
+        while remaining > 0 {
+            let size = remaining.min(bytes.len());
+            let count = port
+                .read(&mut bytes[..size])
+                .map_err(|e| format!("serial ingress read failed: {e}"))?;
+            if count == 0 {
+                return Err("serial ingress made no progress".to_owned());
+            }
+            remaining -= count;
+            frames.extend(self.buffer.receive(&bytes[..count], received_at));
+        }
+        self.boundary = Some(boundary);
+        self.service_time = Some(service_time);
+        Ok(frames)
+    }
+}
+
+fn extract_frames(buf: &mut Vec<u8>, mut accept: impl FnMut(InboundFrame, Vec<u8>, usize)) {
+    let mut consumed = 0;
     loop {
         if let Some(start) = buf.iter().position(|&b| b == START_BYTE) {
             if start > 0 {
                 buf.drain(..start);
+                consumed += start;
             }
         } else {
             buf.clear();
@@ -506,21 +653,23 @@ pub fn process_buffer(buf: &mut Vec<u8>) -> Vec<(InboundFrame, Vec<u8>)> {
         }
         if buf[INBOUND_FRAME_SIZE - 1] != END_BYTE {
             buf.drain(..1);
+            consumed += 1;
             continue;
         }
         let raw = buf[..INBOUND_FRAME_SIZE].to_vec();
         match InboundFrame::try_from(raw.as_slice()) {
             Ok(frame) => {
                 buf.drain(..INBOUND_FRAME_SIZE);
-                frames.push((frame, raw));
+                accept(frame, raw, consumed);
+                consumed += INBOUND_FRAME_SIZE;
             }
             Err(error) => {
                 log::warn!("Failed to parse frame: {error}");
                 buf.drain(..1);
+                consumed += 1;
             }
         }
     }
-    frames
 }
 
 // Encoding to prevent bytes > 240 in the byte stream, allowing 0xfa and 0xf8
@@ -1023,6 +1172,31 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].1, expected);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn receive_buffer_preserves_oldest_constituent_and_recovers_corrupt_prefix() {
+        let first = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let second = report_frame(StatusReportType::DischargeConstantPowerOffReport as u8);
+        let t0 = web_time::Instant::now();
+        let t1 = t0 + web_time::Duration::from_secs(11);
+        let mut buffer = ReceiveBuffer::default();
+        assert!(buffer.receive(&first[..18], t0).is_empty());
+        let mut suffix = vec![first[18]];
+        suffix.extend_from_slice(&second);
+        let frames = buffer.receive(&suffix, t1);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].received_at, t0);
+        assert_eq!(frames[1].received_at, t1);
+        let mut corrupt = first.clone();
+        corrupt[17] ^= 1;
+        assert!(buffer.receive(&corrupt[..18], t0).is_empty());
+        suffix = vec![corrupt[18]];
+        suffix.extend_from_slice(&second);
+        let frames = buffer.receive(&suffix, t1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].received_at, t1);
+        assert_eq!(frames[0].raw, second);
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read as _, Write as _};
+#[cfg(test)]
+use std::io::Read as _;
+use std::io::{BufWriter, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -48,7 +50,7 @@ use crate::core::{
     normalize_required_name, power_microwatts,
 };
 use crate::cycle::{CycleAction, CycleEngine};
-use crate::device::{self, InboundFrame, OUTBOUND_FRAME_SIZE, OutboundFrame};
+use crate::device::{self, InboundFrame, OutboundFrame};
 
 const SNAPSHOT_CHANNEL_CAPACITY: usize = 16;
 const SNAPSHOT_SAMPLE_LIMIT: usize = 5_000;
@@ -1554,7 +1556,7 @@ struct DeviceActor {
     cycle: CycleEngine,
     persistence: Persistence,
     port: Option<Box<dyn serialport::SerialPort>>,
-    serial_buffer: Vec<u8>,
+    serial_buffer: device::SerialIngress,
     mock_sample_number: u64,
     last_mock_sample: Instant,
     mock_idle_report_due: Option<Instant>,
@@ -1610,7 +1612,7 @@ impl DeviceActor {
             cycle,
             persistence,
             port: None,
-            serial_buffer: Vec::new(),
+            serial_buffer: device::SerialIngress::default(),
             mock_sample_number: 0,
             last_mock_sample: Instant::now(),
             mock_idle_report_due: None,
@@ -1837,23 +1839,43 @@ impl DeviceActor {
         self.serial_buffer.clear();
         self.snapshot.connection = ServerConnectionState::Connected;
         self.controller.connection_established();
+        if let Some(port) = self.port.as_mut() {
+            self.serial_buffer.quarantine(port.as_mut())?;
+        }
         self.sync_controller_state();
         Ok(())
     }
 
     fn disconnect(&mut self) -> Result<(), String> {
-        if self.controller.requires_stop_before_disconnect() {
-            self.stop_test()?;
+        self.cycle
+            .interrupt("cycle interrupted by explicit device disconnect");
+        let mut errors = Vec::new();
+        if self.controller.requires_stop_before_disconnect()
+            && let Err(error) = self.stop_test()
+        {
+            errors.push(error);
         }
-        self.send_frame_with_recovery(OutboundFrame::Disconnect, None)?;
+        // A transport failure already retires the port; do not write to it.
+        // Persistence failure after a real Stop must not prevent Disconnect.
+        if self.snapshot.connection != ServerConnectionState::Error
+            && let Err(error) = self.send_frame_with_recovery(OutboundFrame::Disconnect, None)
+        {
+            errors.push(error);
+        }
         self.port = None;
         self.serial_buffer.clear();
         self.mock_idle_report_due = None;
-        self.snapshot.connection = ServerConnectionState::Disconnected;
-        self.controller
-            .disconnect("device disconnected; physical test state is unknown");
+        if self.snapshot.connection != ServerConnectionState::Error {
+            self.snapshot.connection = ServerConnectionState::Disconnected;
+            self.controller
+                .disconnect("device disconnected; physical test state is unknown");
+        }
         self.sync_controller_state();
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     #[expect(
@@ -1866,6 +1888,7 @@ impl DeviceActor {
         name: Option<String>,
         cycle: Option<CycleRunContext>,
     ) -> Result<(), StartError> {
+        self.read_serial();
         self.expire_report_freshness(Instant::now());
         // Only the actor's explicitly authorized cycle-child path may bypass
         // orchestration ownership. HTTP Start and semantic Start share this guard.
@@ -1881,6 +1904,18 @@ impl DeviceActor {
             .controller
             .prepare_command(ApiCommand::Start(config))
             .map_err(StartError::BadRequest)?;
+        let prepared = if let Some(context) = &cycle {
+            if self.current_cycle_context().as_ref() != Some(context)
+                || !self.cycle.owns_orchestration()
+            {
+                return Err(StartError::BadRequest(
+                    "retired cycle context cannot authorize Start".to_owned(),
+                ));
+            }
+            prepared.bind_cycle(self.cycle.epoch())
+        } else {
+            prepared
+        };
         self.sync_controller_state();
         self.persistence
             .archive_current(&self.snapshot)
@@ -2049,6 +2084,7 @@ impl DeviceActor {
         request: StartCycleRequest,
         saved_recipe: Option<SavedRecipeReference>,
     ) -> Result<(), StartError> {
+        self.read_serial();
         self.expire_report_freshness(Instant::now());
         request
             .recipe
@@ -2397,6 +2433,7 @@ impl DeviceActor {
     fn stop_test(&mut self) -> Result<(), String> {
         self.expire_report_freshness(Instant::now());
         let prepared = self.controller.prepare_command(ApiCommand::Stop)?;
+        self.controller.accept_stop_at(prepared, Instant::now());
         self.send_command_frame(prepared)?;
         self.commit_written_command(prepared, None)?;
         self.sync_controller_state();
@@ -2405,6 +2442,8 @@ impl DeviceActor {
     }
 
     fn adjust_test(&mut self, config: TestConfiguration) -> Result<(), String> {
+        self.read_serial();
+        self.cycle.authorize_manual(ApiCommand::Adjust(config))?;
         self.expire_report_freshness(Instant::now());
         let prepared = self
             .controller
@@ -2422,6 +2461,8 @@ impl DeviceActor {
     }
 
     fn resume_test(&mut self) -> Result<(), String> {
+        self.read_serial();
+        self.cycle.authorize_manual(ApiCommand::Resume)?;
         self.expire_report_freshness(Instant::now());
         let prepared = self.controller.prepare_command(ApiCommand::Resume)?;
         self.send_command_frame(prepared)?;
@@ -2431,6 +2472,9 @@ impl DeviceActor {
     }
 
     fn calibrate(&mut self, command: CalibrationCommand) -> Result<(), String> {
+        self.read_serial();
+        self.cycle
+            .authorize_manual(ApiCommand::Calibration(command))?;
         self.expire_report_freshness(Instant::now());
         let prepared = self
             .controller
@@ -2466,9 +2510,16 @@ impl DeviceActor {
     }
 
     fn send_command_frame(&mut self, prepared: PreparedCommand) -> Result<(), String> {
+        if !self.controller.completion_is_current(prepared) {
+            return Err("command belongs to a retired physical connection/operation".to_owned());
+        }
+        if !matches!(prepared.frame(), Some(OutboundFrame::Stop)) {
+            self.read_serial();
+        }
         let now = Instant::now();
         self.expire_report_freshness(now);
-        self.controller.validate_prepared_at(prepared, now)?;
+        self.cycle
+            .validate_prepared(&self.controller, prepared, now)?;
         let Some(frame) = prepared.frame() else {
             return Ok(());
         };
@@ -2480,6 +2531,15 @@ impl DeviceActor {
         prepared: PreparedCommand,
         started_at: Option<String>,
     ) -> Result<(), String> {
+        if !self.controller.completion_is_current(prepared) {
+            return Err("completion belongs to a retired physical connection/operation".to_owned());
+        }
+        if matches!(
+            prepared.kind(),
+            CommandKind::Adjust | CommandKind::Calibration
+        ) {
+            self.read_serial();
+        }
         self.commit_written_command_at(prepared, started_at, Instant::now())
     }
 
@@ -2489,8 +2549,21 @@ impl DeviceActor {
         started_at: Option<String>,
         now: Instant,
     ) -> Result<(), String> {
+        if !self.controller.completion_is_current(prepared) {
+            return Err("completion belongs to a retired physical connection/operation".to_owned());
+        }
         self.expire_report_freshness(now);
         if self.controller.commit_command_at(prepared, started_at, now) {
+            if matches!(
+                prepared.kind(),
+                CommandKind::Start | CommandKind::Resume | CommandKind::Stop
+            ) && prepared.frame().is_some()
+                && let Some(port) = self.port.as_mut()
+                && let Err(error) = self.serial_buffer.quarantine(port.as_mut())
+            {
+                self.set_connection_error(&error);
+                return Err(error);
+            }
             return Ok(());
         }
         self.cycle.interrupt_for_gap(REPORT_TIMEOUT_REASON);
@@ -2503,16 +2576,30 @@ impl DeviceActor {
         frame: OutboundFrame,
         command: Option<CommandKind>,
     ) -> Result<(), String> {
+        let token = self.controller.authority_token();
         if matches!(frame, OutboundFrame::TimerSync(_)) {
+            self.read_serial();
             let now = Instant::now();
             self.expire_report_freshness(now);
-            if !self.controller.timer_sync_authorized_at(now) {
+            if !self.controller.token_is_current(token)
+                || !self.controller.timer_sync_authorized_at(now)
+            {
                 return Err(REPORT_TIMEOUT_REASON.to_owned());
             }
         }
         if let Err(error) = self.send(frame) {
             self.handle_protocol_write_failure(command, &error);
             return Err(error);
+        }
+        if matches!(frame, OutboundFrame::TimerSync(_)) {
+            self.read_serial();
+            let now = Instant::now();
+            self.expire_report_freshness(now);
+            if !self.controller.token_is_current(token)
+                || !self.controller.timer_sync_authorized_at(now)
+            {
+                return Err("TimerSync completed after owned authority ended".to_owned());
+            }
         }
         Ok(())
     }
@@ -2686,18 +2773,22 @@ impl DeviceActor {
 
     fn read_serial(&mut self) {
         let Some(port) = &mut self.port else { return };
-        let mut bytes = [0_u8; 64];
-        match port.read(&mut bytes) {
-            Ok(count) if count > 0 => {
-                let received_at = Instant::now();
-                self.serial_buffer.extend_from_slice(&bytes[..count]);
-                for (frame, _) in device::process_buffer(&mut self.serial_buffer) {
-                    self.handle_frame_received_at(frame, received_at);
-                }
+        let prefix = match self.serial_buffer.receive_prefix(port.as_mut()) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                self.set_connection_error(&error);
+                return;
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(error) => self.set_connection_error(&format!("serial read failed: {error}")),
+        };
+        self.cycle.begin_receive_prefix();
+        for item in prefix {
+            self.handle_frame_received_at(item.frame, item.received_at);
+        }
+        self.expire_report_freshness(Instant::now());
+        if let Some(action) = self.cycle.finish_receive_prefix()
+            && let Err(error) = self.execute_cycle_action(action)
+        {
+            log::error!("cycle action denied after receive prefix: {error}");
         }
     }
 
@@ -2858,7 +2949,14 @@ impl DeviceActor {
             self.controller
                 .report_received_at(report.clone(), received_at, now)
         } else {
-            self.controller.report_at(report.clone(), now)
+            #[cfg(test)]
+            {
+                self.controller.report_at(report.clone(), now)
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("unfenced reports are test-only")
+            }
         };
         if !outcome.accepted {
             return;
@@ -3053,17 +3151,7 @@ impl DeviceActor {
         self.snapshot.test = self.controller.test().clone();
         self.snapshot.cycle = self.cycle.status().clone();
         self.persistence.sync_snapshot_metadata(&mut self.snapshot);
-        self.snapshot.capabilities = self.controller.capabilities();
-        if self.cycle.owns_orchestration() {
-            self.snapshot.capabilities.start = false;
-            self.snapshot.capabilities.resume = false;
-            self.snapshot.capabilities.stop = true;
-            self.snapshot.capabilities.show_stop = true;
-            self.snapshot.capabilities.adjust = false;
-            self.snapshot.capabilities.calibrate_voltage = false;
-            self.snapshot.capabilities.calibrate_current = false;
-            self.snapshot.capabilities.confirm_calibration = false;
-        }
+        self.snapshot.capabilities = self.cycle.capabilities(&self.controller, Instant::now());
     }
 
     fn snapshot_for_clients(&self) -> AuthoritativeSnapshot {
@@ -3088,9 +3176,7 @@ fn write_frame(
     port: &mut Box<dyn serialport::SerialPort>,
     frame: OutboundFrame,
 ) -> Result<(), String> {
-    let bytes: [u8; OUTBOUND_FRAME_SIZE] = frame.into();
-    port.write_all(&bytes)
-        .map_err(|error| format!("serial write failed: {error}"))
+    crate::transport_time::write_frame(port.as_mut(), frame)
 }
 
 /// Runs the device actor and HTTP server until shutdown.
@@ -4339,6 +4425,59 @@ mod tests {
         assert!(actor.port.is_none());
         assert!(actor.serial_buffer.is_empty());
         assert!(!actor.snapshot.device.activity_known);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_completion_reconciles_adjust_and_calibration_input() {
+        use std::io::{Read as _, Write as _};
+        for command in [
+            ApiCommand::Adjust(test_config()),
+            ApiCommand::Calibration(CalibrationCommand::VoltageLow(4000)),
+        ] {
+            let (mut actor, directory) = mock_actor("completion-prefix");
+            confirm_inactive(&mut actor);
+            confirm_running(&mut actor);
+            let capacity = actor.snapshot.test.capacity_mah;
+            let (port, mut peer) = serialport::TTYPort::pair().expect("software PTY");
+            serialport::SerialPort::set_timeout(&mut peer, Duration::from_millis(100))
+                .expect("timeout");
+            actor
+                .serial_buffer
+                .quarantine(&port)
+                .expect("ingress boundary");
+            let mut input = serialport::SerialPort::try_clone(&peer).expect("PTY input clone");
+            actor.port = Some(Box::new(crate::transport_time::fixture::WriteHook {
+                port: Box::new(port),
+                hook: Box::new(move || {
+                    let mut report = [
+                        0xfa, 11, 0, 10, 16, 160, 0, 50, 0, 0, 0, 10, 1, 60, 0, 0, 9, 0, 0xf8,
+                    ];
+                    report[17] = report[1..17]
+                        .iter()
+                        .fold(0, |checksum, byte| checksum ^ byte);
+                    input
+                        .write_all(&report)
+                        .expect("contradiction during write");
+                    std::thread::sleep(Duration::from_millis(5));
+                }),
+            }));
+            actor.config.mock = false;
+            actor
+                .handle_command(command)
+                .expect_err("cannot acknowledge continuing owned authority");
+            let mut wire = [0; device::OUTBOUND_FRAME_SIZE];
+            peer.read_exact(&mut wire).expect("actual command bytes");
+            assert!(matches!(wire[1], 4 | 7));
+            assert!(actor.snapshot.device.activity_known && actor.snapshot.device.active);
+            assert_eq!(
+                actor.snapshot.device.mode,
+                Some(device::DeviceMode::DischargeConstantPower)
+            );
+            assert!(!actor.controller.is_running_owned());
+            assert_eq!(actor.snapshot.test.capacity_mah, capacity);
+            fs::remove_dir_all(directory).expect("remove test directory");
+        }
     }
 
     pub(super) fn numbered_sample(sequence: u64, voltage_mv: u16, current_ma: u16) -> Sample {

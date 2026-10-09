@@ -2,8 +2,8 @@
 
 use crate::backend::{BackendEvent, BackendState, DiagnosticDirection, DiagnosticEvent};
 use crate::controller::{
-    CommandKind, ControllerMode, DeviceReport, PreparedCommand, REPORT_TIMEOUT_REASON, ReportState,
-    TestController,
+    AuthorityToken, CommandKind, ControllerMode, DeviceReport, PreparedCommand,
+    REPORT_TIMEOUT_REASON, ReportState, TestController,
 };
 use crate::core::{
     ApiCommand, AuthoritativeSnapshot, CurrentRunMetadata, CycleRecipe, CycleRunContext,
@@ -54,8 +54,8 @@ enum SendCompletion {
         notify_command: bool,
         reset_history: bool,
     },
-    TimerSync,
-    BestEffort,
+    TimerSync(AuthorityToken),
+    BestEffort(AuthorityToken),
 }
 
 pub(crate) struct LocalBackend {
@@ -95,6 +95,28 @@ impl Default for LocalBackend {
 }
 
 impl LocalBackend {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn ingress_context(&self) -> (u64, Option<Instant>) {
+        self.controller.ingress_context()
+    }
+
+    pub(crate) fn begin_receive_prefix(&mut self) {
+        self.cycle.begin_receive_prefix();
+    }
+
+    pub(crate) fn finish_receive_prefix(&mut self) -> LocalOutput {
+        self.finish_receive_prefix_at(Instant::now())
+    }
+
+    fn finish_receive_prefix_at(&mut self, now: Instant) -> LocalOutput {
+        let mut output = self.expire_report_freshness(now);
+        if let Some(action) = self.cycle.finish_receive_prefix() {
+            output.extend(self.prepare_cycle_action(action, false));
+        } else {
+            output.extend(self.state_output());
+        }
+        output
+    }
     pub(crate) fn begin_connection(&mut self) -> LocalOutput {
         self.cycle
             .interrupt_for_gap("cycle interrupted by connection change");
@@ -149,18 +171,14 @@ impl LocalBackend {
         if command == ApiCommand::Stop && self.cycle.owns_orchestration() {
             return self.stop_cycle();
         }
-        if self.cycle.owns_orchestration()
-            && matches!(
-                command,
-                ApiCommand::Resume | ApiCommand::Adjust(_) | ApiCommand::Calibration(_)
-            )
-        {
-            return Self::command_error("the active cycle owns test orchestration".to_owned());
+        if let Err(error) = self.cycle.authorize_manual(command) {
+            return Self::command_error(error);
         }
         let prepared = match self.controller.prepare_command(command) {
             Ok(prepared) => prepared,
             Err(error) => return Self::command_error(error),
         };
+        self.controller.accept_stop_at(prepared, Instant::now());
         if let Some(frame) = prepared.frame() {
             return LocalOutput {
                 sends: vec![LocalSend {
@@ -189,8 +207,11 @@ impl LocalBackend {
     }
 
     fn start_test_inner(&mut self, request: &StartTestRequest) -> LocalOutput {
-        if self.cycle.owns_orchestration() {
-            return Self::command_error("the active cycle owns test orchestration".to_owned());
+        if let Err(error) = self
+            .cycle
+            .authorize_manual(ApiCommand::Start(request.config))
+        {
+            return Self::command_error(error);
         }
         let name = match normalize_optional_name(request.name.as_deref()) {
             Ok(name) => name,
@@ -228,8 +249,8 @@ impl LocalBackend {
     }
 
     fn resume_inner(&self, config: TestConfiguration) -> LocalOutput {
-        if self.cycle.owns_orchestration() {
-            return Self::command_error("the active cycle owns test orchestration".to_owned());
+        if let Err(error) = self.cycle.authorize_manual(ApiCommand::Resume) {
+            return Self::command_error(error);
         }
         let prepared = match self.controller.prepare_resume(config) {
             Ok(prepared) => prepared,
@@ -428,6 +449,21 @@ impl LocalBackend {
         result: Result<(), String>,
         now: Instant,
     ) -> LocalOutput {
+        if let SendCompletion::Command { prepared, .. } = send.completion
+            && !self.controller.completion_is_current(prepared)
+        {
+            return LocalOutput::default();
+        }
+        if let SendCompletion::TimerSync(token) = send.completion
+            && !self.controller.token_is_current(token)
+        {
+            return LocalOutput::default();
+        }
+        if let SendCompletion::BestEffort(token) = send.completion
+            && !self.controller.safety_token_is_current(token)
+        {
+            return LocalOutput::default();
+        }
         let mut output = self.expire_report_freshness(now);
         output.extend(self.finish_send_inner(send, result, now));
         output
@@ -447,7 +483,9 @@ impl LocalBackend {
                     notify_command,
                     ..
                 } => self.command_succeeded_at(prepared, cycle_action, notify_command, now),
-                SendCompletion::TimerSync | SendCompletion::BestEffort => LocalOutput::default(),
+                SendCompletion::TimerSync(_) | SendCompletion::BestEffort(_) => {
+                    LocalOutput::default()
+                }
             },
             Err(error) => self.send_failed(send, &error),
         }
@@ -473,6 +511,19 @@ impl LocalBackend {
         // completions must propagate expiry to orchestration at the same instant
         // used by the controller commit. Checking only before preparation leaves
         // a deadline-crossing race even without an await.
+        if !self.controller.completion_is_current(prepared) {
+            return LocalOutput::default();
+        }
+        if !matches!(prepared.frame(), Some(OutboundFrame::Stop))
+            && prepared
+                .cycle_epoch()
+                .is_some_and(|epoch| epoch != self.cycle.epoch())
+        {
+            self.controller.invalidate_for_gap(
+                "retired cycle command completed; physical outcome is uncertain",
+            );
+            return self.state_output();
+        }
         let mut output = self.expire_report_freshness(now);
         if !self.controller.commit_command_at(prepared, None, now) {
             self.cycle.interrupt_for_gap(REPORT_TIMEOUT_REASON);
@@ -504,17 +555,46 @@ impl LocalBackend {
     }
 
     fn authorize_send_at(&mut self, send: LocalSend, now: Instant) -> (LocalOutput, bool) {
+        let current = match send.completion {
+            SendCompletion::Command { prepared, .. } => {
+                self.controller.completion_is_current(prepared)
+            }
+            SendCompletion::TimerSync(token) => self.controller.token_is_current(token),
+            SendCompletion::BestEffort(token) => self.controller.safety_token_is_current(token),
+        };
+        if !current {
+            return (LocalOutput::default(), false);
+        }
         let mut output = self.expire_report_freshness(now);
         let authorization = match send.completion {
             SendCompletion::Command { prepared, .. } => {
-                self.controller.validate_prepared_at(prepared, now)
+                self.cycle
+                    .validate_prepared(&self.controller, prepared, now)
             }
-            SendCompletion::TimerSync if !self.controller.timer_sync_authorized_at(now) => {
+            SendCompletion::TimerSync(token)
+                if !self.controller.token_is_current(token)
+                    || !self.controller.timer_sync_authorized_at(now) =>
+            {
                 Err(REPORT_TIMEOUT_REASON.to_owned())
             }
-            SendCompletion::TimerSync | SendCompletion::BestEffort => Ok(()),
+            SendCompletion::BestEffort(token)
+                if !self.controller.safety_token_is_current(token) =>
+            {
+                Err("cleanup belongs to a retired physical connection/operation".to_owned())
+            }
+            SendCompletion::TimerSync(_) | SendCompletion::BestEffort(_) => Ok(()),
         };
         if let Err(error) = authorization {
+            if let SendCompletion::Command {
+                cycle_action: Some(_),
+                ..
+            } = send.completion
+            {
+                if self.cycle.status().result.as_deref() != Some(REPORT_TIMEOUT_REASON) {
+                    self.cycle.on_action_failed(error.clone());
+                }
+                output.extend(self.state_output());
+            }
             output.events.push(BackendEvent::CommandError(error));
             return (output, false);
         }
@@ -540,6 +620,8 @@ impl LocalBackend {
                 return output;
             }
         };
+        let prepared = prepared.bind_cycle(self.cycle.epoch());
+        self.controller.accept_stop_at(prepared, Instant::now());
         if matches!(action, CycleAction::Start(_)) {
             let status = self.cycle.status();
             let cycle = status
@@ -573,16 +655,17 @@ impl LocalBackend {
         self.command_succeeded(prepared, Some(action), notify_command)
     }
 
-    pub(crate) fn safe_disconnect() -> LocalOutput {
+    pub(crate) fn safe_disconnect(&self) -> LocalOutput {
+        let token = self.controller.authority_token();
         LocalOutput {
             sends: vec![
                 LocalSend {
                     frame: OutboundFrame::Stop,
-                    completion: SendCompletion::BestEffort,
+                    completion: SendCompletion::BestEffort(token),
                 },
                 LocalSend {
                     frame: OutboundFrame::Disconnect,
-                    completion: SendCompletion::BestEffort,
+                    completion: SendCompletion::BestEffort(token),
                 },
             ],
             ..LocalOutput::default()
@@ -596,7 +679,9 @@ impl LocalBackend {
         self.shutdown_started = true;
         self.cycle
             .interrupt("cycle interrupted by local backend shutdown");
-        let mut output = Self::safe_disconnect();
+        self.controller
+            .invalidate_for_gap("local backend shutdown accepted; physical outcome is unknown");
+        let mut output = self.safe_disconnect();
         output.events.push(BackendEvent::Update(self.state()));
         output
     }
@@ -604,7 +689,9 @@ impl LocalBackend {
     pub(crate) fn request_disconnect(&mut self) -> LocalOutput {
         self.cycle
             .interrupt("cycle interrupted by explicit device disconnect");
-        let mut output = Self::safe_disconnect();
+        self.controller
+            .invalidate_for_gap("explicit device disconnect accepted; physical outcome is unknown");
+        let mut output = self.safe_disconnect();
         output.events.push(BackendEvent::Update(self.state()));
         output
     }
@@ -630,7 +717,7 @@ impl LocalBackend {
         if let Some(minutes) = self.controller.next_timer_sync_at(now) {
             output.sends.push(LocalSend {
                 frame: OutboundFrame::TimerSync(minutes),
-                completion: SendCompletion::TimerSync,
+                completion: SendCompletion::TimerSync(self.controller.authority_token()),
             });
         }
         self.controller.update_elapsed_at(now);
@@ -781,7 +868,14 @@ impl LocalBackend {
         let (outcome, measurement) = if receipt_fenced {
             self.controller.report_received_at(report, received_at, now)
         } else {
-            self.controller.report_at(report, now)
+            #[cfg(test)]
+            {
+                self.controller.report_at(report, now)
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("unfenced reports are test-only")
+            }
         };
         if !outcome.accepted {
             return output;
@@ -859,17 +953,7 @@ impl LocalBackend {
     }
 
     fn state(&self) -> BackendState {
-        let mut capabilities = self.controller.capabilities();
-        if self.cycle.owns_orchestration() {
-            capabilities.start = false;
-            capabilities.resume = false;
-            capabilities.stop = true;
-            capabilities.show_stop = true;
-            capabilities.adjust = false;
-            capabilities.calibrate_voltage = false;
-            capabilities.calibrate_current = false;
-            capabilities.confirm_calibration = false;
-        }
+        let capabilities = self.cycle.capabilities(&self.controller, Instant::now());
         let mut cycle = self.cycle.status().clone();
         cycle.name.clone_from(&self.cycle_name);
         BackendState {
@@ -909,7 +993,7 @@ impl LocalBackend {
 
     fn send_failed(&mut self, send: LocalSend, error: &str) -> LocalOutput {
         let message = format!("failed to send {:?}: {error}", send.frame);
-        if !matches!(send.completion, SendCompletion::BestEffort) {
+        if !matches!(send.completion, SendCompletion::BestEffort(_)) {
             let mut reset_history = false;
             match send.completion {
                 SendCompletion::Command {
@@ -927,11 +1011,11 @@ impl LocalBackend {
                         self.cycle.interrupt_for_gap(message.clone());
                     }
                 }
-                SendCompletion::TimerSync => {
+                SendCompletion::TimerSync(_) => {
                     self.controller.disconnect(&message);
                     self.cycle.interrupt_for_gap(message.clone());
                 }
-                SendCompletion::BestEffort => unreachable!(),
+                SendCompletion::BestEffort(_) => unreachable!(),
             }
             self.connection = ServerConnectionState::Error;
             self.connection_error = Some(message.clone());
@@ -955,7 +1039,7 @@ impl LocalBackend {
 }
 
 impl LocalOutput {
-    fn extend(&mut self, mut other: Self) {
+    pub(crate) fn extend(&mut self, mut other: Self) {
         self.sends.append(&mut other.sends);
         self.events.append(&mut other.events);
     }
@@ -1090,6 +1174,66 @@ mod tests {
     }
 
     #[test]
+    fn receive_prefix_completion_must_recheck_expiry_before_terminal_progression() {
+        let mut backend = connected_backend();
+        let start = backend.start_cycle(cycle_request(recipe(vec![device_step(100)])));
+        finish_success(&mut backend, &start);
+        let now = Instant::now();
+        backend.report_at(report(ReportState::Active, 10), true, now);
+        backend.report_at(report(ReportState::Finished, 10), true, now);
+        backend.begin_receive_prefix();
+        let settled = now + web_time::Duration::from_secs(1);
+        backend.report_at(report(ReportState::Idle, 10), true, settled);
+        assert_eq!(backend.cycle.status().state, CycleState::Settling);
+        let output =
+            backend.finish_receive_prefix_at(settled + crate::controller::REPORT_FRESHNESS_TIMEOUT);
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
+        assert!(output.sends.is_empty());
+    }
+
+    #[test]
+    fn retired_cleanup_frames_cannot_write_or_fail_a_replacement_owner() {
+        let mut backend = connected_backend();
+        let old = backend.safe_disconnect();
+        backend.begin_connection();
+        backend.connection_established();
+        backend.report(report(ReportState::Idle, 0), true);
+        let start = backend.start_test(start_request(None));
+        finish_success(&mut backend, &start);
+        backend.report(report(ReportState::Active, 1), true);
+        for send in old.sends {
+            let (_, allowed) = backend.authorize_send(send);
+            assert!(!allowed, "retired cleanup cannot use the replacement wire");
+            let snapshot = backend.snapshot();
+            let completion = backend.finish_send(send, Err("old cleanup failed".to_owned()));
+            assert!(completion.events.is_empty() && completion.sends.is_empty());
+            assert_eq!(backend.snapshot(), snapshot);
+        }
+    }
+
+    #[test]
+    fn retired_timer_completions_cannot_mutate_a_replacement_owner() {
+        for result in [Ok(()), Err("old timer failed".to_owned())] {
+            let mut backend = connected_backend();
+            let old = LocalSend {
+                frame: OutboundFrame::TimerSync(1),
+                completion: SendCompletion::TimerSync(backend.controller.authority_token()),
+            };
+            backend.begin_connection();
+            backend.connection_established();
+            backend.report(report(ReportState::Idle, 0), true);
+            let start = backend.start_test(start_request(None));
+            finish_success(&mut backend, &start);
+            backend.report(report(ReportState::Active, 1), true);
+            let snapshot = backend.snapshot();
+            let completion = backend.finish_send(old, result);
+            assert!(completion.events.is_empty() && completion.sends.is_empty());
+            assert_eq!(backend.snapshot(), snapshot);
+            assert!(backend.controller.is_running_owned());
+        }
+    }
+
+    #[test]
     fn interrupted_cycle_allows_stop_retries_and_a_later_manual_stop() {
         use crate::controller::REPORT_FRESHNESS_TIMEOUT;
         let mut backend = connected_backend();
@@ -1179,9 +1323,12 @@ mod tests {
             duration_seconds: 30,
         }])));
         backend.report(report(ReportState::Active, 1), true);
-        assert_eq!(backend.controller.test().state, TestState::Idle);
+        assert_eq!(
+            backend.controller.test().state,
+            TestState::RecoveredUncertain
+        );
         assert!(backend.controller.device().active);
-        assert_eq!(backend.cycle.status().state, CycleState::Resting);
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
         let stop = backend.command(ApiCommand::Stop);
         assert!(matches!(
             send_frames(&stop).as_slice(),
@@ -1189,7 +1336,7 @@ mod tests {
         ));
         finish_success(&mut backend, &stop);
         assert_eq!(backend.controller.test().state, TestState::Stopping);
-        assert_eq!(backend.cycle.status().state, CycleState::Stopped);
+        assert_eq!(backend.cycle.status().state, CycleState::Interrupted);
         assert!(!backend.controller.is_running_owned());
     }
 
@@ -1384,10 +1531,8 @@ mod tests {
         assert!(!backend.authorize_send(old).1);
         let completion = backend.finish_send(old, Ok(()));
         assert!(
-            completion
-                .events
-                .iter()
-                .any(|event| matches!(event, BackendEvent::CommandError(_)))
+            completion.events.is_empty(),
+            "retired completion has no replacement-session effects"
         );
         assert!(!backend.controller.is_stopping());
     }
