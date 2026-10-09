@@ -513,14 +513,14 @@ pub(crate) struct ReceivedFrame {
 }
 
 impl ReceiveBuffer {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "server"))]
     pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
         self.receipts
             .extend(std::iter::repeat_n(web_time::Instant::now(), bytes.len()));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "server"))]
     pub(crate) fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -569,18 +569,19 @@ pub(crate) struct SerialIngress {
 
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "gui", feature = "server")))]
 impl SerialIngress {
+    #[cfg(feature = "server")]
     pub(crate) fn clear(&mut self) {
         self.buffer.clear();
         self.boundary = None;
         self.service_time = None;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "server"))]
     pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "server"))]
     pub(crate) fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
