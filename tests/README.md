@@ -3,6 +3,12 @@
 All fixtures are software-only; they must not open a real tester. CI runs them on
 every PR alongside the ordinary Rust tests and native container smoke jobs.
 
+The [normative physical-authority contract](../docs/physical-authority-model.md)
+defines the permanent [acceptance-test families](../docs/physical-authority-model.md#17-minimum-permanent-acceptance-test-families)
+and [physical-control PR checklist](../docs/physical-authority-model.md#18-physical-control-pr-checklist).
+The suites below provide software boundary evidence, not proof that physical
+hardware obeyed a command; documentation-only changes need no repeated battery test.
+
 ## Production server
 
 ```sh

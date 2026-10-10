@@ -13,6 +13,34 @@ Do not casually redesign settled architecture.
 
 ---
 
+# Normative physical-authority contract
+
+Before changing code involving controller lifecycle, physical authority,
+reports or parsing, observation freshness, serial/WebUSB receive handling,
+command preparation or completion, Stop/Disconnect, cycles, TimerSync,
+telemetry ownership, or server/direct physical command paths, read:
+
+[`docs/physical-authority-model.md`](docs/physical-authority-model.md)
+
+That document is the normative contract for physical-control behavior.
+Changes MUST preserve its invariants, state/authority rules, and required
+behavioral test coverage. UI capabilities, cached snapshots, persisted state,
+and transport connection status are not substitutes for backend authority.
+
+If intended behavior conflicts with the contract, deliberately review and
+update the specification and its tests as part of the change. Do not silently
+bypass the model or weaken it to match an implementation shortcut.
+
+Physical-authority and safety policy MUST be shared across server, native
+direct, and WebUSB backends. Keep transport-specific mechanics in adapters;
+do not independently duplicate ownership, freshness, command authorization,
+or Stop semantics in each backend.
+
+Use the physical-control PR checklist and acceptance-test families near the
+end of the document when planning and reviewing affected changes.
+
+---
+
 # Project architecture
 
 The major architectural principle is:
@@ -179,11 +207,19 @@ Semantics:
 
 Back-to-back Stop + Disconnect has been validated on real hardware.
 
+These describe command effects, not guarantees from a successful host write.
+Stop requires later eligible inactive evidence for physical confirmation;
+Disconnect or local transport retirement does not prove physical Stop.
+
 ---
 
 # Controller lifecycle invariants
 
 The controller distinguishes an owned physical run from uncertain recovered device activity.
+
+The sketches below summarize common transitions. The complete authority,
+pending-acquisition, terminal-evidence, and safety-action rules are defined in
+[`docs/physical-authority-model.md`](docs/physical-authority-model.md) and govern edge cases as well.
 
 Conceptually:
 
@@ -346,7 +382,7 @@ Natural Device-step progression is:
 ```text
 hardware Finished
 -> Settling
--> wait for a fresh confirmed inactive report with current == 0
+-> wait for a later fresh compatible inactive report with current == 0
 -> advance to next step
 ```
 

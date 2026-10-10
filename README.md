@@ -32,7 +32,8 @@ set `EBC_ALLOWED_ORIGIN` to one exact external origin.
 
 The default Cargo feature builds the desktop GUI. It talks to the operating
 system serial port directly and is suitable when the computer remains attached.
-Closing the application stops and disconnects the test during orderly shutdown.
+During orderly shutdown, closing the application attempts bounded Stop and
+Disconnect cleanup; host writes or transport retirement do not prove physical Stop.
 
 The native app can also connect to an independent remote server using a manual
 URL or the **Discovered servers** list; see [LAN discovery](#lan-discovery-mdns).
@@ -327,33 +328,45 @@ diagnostics, while samples, test status, run summaries, browser live capacity,
 and CSV use the normalized cumulative value (divide by 1000 for Ah). Existing
 CSV and JSON data without energy fields loads with zero energy.
 
-After a server restart or any serial observation gap, saved history and
-configuration are retained but ownership of a pending or running test is
-invalidated. The test is marked `recovered_uncertain`, device activity is
-unknown, and its clock is stopped. The server never automatically starts or
-blindly resumes it. An active hardware report keeps the run uncertain and does
-not advance backend elapsed time or energy because ownership of that interval
-cannot be proven. An inactive report resolves the run to `stopped`; the user can
-then start a fresh run or explicitly resume a stopped run. While recovery
-remains uncertain, Start, Resume, Adjust, and Calibration are rejected; explicit
-Stop and Disconnect remain available. Start and Stop are exposed as `starting`
-and `stopping` until hardware reports confirm their result. Because the protocol
-has no command acknowledgement, inactive reports received while Starting are
-treated as potentially buffered pre-command telemetry; only an active report
-confirms Start or Resume. Acquisition expires ten seconds after successful write
-completion, even if fresh inactive reports continue; later Active is unowned.
-Explicit Stop or earlier observation/connection loss also ends acquisition.
-Normal mode reports preserve the device's
-Idle and Finished states: Idle resolves an owned run to `stopped`, while Finished
-resolves it to `completed`. Firmware-inactive reports do not contain that
-distinction, so they immediately end Active control and freeze owned time/energy,
-retaining only terminal classification and one final counter reading. A later
-normal report can distinguish Stopped from Completed; a later Active cannot
-revive the old owner. Disconnects,
-serial errors, and uncertain recovery break the trapezoidal energy accumulator,
-so neither elapsed time nor energy is invented across an observation gap. A
-confirmed backend-owned start/resume starts a fresh clock at zero or resumes
-from the preserved elapsed value, respectively.
+An open physical connection does not prove inactivity or grant ownership.
+After a server restart or any physical observation gap, saved history and
+configuration are retained but physical ownership is invalidated. Potentially
+active work is marked `recovered_uncertain`, device activity is unknown, and
+the owned clock is stopped. Saved state cannot reclaim physical authority.
+Fresh reports restore observation, not ownership or interrupted cycle execution.
+An active recovered tester remains unowned; a fresh inactive report resolves
+recovered work to `stopped` and permits an explicit new Start or eligible Continue.
+While observation remains unknown, Start, Resume, Adjust, and Calibration are
+rejected; explicit safety Stop and Disconnect remain available.
+
+Start and Continue require explicit intent, an authorized physical write, and
+then a fresh, causally eligible Active report in the expected mode. Pending
+acquisition is bounded to ten seconds after successful write completion; at
+equality expiry wins. Explicit Stop or earlier observation/connection loss also
+ends acquisition. Eligible inactive reports may describe the previous mode;
+they update observation but neither confirm nor extend acquisition. Pre-write
+or tied-fence reports cannot confirm the command. A first Active report may
+have zero current. `starting` and `stopping` express pending intent, not a
+confirmed physical effect.
+
+Compatible ordinary Idle ends an owned run as `stopped`; Finished ends it as
+`completed`, which remains latched across later Idle. Firmware-inactive ends
+Active control ownership and freezes owned time/energy but cannot distinguish
+those terminal reasons. Only limited terminal classification and one final
+counter reading remain attributable; a later compatible ordinary report can
+resolve Stopped versus Completed. A public `running` status during that wait
+is not continuing control authority: Start/Continue remains blocked until
+resolution or explicit cancellation. Subsequent Active without a new explicit
+acquisition remains unowned. Cycle Finished enters Settling and progression
+waits for a **later** fresh, compatible inactive report with zero current; the
+Finished report itself cannot satisfy that barrier. Firmware-inactive can
+satisfy the later barrier without generating a sample row.
+
+Recovered or unowned intervals never contribute owned metrics or bridge server
+energy integration. Explicit Continue begins a new attributable segment while
+retaining legitimate prior owned totals and elapsed time. The owned clock starts
+at confirming Active receipt for a new Start, or resumes the preserved elapsed
+value for Continue, never counting the unowned gap.
 
 Start and Calibration require telemetry from the current serial connection;
 persisted or pre-disconnect voltage/activity values are never accepted as proof
@@ -369,8 +382,9 @@ When physical observation is unknown, each explicit Stop retry sends a real
 Stop frame, even if an earlier write succeeded and the test still says
 `stopping`. A subsequent Active report also permits a new explicit retry;
 immediate duplicate intent without a new report is deduplicated while observation
-is fresh. A successful write is not confirmation of inactivity. An interrupted
-cycle does not own a later manual run or intercept its Stop. Manual Start is
+is fresh, bounded by its original freshness deadline and never renewed by a
+no-frame acknowledgement. A successful write is not confirmation of inactivity.
+An interrupted cycle does not own a later manual run or intercept its Stop. Manual Start is
 rejected while a cycle owns orchestration, including Rest and Settling.
 
 This safety Stop policy also applies to a newly opened connection before its
@@ -385,11 +399,24 @@ visible, cycles interrupt, and returning to the expected mode does not reclaim
 the run. Explicit Stop remains available. These rules are shared by server,
 native direct, and WebUSB backends. See [boundary regression tests](tests/README.md).
 
+### Physical-control safety model
+
+[Physical-authority model](docs/physical-authority-model.md) defines the
+normative rules for physical observation, freshness, ownership, command
+confirmation, Stop/Disconnect, cycle authority, telemetry, and transport
+behavior. Changes to controller, cycle, report, transport, or physical-command
+behavior must preserve that contract across server, native direct, and WebUSB
+backends.
+
 Fragmented input retains the oldest byte's conservative receipt bound. Serial
 driver backlog and outstanding WebUSB reads cannot become post-command evidence
 merely because processing occurred later. Already-available input is reconciled
-in order before ordinary wire actions or autonomous progression. Suspension or
-uncertain receive timing revokes authority instead of refreshing it.
+as a finite FIFO prefix before ordinary wire actions or autonomous progression,
+without waiting for future reports or delaying explicit safety Stop behind that
+barrier. Serial ingress uses a preceding serviced/drained boundary and WebUSB
+uses transfer issuance as conservative receipt bounds, not exact hardware
+arrival timestamps. Suspension or uncertain receive timing revokes authority
+instead of refreshing it.
 
 Physical writes and WebUSB resource cleanup have bounded host-side handling
 (at most ten seconds per attempt while runnable). Timeout retires the uncertain
@@ -522,9 +549,11 @@ not replace a real-device check.
 10. During a controlled multi-minute run, compare the tester's display and cutoff behavior with and without `0x0A` timer sync before relying on it operationally.
 11. Exercise charge, constant-power, adjustment, resume, and calibration only with appropriate instrumentation and safe limits.
 
-The available protocol documentation is ambiguous about serial parity. This
-project preserves the known-working odd-parity implementation; deployment work
-does not change protocol behavior.
+The validated application protocol uses **9600 8O1** (odd parity); see the
+[frame reference](FRAMES.md). Older even-parity research claims must not be
+applied to normal application control. Bootloader/recovery settings are a
+separate, not independently validated context in the
+[reverse-engineering notes](REVERSE_ENGINEERING.md).
 
 ## LAN discovery (mDNS)
 

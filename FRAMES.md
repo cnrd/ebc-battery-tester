@@ -6,9 +6,16 @@ the initial investigation was this blog post, though it is incomplete and contai
 some inaccuracies: <https://pop.fsck.pl/hardware/zketech-ebc-a20.html>
 
 The device communicates over a **CH340 USB-serial adapter** (VID `0x1A86`,
-PID `0x7523`) at **9600 baud, 8E1** (8 data bits, even parity, 1 stop bit).
+PID `0x7523`) at **9600 baud, 8O1** (8 data bits, odd parity, 1 stop bit)
+for validated normal application control.
 There is no USB HID or custom USB class involved. It is plain serial over USB.
-Note that the parity is **even (E)**, not the more common none (8N1). Using the wrong parity setting will result in garbled or no communication.
+Earlier external references suggested even parity, but tested application hardware
+requires **odd (O)** parity. Bootloader/recovery research is a separate context;
+see [reverse-engineering notes](REVERSE_ENGINEERING.md#connection).
+
+This is a wire-format reference, not authorization to issue a command. The
+[physical-authority model](docs/physical-authority-model.md) governs observation,
+ownership, confirmation, Stop/Disconnect, cycles, and telemetry in the application.
 
 Some fields remain unknown and are noted as such.
 
@@ -56,7 +63,7 @@ Every message in both directions uses the same wrapper:
 | --- | --- | --- |
 | First byte | Start of frame (SOF) | Always `0xfa` |
 | Middle bytes | Payload | Command-specific |
-| Second-to-last byte | Checksum | XOR of all payload bytes |
+| Second-to-last byte | Checksum | Payload XOR; accepted inbound variation below |
 | Last byte | End of frame (EOF) | Always `0xf8` |
 
 - **Host → device** frames are always **10 bytes** (7-byte payload).
@@ -64,12 +71,28 @@ Every message in both directions uses the same wrapper:
 
 ### Checksum
 
-The checksum is computed by XOR-ing every payload byte together (not including
-the SOF, EOF, or the checksum byte itself):
+The ordinary checksum is computed by XOR-ing every payload byte together
+(not including the SOF, EOF, or the checksum byte itself):
 
 ```text
 checksum = payload[0] ^ payload[1] ^ payload[2] ^ ... ^ payload[N]
 ```
+
+Outbound frames always use ordinary XOR of the seven payload bytes. For a
+19-byte inbound frame `b`, let `x` be XOR of its 16 payload bytes `b[1..17)`;
+the accepted checksum at `b[17]` is exactly:
+
+```text
+b[17] == x OR (x >= 0xF0 AND b[17] == x - 0xF0)
+```
+
+The second form is the validated firmware-3.0.2 high-XOR variation. It applies
+to accepted ordinary and firmware report types, not only firmware-report messages.
+For example, XOR `0xFA` accepts checksum `0xFA` or `0x0A`, but not `0x0B`.
+For XOR below `0xF0`, only ordinary XOR is accepted. This is bounded subtraction,
+not wrapping subtraction, an arbitrary modulo rule, or permission to accept
+corrupt frames. Framing and supported report-type checks still apply; invalid
+checksums cannot refresh observation or progress a cycle.
 
 **Example:** Connect command `fa 05 00 00 00 00 00 00 05 f8`:
 
@@ -133,9 +156,13 @@ range:
 
 ## Typical session flow
 
-The device streams status reports continuously as long as it has power —
-it does not wait to be asked. The report type changes to reflect whatever the
-device is currently doing.
+Application captures show periodic unsolicited status reports; the device does
+not require a request for each report. The report type reflects the observed
+operation. The normal observed cadence is approximately **one report every two
+seconds**, not ten reports per second. This is measured behavior, not a universal
+firmware timing or continuous-delivery guarantee. The application's separate
+**ten-second monotonic observation freshness policy** bounds software authority;
+it is not a protocol report interval or a hardware acknowledgement deadline.
 
 When the PC first connects, the device sends both the firmware report and the
 normal mode-specific status report interleaved for approximately 15 seconds, then
@@ -150,22 +177,32 @@ dev  → fa 00/01/02 ...                  Idle report      ┘ then
 dev  → fa 00/01/02 ...                  Idle report only (firmware report stops)
 host → fa 01 00 14 01 5a 00 00 4b f8    Start CC discharge: 200 mA, 3.3 V cutoff
 dev  → fa 0a ...                        CC active report (live current/voltage/mAh)
-dev  → fa 0a ...                        CC active report (repeats ~10×/sec)
+dev  → fa 0a ...                        CC active report (observed ~2 s cadence)
 host → fa 0a 00 01 00 00 00 00 0b f8    Timer sync after 1 minute
 dev  → fa 0a ...                        CC active report continues
 ...
 dev  → fa 14 ...                        CC finished (cutoff voltage reached)
-dev  → fa 14 ...                        Finished report continues until stopped
+dev  → fa 00 ...                        Idle may retain previous nonzero current
+dev  → fa 00 ...                        Later Idle with current 0 (settled)
 host → fa 06 00 00 00 00 00 00 06 f8    Disconnect
 ```
 
 Key points:
 
-- Reports never stop. The device always streams and the report type just changes
+- Reports are normally periodic; silence or buffering cannot preserve authority indefinitely
 - The host knows an operation finished when the cmd byte changes to the
-  "finished" value (e.g. `0x14` for CC discharge)
+  "finished" value (e.g. `0x14` for CC discharge), provided the report is valid,
+  fresh, causally eligible, and compatible with the owned operation
 - If the user stops early, the host sends Stop (`0x02`), which switches the
-  device back to sending idle reports
+  device back to sending idle reports when obeyed; a successful host write is
+  not physical confirmation. Disconnect does not prove physical Stop
+
+Inactive status can retain nonzero current. Automated cycle progression requires
+a later fresh compatible inactive report with current exactly zero; Finished
+alone does not satisfy that settling barrier. Conversely, Active with current
+zero may legitimately confirm Start. An open connection alone proves neither
+inactivity nor ownership, and explicit safety Stop remains available when
+inactivity is unproven.
 
 ## Outbound frames (host → device)
 
@@ -407,10 +444,11 @@ current state of that mode. Each mode has three states:
 - **Finished**: the operation ended because a cutoff condition was met (voltage,
   current, or time limit)
 
-The host uses the command byte to update the UI, show the correct measurements,
-and know when to stop the elapsed timer. The remaining payload bytes carry the
-live measurements (current, voltage, capacity) plus the parameters the device is
-operating with (so the host always knows what settings are active).
+The command byte supplies physical observation to the backend; freshness,
+causality, mode compatibility, and ownership determine its control and metric
+effects. The remaining payload bytes carry measurements (current, voltage,
+capacity) and reported parameters. Parameter echoes alone do not prove command
+success or exact physical settings.
 
 ### Firmware report
 
@@ -598,9 +636,12 @@ stopped on its own because a cutoff condition was met.
 
 **Firmware report command bytes:**
 
-The firmware report uses a separate set of command bytes that encode which mode
-was active at the time the PC connected. There is no "finished" state for
-firmware reports.
+The firmware report uses a separate set of command bytes that encode reported
+mode and activity. There is no "finished" state for firmware reports: an inactive
+firmware report ends Active control ownership but leaves the terminal reason
+unresolved until compatible ordinary evidence distinguishes Idle from Finished.
+Its validated physical fields may update observation and owned metric inputs;
+it generates no ordinary run or cycle sample row.
 
 | Cmd byte | Meaning |
 | --- | --- |
