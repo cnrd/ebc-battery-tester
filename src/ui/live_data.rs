@@ -31,7 +31,12 @@ pub(crate) fn ui(session: &DeviceSession, ui: &mut egui::Ui) {
         ui.end_row();
 
         ui.label("Capacity:");
-        ui.label(format!("{} mAh", session.live_milli_ampere_hours));
+        ui.label(format!(
+            "{} mAh",
+            session
+                .live_milli_ampere_hours
+                .map_or_else(|| "Unknown".to_owned(), |value| value.to_string())
+        ));
         ui.end_row();
 
         ui.label("Time:");

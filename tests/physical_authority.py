@@ -47,6 +47,7 @@ class Rig:
         self.url = f"http://127.0.0.1:{port}/api"
         env = dict(os.environ, EBC_SERIAL_PORT=os.ttyname(self.slave), EBC_HTTP_ADDR=f"127.0.0.1:{port}",
                    EBC_DATA_DIR=str(directory / "data"), EBC_STATIC_DIR=str(directory), EBC_MDNS="false", EBC_MOCK="false")
+        self.binary, self.env = binary, env
         self.log = (directory / "server.log").open("wb")
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
@@ -125,6 +126,21 @@ class Rig:
 
     def count(self, command):
         return sum(self.wire[i + 1] == command for i in range(0, len(self.wire) - 9, 10))
+
+    def restart(self):
+        self.process.terminate()
+        self.process.wait(timeout=5)
+        before = {command: self.count(command) for command in (1, 8, 17, 24, 33, 40)}
+        self.process = subprocess.Popen([self.binary], env=self.env, stdout=self.log, stderr=self.log)
+        for _ in range(100):
+            try:
+                self.status()
+                break
+            except OSError:
+                time.sleep(.05)
+        else:
+            raise AssertionError("server did not restart")
+        assert {command: self.count(command) for command in before} == before
 
     def close(self):
         self.process.terminate()
@@ -402,6 +418,145 @@ def closing_classification(rig):
     assert rig.status()["test"]["state"] == "starting"
 
 
+def archived_capacity(rig, run_id, capacity, sample_count, state):
+    code, runs = rig.request("/runs")
+    assert code == 200, (code, runs)
+    summary = next(run for run in runs if run["id"] == run_id)
+    assert summary["capacity_mah"] == capacity, summary
+    assert summary["sample_count"] == sample_count and summary["state"] == state, summary
+    code, detail = rig.request("/runs/" + run_id)
+    assert code == 200 and detail["summary"] == summary, (code, detail)
+    assert len(detail["samples"]) == sample_count, detail
+    disk = json.loads((rig.directory / "data/runs" / f"{run_id}.json").read_text())
+    assert disk == summary, disk
+    return summary
+
+
+def unowned_archive(rig, cycle):
+    rig.observe(0, 40)
+    if cycle:
+        step = dict(type="device", config=CONFIGS[0], completion="hardware")
+        rig.post("/cycle/start", dict(recipe=dict(steps=[step], repeat_count=1)))
+    else:
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    run_id = rig.status()["current_run"]["id"]
+    rig.observe(11, 50)  # First Active contradicts CC: never owned.
+    active = rig.status()
+    assert active["test"]["state"] == "recovered_uncertain"
+    assert active["test"]["capacity_mah"] is None and active["history"] == []
+    rig.observe(1, 51)
+    live = rig.status()
+    assert live["test"]["state"] == "stopped"
+    assert live["test"]["result"] == "physical device mode contradicts the owned test"
+    assert live["test"]["capacity_mah"] is None and live["history"] == []
+    assert live["device"]["capacity_mah"] == 51 and rig.count(10) == 0
+    if cycle:
+        assert live["cycle"]["state"] == "interrupted"
+        execution_id = live["cycle"]["execution_id"]
+        assert rig.request("/runs")[1] == []  # Actual interrupted-child boundary.
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    summary = archived_capacity(rig, run_id, None, 0, "stopped")
+    assert summary["config"] == CONFIGS[0]
+    if cycle:
+        assert summary["name"] is None
+        assert summary["cycle"] == dict(execution_id=execution_id, repeat_index=0, step_index=0)
+        code, parent = rig.request("/cycles/" + execution_id)
+        assert code == 200 and parent["child_runs"] == [summary], parent
+        assert parent["summary"]["child_run_count"] == 1
+        assert all(row["test_capacity_mah"] is None for row in parent["samples"])
+        # New manual work is independent of the interrupted parent and child.
+        later_id = rig.status()["current_run"]["id"]
+        assert later_id != run_id
+        rig.observe(10, 7)
+        rig.observe(20, 8)
+        later = archived_capacity(rig, later_id, 8, 1, "completed")
+        assert later["cycle"] is None
+    else:
+        assert summary["cycle"] is None
+    rig.restart()
+    assert archived_capacity(rig, run_id, None, 0, "stopped") == summary
+    if cycle:
+        assert rig.request("/cycles/" + execution_id)[1]["child_runs"] == [summary]
+        assert archived_capacity(rig, later_id, 8, 1, "completed") == later
+    else:
+        assert rig.status()["test"]["capacity_mah"] is None
+
+
+def firmware_only_archive(rig, cycle, capacity):
+    rig.observe(0, 40)
+    if cycle:
+        step = dict(type="device", config=CONFIGS[0], completion="hardware")
+        rig.post("/cycle/start", dict(recipe=dict(steps=[step], repeat_count=1)))
+    else:
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    run_id = rig.status()["current_run"]["id"]
+    rig.observe(110, capacity)
+    active = rig.status()
+    assert active["test"]["state"] == "running" and active["history"] == []
+    assert active["test"]["capacity_mah"] == capacity
+    closing = capacity + (1 if capacity else 0)
+    rig.observe(100, closing)  # Legitimately attributed closing input, still no row.
+    assert rig.status()["test"]["capacity_mah"] == closing
+    rig.observe(20, 50)  # Resolve reason, not an additional attributable counter.
+    assert rig.status()["test"]["state"] == "completed"
+    assert rig.status()["test"]["capacity_mah"] == closing and rig.status()["history"] == []
+    rig.observe(0, 51)
+    summary = archived_capacity(rig, run_id, closing, 0, "completed")
+    if cycle:
+        assert rig.status()["cycle"]["state"] == "completed"
+        assert rig.request("/cycles/" + summary["cycle"]["execution_id"])[1]["child_runs"] == [summary]
+    rig.restart()
+    assert archived_capacity(rig, run_id, closing, 0, "completed") == summary
+    assert rig.status()["test"]["capacity_mah"] == closing
+
+
+def terminal_capacity_archive(rig, cycle):
+    rig.observe()
+    if cycle:
+        step = dict(type="device", config=CONFIGS[0], completion="hardware")
+        rig.post("/cycle/start", dict(recipe=dict(steps=[step], repeat_count=1)))
+    else:
+        rig.post("/test/start", dict(config=CONFIGS[0]))
+    run_id = rig.status()["current_run"]["id"]
+    rig.observe(10, 10)
+    for state, capacity, current in [(20, 12, 10), (0, 13, 10), (0, 14, 0)]:
+        os.write(rig.master, frame(state, capacity, current))
+        rig.wait(lambda: rig.status()["device"]["capacity_mah"] == capacity, "terminal counter")
+        status = rig.status()
+        assert status["test"]["state"] == "completed" and status["test"]["capacity_mah"] == 12
+        assert len(status["history"]) == 1
+        if cycle:
+            assert status["cycle"]["state"] == ("completed" if current == 0 else "settling")
+    summary = archived_capacity(rig, run_id, 12, 1, "completed")
+    rig.restart()
+    assert archived_capacity(rig, run_id, 12, 1, "completed") == summary
+    assert rig.status()["test"]["capacity_mah"] == 12
+
+
+def continue_capacity_archive(rig):
+    rig.observe()
+    rig.post("/test/start", dict(config=CONFIGS[0]))
+    run_id = rig.status()["current_run"]["id"]
+    rig.observe(10, 10)
+    rig.post("/test/stop")
+    rig.observe(0, 10)
+    archived_capacity(rig, run_id, 10, 1, "stopped")
+    rig.observe(0, 50)  # Unowned growth must not be imported by explicit Continue.
+    assert rig.status()["test"]["capacity_mah"] == 10
+    rig.post("/test/resume")
+    rig.wait(lambda: rig.count(8) == 1, "actual Continue")
+    rig.observe(10, 51)
+    status = rig.status()
+    assert status["current_run"]["id"] == run_id and status["test"]["capacity_mah"] == 11
+    rig.post("/test/stop")
+    rig.observe(0, 51)
+    summary = archived_capacity(rig, run_id, 11, 2, "stopped")
+    assert [row["capacity_mah"] for row in rig.request("/runs/" + run_id)[1]["samples"]] == [10, 11]
+    rig.restart()
+    assert archived_capacity(rig, run_id, 11, 2, "stopped") == summary
+    assert rig.status()["test"]["capacity_mah"] == 11
+
+
 def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
     scratch = pathlib.Path(sys.argv[2]).resolve()
@@ -422,6 +577,11 @@ def main():
               for a in range(3) for b in range(3) if a != b for state in (0, 20, 100) for cycle in (False, True)]
     cases.append(("continue-segments", continue_segments, ()))
     cases.append(("closing-classification", closing_classification, ()))
+    cases += [(f"unowned-archive-{cycle}", unowned_archive, (cycle,)) for cycle in (False, True)]
+    cases += [(f"firmware-only-archive-{cycle}-{capacity}", firmware_only_archive, (cycle, capacity))
+              for cycle in (False, True) for capacity in (0, 10)]
+    cases += [(f"terminal-capacity-archive-{cycle}", terminal_capacity_archive, (cycle,)) for cycle in (False, True)]
+    cases.append(("continue-capacity-archive", continue_capacity_archive, ()))
 
     def run(case):
         name, test, args = case

@@ -572,10 +572,9 @@ impl Persistence {
             config: snapshot.test.config,
             elapsed_seconds: snapshot.test.elapsed_seconds,
             result: snapshot.test.result.clone(),
-            capacity_mah: snapshot
-                .test
-                .capacity_mah
-                .or_else(|| snapshot.device.capacity_mah.map(u64::from)),
+            // Only the controller can attribute a counter to this run, including
+            // firmware-only/closing metrics that have no ordinary sample row.
+            capacity_mah: snapshot.test.capacity_mah,
             energy_wh: snapshot.test.energy_wh,
             model: snapshot.device.model.clone(),
             firmware_version: snapshot.device.firmware_version.clone(),

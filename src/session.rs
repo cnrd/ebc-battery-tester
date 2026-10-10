@@ -132,7 +132,7 @@ pub(crate) struct DeviceSession {
     pub(crate) model_name: Option<String>,
     pub(crate) live_voltage_mv: u16,
     pub(crate) live_current_ma: u16,
-    pub(crate) live_milli_ampere_hours: u64,
+    pub(crate) live_milli_ampere_hours: Option<u64>,
     pub(crate) live_energy_wh: f64,
     pub(crate) history: history::HistoryState,
     pub(crate) samples: Vec<Sample>,
@@ -171,7 +171,7 @@ impl Default for DeviceSession {
             model_name: None,
             live_voltage_mv: 0,
             live_current_ma: 0,
-            live_milli_ampere_hours: 0,
+            live_milli_ampere_hours: None,
             live_energy_wh: 0.0,
             history: history::HistoryState::default(),
             samples: Vec::new(),
@@ -562,11 +562,7 @@ impl DeviceSession {
         self.model_name = update.device.model;
         self.live_voltage_mv = update.device.voltage_mv.unwrap_or(0);
         self.live_current_ma = update.device.current_ma.unwrap_or(0);
-        self.live_milli_ampere_hours = update
-            .test
-            .capacity_mah
-            .or_else(|| update.device.capacity_mah.map(u64::from))
-            .unwrap_or(0);
+        self.live_milli_ampere_hours = update.test.capacity_mah;
         self.live_energy_wh = update.test.energy_wh;
         self.current_device_mode = update.device.mode;
         self.current_test_config = update.test.config;
@@ -599,7 +595,7 @@ impl DeviceSession {
         }
         self.live_voltage_mv = sample.voltage_mv;
         self.live_current_ma = sample.current_ma;
-        self.live_milli_ampere_hours = sample.capacity_mah;
+        self.live_milli_ampere_hours = Some(sample.capacity_mah);
         self.live_energy_wh = sample.energy_wh;
         self.current_device_mode = Some(sample.mode);
         self.elapsed_seconds = sample.elapsed_seconds;
@@ -746,7 +742,7 @@ mod tests {
             ..AuthoritativeSnapshot::default()
         });
         assert_eq!(session.samples, vec![sample("new-run", 0, 12)]);
-        assert_eq!(session.live_milli_ampere_hours, 100_005);
+        assert_eq!(session.live_milli_ampere_hours, Some(100_005));
         assert!(session.mode_on);
         assert!(session.can_adjust());
     }
@@ -785,6 +781,120 @@ mod tests {
         assert_eq!(session.samples.len(), 1);
         session.apply_sample(sample("new", 0, 2));
         assert_eq!(session.samples, vec![sample("new", 0, 2)]);
+        assert_eq!(session.live_milli_ampere_hours, Some(5));
+    }
+
+    #[test]
+    fn capacity_projection_preserves_owned_unknown_zero_and_no_row_metrics() {
+        for transport_mode in [TransportMode::Direct, TransportMode::Remote] {
+            let mut session = DeviceSession {
+                transport_mode,
+                ..DeviceSession::default()
+            };
+            assert_eq!(session.live_milli_ampere_hours, None);
+            // Deliberately keep raw capacity different from every owned value.
+            // A snapshot need not contain an ordinary row to supply owned metrics.
+            for capacity_mah in [None, Some(0), Some(11), Some(100_005), None] {
+                let snapshot = AuthoritativeSnapshot {
+                    device: DeviceState {
+                        capacity_mah: Some(51),
+                        voltage_mv: Some(4000),
+                        current_ma: Some(100),
+                        activity_known: true,
+                        firmware_version: Some("3.0.2".to_owned()),
+                        ..DeviceState::default()
+                    },
+                    test: TestStatus {
+                        capacity_mah,
+                        ..TestStatus::default()
+                    },
+                    ..AuthoritativeSnapshot::default()
+                };
+                session.apply_snapshot(snapshot.clone());
+                assert_eq!(session.live_milli_ampere_hours, capacity_mah);
+                assert!(session.samples.is_empty());
+                assert_eq!(session.live_voltage_mv, 4000);
+                assert_eq!(session.live_current_ma, 100);
+                assert_eq!(session.firmware_version.as_deref(), Some("3.0.2"));
+                // Incremental updates use the same projection, not a second fallback.
+                session.apply_state(BackendState {
+                    update: SnapshotUpdate::from(&snapshot),
+                });
+                assert_eq!(session.live_milli_ampere_hours, capacity_mah);
+                assert_eq!(snapshot.device.capacity_mah, Some(51));
+            }
+        }
+    }
+
+    #[test]
+    fn capacity_projection_tracks_controller_closing_and_continue_segments() {
+        use crate::controller::{ControllerMode, DeviceReport, ReportState, TestController};
+
+        let report = |state, capacity_mah| DeviceReport {
+            mode: device::DeviceMode::DischargeConstantCurrent,
+            state,
+            voltage_mv: 4000,
+            current_ma: 100,
+            capacity_mah,
+            model: "EBC-A20".to_owned(),
+            firmware_version: None,
+        };
+        let config = TestConfiguration::DischargeConstantCurrent {
+            current_ma: 100,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        };
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for resume in [false, true] {
+                let now = Instant::now();
+                let mut controller = TestController::new(mode);
+                controller.begin_connection("capacity projection test");
+                controller.connection_established_at(now);
+                controller.report_at(report(ReportState::Idle, 40), now);
+                let start = controller
+                    .prepare_command(ApiCommand::Start(config))
+                    .unwrap_or_else(|error| panic!("failed to prepare Start: {error}"));
+                controller.commit_command(start, None);
+                let mut session = DeviceSession::default();
+                let mut project = |controller: &TestController, expected| {
+                    session.apply_snapshot(AuthoritativeSnapshot {
+                        device: controller.device().clone(),
+                        test: controller.test().clone(),
+                        ..AuthoritativeSnapshot::default()
+                    });
+                    assert_eq!(session.live_milli_ampere_hours, expected);
+                    assert_eq!(
+                        session.live_milli_ampere_hours,
+                        controller.test().capacity_mah
+                    );
+                };
+                project(&controller, None);
+                controller.report_at(report(ReportState::Active, 10), now);
+                project(&controller, Some(10));
+                if resume {
+                    controller.report_at(report(ReportState::Idle, 10), now);
+                    controller.report_at(report(ReportState::Idle, 50), now);
+                    project(&controller, Some(10));
+                    let command = controller
+                        .prepare_command(ApiCommand::Resume)
+                        .unwrap_or_else(|error| panic!("failed to prepare Continue: {error}"));
+                    controller.commit_command(command, None);
+                    project(&controller, Some(10));
+                    controller.report_at(report(ReportState::Active, 51), now);
+                    project(&controller, Some(11));
+                    controller.report_at(report(ReportState::Idle, 51), now);
+                    project(&controller, Some(11));
+                } else {
+                    controller.report_at(report(ReportState::Finished, 12), now);
+                    project(&controller, Some(12));
+                    for raw in [13, 14] {
+                        controller.report_at(report(ReportState::Idle, raw), now);
+                        project(&controller, Some(12));
+                        assert_eq!(controller.test().state, TestState::Completed);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
