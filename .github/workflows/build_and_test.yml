@@ -1,5 +1,8 @@
 name: Build and Test
 
+env:
+  TRUNK_VERSION: 0.21.14
+
 on:
   push:
     branches:
@@ -7,6 +10,14 @@ on:
   pull_request:
     branches:
       - main
+
+permissions:
+  contents: read
+
+# Cancel the entire older main pipeline, not just its final push. PRs are isolated.
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   fmt:
@@ -38,8 +49,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check native
         run: cargo check --quiet --workspace --all-targets
+      - name: Check headless server without GUI dependencies
+        run: cargo check --quiet --no-default-features --features server --bin ebc-server
       - name: Check wasm
-        run: cargo check --quiet --workspace --all-features --lib --target wasm32-unknown-unknown
+        run: cargo check --quiet --lib --target wasm32-unknown-unknown
 
   clippy:
     runs-on: ubuntu-latest
@@ -57,9 +70,11 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Clippy native
-        run: cargo clippy --quiet --workspace --all-targets --all-features -- -D warnings -W clippy::all
+        run: cargo clippy --quiet --workspace --all-targets -- -D warnings -W clippy::all
+      - name: Clippy headless server
+        run: cargo clippy --quiet --no-default-features --features server --all-targets -- -D warnings -W clippy::all
       - name: Clippy wasm
-        run: cargo clippy --quiet --workspace --all-features --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::all
+        run: cargo clippy --quiet --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::all
 
   test:
     runs-on: ubuntu-latest
@@ -75,9 +90,21 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --quiet --workspace --all-targets --all-features
+        run: cargo test --quiet --workspace --all-targets
+      - name: Run headless server tests
+        run: cargo test --quiet --no-default-features --features server --all-targets
       - name: Run doc tests
         run: cargo test --quiet --workspace --doc
+      - name: Build production server for physical-authority regressions
+        run: cargo build --locked --no-default-features --features server --bin ebc-server
+      - name: Production HTTP and PTY physical-authority regressions
+        run: python tests/physical_authority.py target/debug/ebc-server "$RUNNER_TEMP/physical-authority"
+      - name: Preserve physical-authority failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-authority-failure
+          path: ${{ runner.temp }}/physical-authority
 
   trunk-build:
     runs-on: ubuntu-latest
@@ -92,6 +119,43 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Download and install Trunk binary
-        run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+        run: wget -qO- "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xzf-
       - name: Build
-        run: ./trunk build
+        run: EBC_WASM_DEFAULT_TRANSPORT=webusb ./trunk build --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install browser test dependencies
+        run: npm ci --prefix tests/webusb
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+      - name: Prepare worker visibility adapter in disposable source copy
+        run: python tests/webusb/prepare.py "$RUNNER_TEMP/webusb-source"
+      - name: Build actual WebUSB worker for Promise-boundary regressions
+        working-directory: ${{ runner.temp }}/webusb-source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/webusb-target
+        run: EBC_WASM_DEFAULT_TRANSPORT=remote "$GITHUB_WORKSPACE/trunk" build --locked --dist "$RUNNER_TEMP/webusb-dist"
+      - name: Browser worker and USB Promise physical-authority regressions
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: node tests/webusb/run.mjs "$RUNNER_TEMP/webusb-dist"
+
+  container-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --test .github/scripts/*.test.mjs
+
+  docker-build:
+    uses: ./.github/workflows/container_validate.yml
+
+  container-publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'cnrd/ebc-battery-tester'
+    needs: [fmt, check, clippy, test, trunk-build, container-policy, docker-build]
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/container_publish.yml

@@ -1,0 +1,198 @@
+name: Publish production container
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/cnrd/ebc-battery-tester
+
+jobs:
+  publish-amd64:
+    if: github.repository == 'cnrd/ebc-battery-tester' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container_publish_platform.yml
+    with:
+      arch: amd64
+
+  publish-arm64:
+    if: github.repository == 'cnrd/ebc-battery-tester' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container_publish_platform.yml
+    with:
+      arch: arm64
+
+  publish:
+    # Defense in depth: callers cannot enable publication for PRs, forks or wip.
+    if: github.repository == 'cnrd/ebc-battery-tester' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [publish-amd64, publish-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate release again before publication
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash .github/scripts/validate-release.sh
+      - name: Generate explicit image tag policy
+        id: policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(node .github/scripts/container-tags.mjs tags "$GITHUB_REF" "$GITHUB_SHA")
+          VERSION=$(node .github/scripts/container-tags.mjs version)
+          {
+            echo 'tags<<EOF'
+            printf '%s\n' "$TAGS" | sed 's/^/type=raw,value=/'
+            echo 'EOF'
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+      - name: OCI metadata (no implicit latest)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: ${{ steps.policy.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/cnrd/ebc-battery-tester
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.policy.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.description=Headless EBC Battery Tester server with remote browser UI
+      - name: Configure Docker Hub cache before builder bootstrap
+        run: |
+          sudo python3 .github/scripts/configure-docker-mirror.py
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}'
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: .github/buildkitd.toml
+          driver-opts: image=moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Log in to GHCR with the workflow token
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble native platform digests into the multiarchitecture SHA image
+        id: push
+        env:
+          AMD64_DIGEST: ${{ needs.publish-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.publish-arm64.outputs.digest }}
+          VERSION: ${{ steps.policy.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AMD64_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$ARM64_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$AMD64_DIGEST" != "$ARM64_DIGEST"
+          docker buildx imagetools create \
+            --tag "$IMAGE:sha-$GITHUB_SHA" \
+            --metadata-file "$RUNNER_TEMP/manifest-metadata.json" \
+            "$IMAGE@$AMD64_DIGEST" "$IMAGE@$ARM64_DIGEST"
+          DIGEST=$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/manifest-metadata.json")
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" --raw > "$RUNNER_TEMP/manifest.json"
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Image}}' > "$RUNNER_TEMP/configs.json"
+          node .github/scripts/check-container-manifest.mjs \
+            "$RUNNER_TEMP/manifest.json" "$RUNNER_TEMP/configs.json" \
+            "$AMD64_DIGEST" "$ARM64_DIGEST" "$GITHUB_SHA" "$VERSION"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Attest the multiarchitecture manifest digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Assign main aliases only after provenance succeeds
+        if: github.ref == 'refs/heads/main'
+        env:
+          PUBLISH_TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/main)
+              # Also protect against manually rerunning an obsolete main run.
+              MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
+              test "$MAIN_SHA" = "$GITHUB_SHA" || {
+                echo 'Refusing to move rolling aliases from an obsolete main commit' >&2
+                exit 1
+              }
+              ;;
+            *) exit 1 ;;
+          esac
+          test -n "$PUBLISH_TAGS"
+          TAG_ARGS=()
+          while IFS= read -r TAG; do TAG_ARGS+=(--tag "$TAG"); done <<< "$PUBLISH_TAGS"
+          # One existing index is carbon-copied: no platform-specific public tags,
+          # no rebuild, and all aliases retain the attested manifest digest.
+          docker buildx imagetools create "${TAG_ARGS[@]}" "$IMAGE@$DIGEST"
+
+  release-aliases:
+    if: github.repository == 'cnrd/ebc-battery-tester' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    # Only alias mutation is serialized; builds, SHA pushes and provenance stay
+    # parallel. Prereleases have no floating aliases and use per-tag groups.
+    concurrency:
+      group: container-release-aliases-${{ contains(github.ref_name, '-') && github.ref || 'stable' }}
+      cancel-in-progress: false
+      # The default single pending slot cancels earlier queued releases.
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure Docker Hub cache before builder bootstrap
+        run: |
+          sudo python3 .github/scripts/configure-docker-mirror.py
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}'
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: .github/buildkitd.toml
+          driver-opts: image=moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Log in to GHCR with the workflow token
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select and assign release aliases from current registry state
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/validate-release.sh
+          VERSION=${GITHUB_REF_NAME#v}
+          # The SHA push already created/linked the package. Preserve exact
+          # revision immutability independently of floating alias selection.
+          bash .github/scripts/check-release-image.sh "$IMAGE" "$VERSION" "$GITHUB_SHA"
+          # Inspect inside the serialization boundary immediately before write.
+          # A deliberate skip is successful; ambiguity fails before any aliases.
+          PUBLISH_TAGS=$(node .github/scripts/select-release-aliases.mjs "$IMAGE" "$VERSION" "$GITHUB_SHA")
+          TAG_ARGS=()
+          while IFS= read -r TAG; do TAG_ARGS+=(--tag "$TAG"); done <<< "$PUBLISH_TAGS"
+          docker buildx imagetools create "${TAG_ARGS[@]}" "$IMAGE@$DIGEST"

@@ -1,0 +1,65 @@
+# Physical-authority boundary regressions
+
+All fixtures are software-only; they must not open a real tester. CI runs them on
+every PR alongside the ordinary Rust tests and native container smoke jobs.
+
+The [normative physical-authority contract](../docs/physical-authority-model.md)
+defines the permanent [acceptance-test families](../docs/physical-authority-model.md#17-minimum-permanent-acceptance-test-families)
+and [physical-control PR checklist](../docs/physical-authority-model.md#18-physical-control-pr-checklist).
+The suites below provide software boundary evidence, not proof that physical
+hardware obeyed a command; documentation-only changes need no repeated battery test.
+
+## Production server
+
+```sh
+cargo build --locked --no-default-features --features server --bin ebc-server
+python tests/physical_authority.py target/debug/ebc-server <new-scratch-directory>
+```
+
+This starts the actual server against Linux PTYs and uses real HTTP commands and
+parsed protocol reports. It checks unknown/stale safety Stop, all CC/CP/CV mode
+contradictions (manual/cycle, first Active/Running, ordinary/firmware), and fresh
+contradictory observations lasting longer than a TimerSync interval. Wire bytes,
+history, metrics, conservative state, and explicit recovery are asserted. It also
+checks fragmented Start/Stop/expiry/reconnect boundaries, finite acquisition,
+firmware closing/classification, receive-prefix contradictions, reserved manual
+and saved-recipe controls, Rest current violations, all directed contradictory
+terminal modes, owned Continue segments in persisted CSV, and Disconnect despite
+an actual `/dev/full` telemetry flush failure. Artifacts
+are written only to the supplied new directory; failures preserve them.
+
+Native direct Rust tests in `src/usb_native.rs` also run the production
+command queue and receive loop as well as authorization/write/completion against
+software PTY pairs. A PTY write-return hook tests real contradictory input arriving
+during Adjust/calibration before semantic completion. Shared local tests
+exercise receipt-age equality, parsed firmware sampling, and connection generations.
+
+## Browser WebUSB worker
+
+```sh
+python tests/webusb/prepare.py <new-scratch-source>
+# From that scratch source (uses the repository's .cargo configuration):
+EBC_WASM_DEFAULT_TRANSPORT=remote trunk build --locked --dist <scratch-dist>
+# From the source repository:
+npm ci --prefix tests/webusb
+CHROME_PATH=<chromium-executable> node tests/webusb/run.mjs <scratch-dist>
+```
+
+The preparation script copies source and appends a visibility-only adapter to the
+scratch copy. Production parser, worker, controller, cycle and USB transfer checks
+remain unchanged. No adapter is shipped in normal builds. The JavaScript USB fixture
+controls the actual `transferIn`/`transferOut` Promises, including full/short/stalled
+success and rejection. A controlled monotonic browser clock tests exact age equality
+and long schedules without wall-clock sleeps. Coverage includes queued ordinary and
+firmware reports, multiple frames, pre-command acknowledgements, settling-zero,
+generation replacement, tab resumption, Start/Resume/Adjust/calibration rejection,
+Stop retries/deduplication, and sustained mode contradictions. Conformance cases
+also cover oldest-byte fragments, acquisition equality, firmware closing, Rest
+contradictions, owned Continue segments, four-reference calibration, reserved
+entry points, never-settling output/open/close, resource retirement, and late
+completions. A separate wall-clock discontinuity veto exercises host clocks that
+exclude suspension; wall time never grants observation freshness. Captures retain
+the last published state without manufacturing a new event when nothing changed.
+`probe.mjs` can also run through Browserless using its `{page, context}` entry point
+(sections `queue`, `modes`, and `conformance`). The auditor's real-time 11.2-second delay is rerun separately during
+release remediation; simulated clocks are not hardware or real tab-lifecycle proof.

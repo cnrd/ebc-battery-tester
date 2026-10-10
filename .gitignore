@@ -16,3 +16,6 @@ target_wasm
 **/*.exe
 
 __pycache__/
+
+# Browser boundary test dependencies (npm ci).
+tests/webusb/node_modules/
