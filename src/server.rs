@@ -30,6 +30,8 @@ use crate::controller::{
     TestController,
 };
 #[cfg(test)]
+mod archive_tests;
+#[cfg(test)]
 mod freshness_tests;
 mod history;
 #[cfg(test)]
@@ -526,20 +528,6 @@ impl Persistence {
         {
             return Ok(None);
         }
-        if let Some(id) = &self.archived_run_id
-            && let Some(summary) = self.runs.iter().find(|run| &run.id == id)
-            && (!matches!(
-                snapshot.test.state,
-                TestState::Completed | TestState::Stopped
-            ) || (summary.sample_count == self.raw_sample_count
-                && summary.state == snapshot.test.state
-                && summary.result == snapshot.test.result
-                && summary.elapsed_seconds == snapshot.test.elapsed_seconds))
-        {
-            return Ok(Some(summary.clone()));
-        }
-
-        self.flush_samples()?;
         let id = if let Some(id) = &self.archived_run_id {
             id.clone()
         } else if valid_run_id(&self.current_run_id) {
@@ -547,19 +535,8 @@ impl Persistence {
         } else {
             self.next_run_id(snapshot.test.started_at_utc.as_deref())
         };
-        let csv_path = self.runs_dir.join(format!("{id}.csv"));
-        let csv_temporary = self.runs_dir.join(format!("{id}.csv.tmp"));
-        if self.samples_path.exists() {
-            fs::copy(&self.samples_path, &csv_temporary).map_err(|error| error.to_string())?;
-        } else {
-            let mut file = File::create(&csv_temporary).map_err(|error| error.to_string())?;
-            file.write_all(Self::history_csv(&snapshot.history).as_bytes())
-                .map_err(|error| error.to_string())?;
-        }
-        File::open(&csv_temporary)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())?;
-        let summary = RunSummary {
+        let existing = self.runs.iter().find(|run| run.id == id);
+        let mut summary = RunSummary {
             id: id.clone(),
             name: if self.current_run_cycle.is_none() {
                 self.current_run_name.clone()
@@ -567,7 +544,10 @@ impl Persistence {
                 None
             },
             started_at_utc: snapshot.test.started_at_utc.clone(),
-            archived_at_utc: Utc::now().to_rfc3339(),
+            // A write timestamp is not a measurement revision. Normalize only
+            // this field so derived RunSummary equality covers every persisted
+            // field (including future additions), without identical-write churn.
+            archived_at_utc: existing.map_or_else(String::new, |run| run.archived_at_utc.clone()),
             state: snapshot.test.state.clone(),
             config: snapshot.test.config,
             elapsed_seconds: snapshot.test.elapsed_seconds,
@@ -585,6 +565,24 @@ impl Persistence {
             },
             cycle: self.current_run_cycle.clone(),
         };
+        if existing == Some(&summary) {
+            return Ok(Some(summary));
+        }
+        summary.archived_at_utc = Utc::now().to_rfc3339();
+
+        self.flush_samples()?;
+        let csv_path = self.runs_dir.join(format!("{id}.csv"));
+        let csv_temporary = self.runs_dir.join(format!("{id}.csv.tmp"));
+        if self.samples_path.exists() {
+            fs::copy(&self.samples_path, &csv_temporary).map_err(|error| error.to_string())?;
+        } else {
+            let mut file = File::create(&csv_temporary).map_err(|error| error.to_string())?;
+            file.write_all(Self::history_csv(&snapshot.history).as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        File::open(&csv_temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
         let json_path = self.runs_dir.join(format!("{id}.json"));
         let json_temporary = self.runs_dir.join(format!("{id}.json.tmp"));
         let mut file = File::create(&json_temporary).map_err(|error| error.to_string())?;
@@ -4205,7 +4203,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
-    fn temporary_directory(name: &str) -> PathBuf {
+    pub(super) fn temporary_directory(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "ebc-server-{name}-{}-{}",
             std::process::id(),

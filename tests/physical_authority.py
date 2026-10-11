@@ -557,6 +557,50 @@ def continue_capacity_archive(rig):
     assert rig.status()["test"]["capacity_mah"] == 11
 
 
+def firmware_continue_archive(rig):
+    rig.observe(0, 40)
+    rig.post("/test/start", dict(config=CONFIGS[0], name="firmware Continue"))
+    run_id = rig.status()["current_run"]["id"]
+    rig.observe(110, 10)
+    rig.post("/test/stop")
+    rig.observe(100, 10)
+    first = archived_capacity(rig, run_id, 10, 0, "stopped")
+    rig.observe(0, 50)
+    rig.post("/test/resume")
+    rig.wait(lambda: rig.count(8) == 1, "actual firmware-only Continue")
+    rig.observe(110, 51)
+    active = rig.status()
+    assert active["current_run"]["id"] == run_id
+    assert active["test"]["capacity_mah"] == 11 and active["history"] == []
+    rig.post("/test/stop")
+    rig.observe(100, 51)
+    terminal = rig.status()
+    # Keep every old shortcut key equal. Waiting for a new second or creating
+    # an ordinary row would conceal the original 10-versus-11 archive defect.
+    assert terminal["history"] == []
+    for field in ("state", "result", "elapsed_seconds"):
+        assert terminal["test"][field] == first[field], (field, first, terminal)
+    summary = archived_capacity(rig, run_id, 11, 0, "stopped")
+    assert summary["config"] == first["config"] == CONFIGS[0]
+    assert summary["name"] == first["name"] == "firmware Continue"
+    assert summary["started_at_utc"] == first["started_at_utc"]
+    assert summary["cycle"] is None
+    # A further unowned report re-archives identical owned contents: no churn.
+    rig.observe(100, 52)
+    assert archived_capacity(rig, run_id, 11, 0, "stopped") == summary
+    with (rig.directory / "data/runs" / f"{run_id}.csv").open() as exported:
+        assert list(csv.DictReader(exported)) == []
+    rig.restart()
+    assert archived_capacity(rig, run_id, 11, 0, "stopped") == summary
+    assert rig.status()["test"]["capacity_mah"] == 11
+    rig.observe(0, 53)
+    rig.post("/test/start", dict(config=CONFIGS[0]))
+    later = rig.status()
+    assert later["current_run"]["id"] != run_id and later["test"]["capacity_mah"] is None
+    assert archived_capacity(rig, run_id, 11, 0, "stopped") == summary
+    assert [run["id"] for run in rig.request("/runs")[1]] == [run_id]
+
+
 def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
     scratch = pathlib.Path(sys.argv[2]).resolve()
@@ -582,6 +626,7 @@ def main():
               for cycle in (False, True) for capacity in (0, 10)]
     cases += [(f"terminal-capacity-archive-{cycle}", terminal_capacity_archive, (cycle,)) for cycle in (False, True)]
     cases.append(("continue-capacity-archive", continue_capacity_archive, ()))
+    cases.append(("firmware-continue-archive", firmware_continue_archive, ()))
 
     def run(case):
         name, test, args = case
