@@ -1,0 +1,6 @@
+# The host Docker daemon config handles the separate BuildKit bootstrap pull.
+# This cache handles Dockerfile bases; missing entries can fall back to Docker Hub.
+debug = true
+
+[registry."docker.io"]
+  mirrors = ["mirror.gcr.io"]

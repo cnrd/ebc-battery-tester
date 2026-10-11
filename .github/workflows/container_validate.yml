@@ -1,0 +1,60 @@
+name: Validate production containers
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native runner architecture
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          case "$ARCH:$(uname -m)" in
+            amd64:x86_64|arm64:aarch64) ;;
+            *) echo 'Runner does not match the requested native architecture' >&2; exit 1 ;;
+          esac
+      - name: Configure Docker Hub cache before builder bootstrap
+        run: |
+          sudo python3 .github/scripts/configure-docker-mirror.py
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}'
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: .github/buildkitd.toml
+          driver-opts: image=moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Build loadable production image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: TRUNK_VERSION=0.21.14
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ebc-battery-tester:smoke-${{ matrix.arch }}
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
+      - name: Smoke production runtime and persistent data
+        run: bash .github/scripts/container-smoke.sh "ebc-battery-tester:smoke-${{ matrix.arch }}"
+      - name: Preserve builder mirror diagnostics
+        if: always()
+        run: |
+          for container in $(docker ps -aq --filter name=buildx_buildkit); do
+            docker logs "$container"
+          done

@@ -21,10 +21,9 @@ pub const MIN_VOLTAGE_MV: u16 = 10;
 pub const MAX_VOLTAGE_MV: u16 = 30000;
 pub const MIN_CUTOFF_TIME_MIN: u16 = 0;
 pub const MAX_CUTOFF_TIME_MIN: u16 = 999;
+pub const MAX_TIMER_SYNC_MINUTES: u16 = 57_599;
 // Max minutes to wait between charge and discharge cycle.
-#[expect(unused)]
 pub const AUTO_MODE_TIME_MIN_MINS: u16 = 0;
-#[expect(unused)]
 pub const AUTO_MODE_TIME_MAX_MINS: u16 = 10;
 
 // ZKETECH EBC model codes sent from the device.
@@ -42,7 +41,7 @@ fn get_device_model_name(device_type_code: u8) -> String {
         _ => format!("Unknown ({device_type_code:#04x})"),
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbDeviceInfo {
     pub product_name: String,
     pub manufacturer_name: String,
@@ -68,7 +67,7 @@ impl std::fmt::Display for UsbDeviceInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -93,7 +92,7 @@ impl std::fmt::Display for DeviceMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum OutboundFrame {
     // Send connect command to the device. This will display '-PC-' on the LCD
     // screen. The usize is the index of the device to connect to.
@@ -239,76 +238,69 @@ enum StatusReportType {
     ChargeConstantCurrentEnd = 0x16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirmwareReport {
     pub device_mode: DeviceMode,
     pub in_progress: bool,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
     pub firmware_version: String,
     // Calibration parameters, offset and gain maybe?
-    #[expect(unused)]
     pub unknown1: u16, // Always 2988
-    #[expect(unused)]
     pub unknown2: u16, // Always 2087
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeReportState {
+    Idle,
+    Active,
+    Finished,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChargeReport {
-    pub in_progress: bool,
+    pub state: ModeReportState,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
-    #[expect(unused)]
     pub charge_current_ma: u16,
-    #[expect(unused)]
     pub charge_voltage_mv: u16,
-    #[expect(unused)]
     pub cutoff_current_ma: u16,
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DischargeConstantCurrentReport {
-    pub in_progress: bool,
+    pub state: ModeReportState,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
-    #[expect(unused)]
     pub discharge_current_ma: u16,
-    #[expect(unused)]
     pub cutoff_voltage_mv: u16,
-    #[expect(unused)]
     pub cutoff_time_min: u16,
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DischargeConstantPowerReport {
-    pub in_progress: bool,
+    pub state: ModeReportState,
     pub current_ma: u16,
     pub voltage_mv: u16,
     pub milli_ampere_hours: u16,
-    #[expect(unused)]
     pub unknown: u16, // Always 0.
-    #[expect(unused)]
     pub discharge_power_w: u16,
-    #[expect(unused)]
     pub cutoff_voltage_mv: u16,
-    #[expect(unused)]
     pub cutoff_time_min: u16,
     pub device_type: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum InboundFrame {
     Firmware(FirmwareReport),
     DischargeConstantCurrent(DischargeConstantCurrentReport),
@@ -357,14 +349,18 @@ impl InboundFrame {
     fn construct_charge_report(payload: &[u8]) -> Self {
         let command_byte = payload[0];
         Self::Charge(ChargeReport {
-            in_progress: command_byte == StatusReportType::ChargeConstantCurrentOnReport as u8,
+            state: mode_report_state(
+                command_byte,
+                StatusReportType::ChargeConstantCurrentOnReport,
+                StatusReportType::ChargeConstantCurrentEnd,
+            ),
             current_ma: decode_base240(payload[1], payload[2]) * 10,
             voltage_mv: decode_base240(payload[3], payload[4]),
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
             unknown: decode_base240(payload[7], payload[8]),
             charge_current_ma: decode_base240(payload[9], payload[10]) * 10,
-            charge_voltage_mv: decode_base240(payload[11], payload[12]),
-            cutoff_current_ma: decode_base240(payload[13], payload[14]),
+            charge_voltage_mv: decode_base240(payload[11], payload[12]) * 10,
+            cutoff_current_ma: decode_base240(payload[13], payload[14]) * 10,
             device_type: get_device_model_name(payload[15]),
         })
     }
@@ -372,13 +368,17 @@ impl InboundFrame {
     fn construct_discharge_constant_current_report(payload: &[u8]) -> Self {
         let command_byte = payload[0];
         Self::DischargeConstantCurrent(DischargeConstantCurrentReport {
-            in_progress: command_byte == StatusReportType::DischargeConstantCurrentOnReport as u8,
+            state: mode_report_state(
+                command_byte,
+                StatusReportType::DischargeConstantCurrentOnReport,
+                StatusReportType::DischargeConstantCurrentEnd,
+            ),
             current_ma: decode_base240(payload[1], payload[2]) * 10,
             voltage_mv: decode_base240(payload[3], payload[4]),
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
             unknown: decode_base240(payload[7], payload[8]),
             discharge_current_ma: decode_base240(payload[9], payload[10]) * 10,
-            cutoff_voltage_mv: decode_base240(payload[11], payload[12]),
+            cutoff_voltage_mv: decode_base240(payload[11], payload[12]) * 10,
             cutoff_time_min: decode_base240(payload[13], payload[14]),
             device_type: get_device_model_name(payload[15]),
         })
@@ -387,16 +387,34 @@ impl InboundFrame {
     fn construct_discharge_constant_power_report(payload: &[u8]) -> Self {
         let command_byte = payload[0];
         Self::DischargeConstantPower(DischargeConstantPowerReport {
-            in_progress: command_byte == StatusReportType::DischargeConstantPowerOnReport as u8,
+            state: mode_report_state(
+                command_byte,
+                StatusReportType::DischargeConstantPowerOnReport,
+                StatusReportType::DischargeConstantPowerEnd,
+            ),
             current_ma: decode_base240(payload[1], payload[2]) * 10,
             voltage_mv: decode_base240(payload[3], payload[4]),
             milli_ampere_hours: decode_base240(payload[5], payload[6]),
             unknown: decode_base240(payload[7], payload[8]),
             discharge_power_w: decode_base240(payload[9], payload[10]),
-            cutoff_voltage_mv: decode_base240(payload[11], payload[12]),
+            cutoff_voltage_mv: decode_base240(payload[11], payload[12]) * 10,
             cutoff_time_min: decode_base240(payload[13], payload[14]),
             device_type: get_device_model_name(payload[15]),
         })
+    }
+}
+
+fn mode_report_state(
+    command_byte: u8,
+    active: StatusReportType,
+    finished: StatusReportType,
+) -> ModeReportState {
+    if command_byte == active as u8 {
+        ModeReportState::Active
+    } else if command_byte == finished as u8 {
+        ModeReportState::Finished
+    } else {
+        ModeReportState::Idle
     }
 }
 
@@ -426,15 +444,12 @@ impl TryFrom<&[u8]> for InboundFrame {
         let payload = &value[1..value.len() - 2];
         let checksum = value[value.len() - 2];
         let calculated_checksum = xor_checksum(payload);
-        // It seems there is a bug in the device firmware. When you discharge to
-        // 3.3V with 1A. The checksum byte is wrong after about 2 mins of
-        // discharging. If the checksum is ignored, the frame still has correct
-        // data in it. This happens with firmware version 3.0.2 to me at least.
-        // So we log the checksum error instead.
-        if calculated_checksum != checksum {
-            log::warn!(
+        // Captured inbound frames encode XOR values >= 0xf0 either verbatim or
+        // reduced by 0xf0. The reason for this device behavior is unknown.
+        if !inbound_checksum_valid(calculated_checksum, checksum) {
+            return Err(format!(
                 "Invalid checksum: expected {calculated_checksum:#04x}, got {checksum:#04x}"
-            );
+            ));
         }
         let command_byte = payload[0];
         match command_byte {
@@ -475,48 +490,187 @@ impl TryFrom<&[u8]> for InboundFrame {
     }
 }
 
-pub enum DeviceEvent {
-    StatusChanged(ConnectionStatus),
-    // Vec of available devices.
-    DevicesUpdated(Vec<UsbDeviceInfo>),
-    Frame(InboundFrame, Vec<u8>),
+pub fn process_buffer(buf: &mut Vec<u8>) -> Vec<(InboundFrame, Vec<u8>)> {
+    let mut frames = Vec::new();
+    extract_frames(buf, |frame, raw, _| frames.push((frame, raw)));
+    frames
 }
 
-impl std::fmt::Debug for DeviceEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StatusChanged(s) => f.debug_tuple("StatusChanged").field(s).finish(),
-            Self::DevicesUpdated(d) => f.debug_tuple("DevicesUpdated").field(d).finish(),
-            Self::Frame(frame, _) => {
-                write!(f, "Frame({frame:?})")
-            }
-        }
+/// Integrity-validated input with conservative oldest-byte provenance. The
+/// adapter owns this buffer for exactly one connection; it must clear it on
+/// replacement and quarantine it at lifecycle/uncertain-service boundaries.
+#[derive(Default)]
+pub(crate) struct ReceiveBuffer {
+    bytes: Vec<u8>,
+    receipts: Vec<web_time::Instant>,
+}
+
+pub(crate) struct ReceivedFrame {
+    pub(crate) frame: InboundFrame,
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) raw: Vec<u8>,
+    pub(crate) received_at: web_time::Instant,
+}
+
+impl ReceiveBuffer {
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        self.receipts
+            .extend(std::iter::repeat_n(web_time::Instant::now(), bytes.len()));
+    }
+
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn clear(&mut self) {
+        self.bytes.clear();
+        self.receipts.clear();
+    }
+
+    pub(crate) fn receive(
+        &mut self,
+        bytes: &[u8],
+        received_at: web_time::Instant,
+    ) -> Vec<ReceivedFrame> {
+        self.bytes.extend_from_slice(bytes);
+        self.receipts
+            .extend(std::iter::repeat_n(received_at, bytes.len()));
+        let old_len = self.bytes.len();
+        let mut frames = Vec::new();
+        extract_frames(&mut self.bytes, |frame, raw, start| {
+            #[cfg(not(any(feature = "gui", test)))]
+            drop(raw);
+            frames.push(ReceivedFrame {
+                frame,
+                #[cfg(any(feature = "gui", test))]
+                raw,
+                received_at: self.receipts[start],
+            });
+        });
+        self.receipts.drain(..old_len - self.bytes.len());
+        frames
     }
 }
 
-pub fn process_buffer(buf: &mut Vec<u8>) -> Vec<(InboundFrame, Vec<u8>)> {
-    let mut frames = Vec::new();
+/// Finite driver-input watermark, shared by both serial executors. Receipt is
+/// bounded by the preceding serviced/drained boundary, not this read's callback.
+/// A receive gap therefore ages buffered input rather than rejuvenating it.
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "gui", feature = "server")))]
+#[derive(Default)]
+pub(crate) struct SerialIngress {
+    pub(crate) buffer: ReceiveBuffer,
+    boundary: Option<web_time::Instant>,
+    service_time: Option<crate::transport_time::ServiceTime>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "gui", feature = "server")))]
+impl SerialIngress {
+    #[cfg(feature = "server")]
+    pub(crate) fn clear(&mut self) {
+        self.buffer.clear();
+        self.boundary = None;
+        self.service_time = None;
+    }
+
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub(crate) fn quarantine(&mut self, port: &dyn serialport::SerialPort) -> Result<(), String> {
+        let boundary = web_time::Instant::now();
+        let service_time = crate::transport_time::ServiceTime::now();
+        port.clear(serialport::ClearBuffer::Input)
+            .map_err(|e| format!("cannot quarantine serial input: {e}"))?;
+        self.buffer.clear();
+        self.boundary = Some(boundary);
+        self.service_time = Some(service_time);
+        Ok(())
+    }
+
+    pub(crate) fn receive_prefix(
+        &mut self,
+        port: &mut dyn serialport::SerialPort,
+    ) -> Result<Vec<ReceivedFrame>, String> {
+        let boundary = web_time::Instant::now();
+        let service_time = crate::transport_time::ServiceTime::now();
+        if self
+            .service_time
+            .is_some_and(|previous| service_time.discontinuity_since(previous))
+        {
+            return Err(
+                "serial receive-service clock discontinuity; input provenance is uncertain"
+                    .to_owned(),
+            );
+        }
+        let mut remaining =
+            port.bytes_to_read()
+                .map_err(|e| format!("serial ingress watermark failed: {e}"))? as usize;
+        let Some(received_at) = self.boundary else {
+            return Err("serial receipt provenance has not been initialized".to_owned());
+        };
+        let mut frames = Vec::new();
+        let mut bytes = [0; 4096];
+        while remaining > 0 {
+            let size = remaining.min(bytes.len());
+            let count = port
+                .read(&mut bytes[..size])
+                .map_err(|e| format!("serial ingress read failed: {e}"))?;
+            if count == 0 {
+                return Err("serial ingress made no progress".to_owned());
+            }
+            remaining -= count;
+            frames.extend(self.buffer.receive(&bytes[..count], received_at));
+        }
+        self.boundary = Some(boundary);
+        self.service_time = Some(service_time);
+        Ok(frames)
+    }
+}
+
+fn extract_frames(buf: &mut Vec<u8>, mut accept: impl FnMut(InboundFrame, Vec<u8>, usize)) {
+    let mut consumed = 0;
     loop {
         if let Some(start) = buf.iter().position(|&b| b == START_BYTE) {
             if start > 0 {
                 buf.drain(..start);
+                consumed += start;
             }
         } else {
             buf.clear();
             break;
         }
-        if let Some(end) = buf[1..].iter().position(|&b| b == END_BYTE) {
-            let frame_end = end + 2; // +1 for slice offset, +1 for inclusive
-            let raw = buf.drain(..frame_end).collect::<Vec<u8>>();
-            match InboundFrame::try_from(raw.as_slice()) {
-                Ok(f) => frames.push((f, raw)),
-                Err(e) => log::warn!("Failed to parse frame: {e}"),
-            }
-        } else {
+        if buf.len() < INBOUND_FRAME_SIZE {
             break;
         }
+        if buf[INBOUND_FRAME_SIZE - 1] != END_BYTE {
+            buf.drain(..1);
+            consumed += 1;
+            continue;
+        }
+        let raw = buf[..INBOUND_FRAME_SIZE].to_vec();
+        match InboundFrame::try_from(raw.as_slice()) {
+            Ok(frame) => {
+                buf.drain(..INBOUND_FRAME_SIZE);
+                accept(frame, raw, consumed);
+                consumed += INBOUND_FRAME_SIZE;
+            }
+            Err(error) => {
+                log::warn!("Failed to parse frame: {error}");
+                buf.drain(..1);
+                consumed += 1;
+            }
+        }
     }
-    frames
 }
 
 // Encoding to prevent bytes > 240 in the byte stream, allowing 0xfa and 0xf8
@@ -537,6 +691,10 @@ fn decode_base240(h: u8, l: u8) -> u16 {
 
 fn xor_checksum(data: &[u8]) -> u8 {
     data.iter().fold(0, |acc, &b| acc ^ b)
+}
+
+fn inbound_checksum_valid(calculated: u8, actual: u8) -> bool {
+    actual == calculated || (calculated >= 0xf0 && actual == calculated - 0xf0)
 }
 
 fn build_frame(payload: [u8; 7]) -> [u8; OUTBOUND_FRAME_SIZE] {
@@ -671,6 +829,10 @@ fn continue_constant_current_discharge_command(
 }
 
 fn timer_sync_command(minutes: u16) -> [u8; OUTBOUND_FRAME_SIZE] {
+    assert!(
+        minutes <= MAX_TIMER_SYNC_MINUTES,
+        "Timer sync must not exceed {MAX_TIMER_SYNC_MINUTES} minutes"
+    );
     let (min_h, min_l) = encode_base240(minutes);
     build_frame([
         CommmandType::TimerSync as u8,
@@ -820,4 +982,316 @@ fn continue_constant_voltage_charge_command(
         cutoff_current_h,
         cutoff_current_l,
     ])
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test parsing should fail fast")]
+mod tests {
+    use super::*;
+
+    fn inbound_frame(payload: [u8; 16]) -> Vec<u8> {
+        let mut frame = vec![START_BYTE];
+        frame.extend_from_slice(&payload);
+        frame.push(xor_checksum(&payload));
+        frame.push(END_BYTE);
+        frame
+    }
+
+    fn set_base240(payload: &mut [u8; 16], offset: usize, value: u16) {
+        let (high, low) = encode_base240(value);
+        payload[offset] = high;
+        payload[offset + 1] = low;
+    }
+
+    fn report_frame(command: u8) -> Vec<u8> {
+        let mut payload = [0_u8; 16];
+        payload[0] = command;
+        inbound_frame(payload)
+    }
+
+    #[test]
+    fn mode_reports_preserve_idle_active_and_finished_states() {
+        for (command, expected) in [
+            (0x00, ModeReportState::Idle),
+            (0x0a, ModeReportState::Active),
+            (0x14, ModeReportState::Finished),
+            (0x01, ModeReportState::Idle),
+            (0x0b, ModeReportState::Active),
+            (0x15, ModeReportState::Finished),
+            (0x02, ModeReportState::Idle),
+            (0x0c, ModeReportState::Active),
+            (0x16, ModeReportState::Finished),
+        ] {
+            let mut payload = [0_u8; 16];
+            payload[0] = command;
+            let frame = inbound_frame(payload);
+
+            let state = match InboundFrame::try_from(frame.as_slice()).expect("parse report") {
+                InboundFrame::Charge(report) => report.state,
+                InboundFrame::DischargeConstantCurrent(report) => report.state,
+                InboundFrame::DischargeConstantPower(report) => report.state,
+                InboundFrame::Firmware(_) => panic!("expected normal mode report"),
+            };
+            assert_eq!(state, expected, "command {command:#04x}");
+        }
+    }
+
+    #[test]
+    fn normal_reports_decode_all_configured_values_in_protocol_units() {
+        let mut charge = [0_u8; 16];
+        charge[0] = StatusReportType::ChargeConstantCurrentOnReport as u8;
+        set_base240(&mut charge, 9, 200);
+        set_base240(&mut charge, 11, 420);
+        set_base240(&mut charge, 13, 50);
+        let InboundFrame::Charge(charge) =
+            InboundFrame::try_from(inbound_frame(charge).as_slice()).expect("parse charge report")
+        else {
+            panic!("expected charge report");
+        };
+        assert_eq!(charge.charge_current_ma, 2_000);
+        assert_eq!(charge.charge_voltage_mv, 4_200);
+        assert_eq!(charge.cutoff_current_ma, 500);
+
+        let mut current = [0_u8; 16];
+        current[0] = StatusReportType::DischargeConstantCurrentOnReport as u8;
+        set_base240(&mut current, 9, 150);
+        set_base240(&mut current, 11, 390);
+        set_base240(&mut current, 13, 30);
+        let InboundFrame::DischargeConstantCurrent(current) =
+            InboundFrame::try_from(inbound_frame(current).as_slice()).expect("parse CC report")
+        else {
+            panic!("expected CC report");
+        };
+        assert_eq!(current.discharge_current_ma, 1_500);
+        assert_eq!(current.cutoff_voltage_mv, 3_900);
+        assert_eq!(current.cutoff_time_min, 30);
+
+        let mut power = [0_u8; 16];
+        power[0] = StatusReportType::DischargeConstantPowerOnReport as u8;
+        set_base240(&mut power, 9, 100);
+        set_base240(&mut power, 11, 300);
+        set_base240(&mut power, 13, 45);
+        let InboundFrame::DischargeConstantPower(power) =
+            InboundFrame::try_from(inbound_frame(power).as_slice()).expect("parse CP report")
+        else {
+            panic!("expected CP report");
+        };
+        assert_eq!(power.discharge_power_w, 100);
+        assert_eq!(power.cutoff_voltage_mv, 3_000);
+        assert_eq!(power.cutoff_time_min, 45);
+    }
+
+    #[test]
+    fn inbound_checksum_accepts_observed_high_range_encoding() {
+        assert!(inbound_checksum_valid(0xef, 0xef));
+        for (calculated, actual) in [
+            (0xf0, 0x00),
+            (0xf7, 0x07),
+            (0xfa, 0x0a),
+            (0xfe, 0x0e),
+            (0xff, 0x0f),
+        ] {
+            assert!(inbound_checksum_valid(calculated, calculated));
+            assert!(inbound_checksum_valid(calculated, actual));
+        }
+        assert!(!inbound_checksum_valid(0xfa, 0x0b));
+    }
+
+    #[test]
+    fn outbound_checksum_keeps_ordinary_high_xor() {
+        let frame = calibration_command(0x00, 5_039);
+        assert_eq!(xor_checksum(&frame[1..8]), 0xff);
+        assert_eq!(frame[8], 0xff);
+    }
+
+    #[test]
+    fn invalid_inbound_checksum_is_rejected() {
+        let mut frame = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        frame[INBOUND_FRAME_SIZE - 2] ^= 0x01;
+        let payload = &frame[1..INBOUND_FRAME_SIZE - 2];
+        assert!(!inbound_checksum_valid(
+            xor_checksum(payload),
+            frame[INBOUND_FRAME_SIZE - 2]
+        ));
+        assert!(InboundFrame::try_from(frame.as_slice()).is_err());
+    }
+
+    #[test]
+    fn single_bit_current_corruption_and_invalid_firmware_checksums_are_rejected() {
+        for command in [0x00, 0x0a, 0x14, 0x64, 0x6e] {
+            let mut payload = [0_u8; 16];
+            payload[0] = command;
+            payload[2] = 8; // 80mA: flip one bit to fabricate zero, keep checksum.
+            let mut frame = inbound_frame(payload);
+            frame[3] ^= 8;
+            assert!(InboundFrame::try_from(frame.as_slice()).is_err());
+            let mut buffer = frame;
+            assert!(process_buffer(&mut buffer).is_empty());
+        }
+    }
+
+    #[test]
+    fn parser_recovers_from_corrupt_frames_to_fragmented_valid_frame() {
+        let mut corrupt = report_frame(0x64);
+        corrupt[17] ^= 1;
+        let valid = report_frame(0x0a);
+        let mut buffer = vec![0x12, 0xf8, 0xfa, 0x02];
+        buffer.extend_from_slice(&corrupt);
+        buffer.extend_from_slice(&valid[..7]);
+        assert!(process_buffer(&mut buffer).is_empty());
+        assert_eq!(buffer, valid[..7]);
+        buffer.extend_from_slice(&valid[7..]);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, valid);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parser_accepts_both_validated_checksums_through_stream_boundary() {
+        for command in [0x00, 0x64, 0x6e] {
+            for calculated in 0xf0..=0xff {
+                let mut payload = [0_u8; 16];
+                payload[0] = command;
+                payload[15] = calculated ^ command;
+                for checksum in [calculated, calculated - 0xf0] {
+                    let mut buffer = inbound_frame(payload);
+                    buffer[17] = checksum;
+                    assert!(InboundFrame::try_from(buffer.as_slice()).is_ok());
+                    assert_eq!(process_buffer(&mut buffer).len(), 1);
+                    assert!(buffer.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_buffer_extracts_one_complete_frame() {
+        let expected = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let mut buffer = expected.clone();
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn receive_buffer_preserves_oldest_constituent_and_recovers_corrupt_prefix() {
+        let first = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let second = report_frame(StatusReportType::DischargeConstantPowerOffReport as u8);
+        let t0 = web_time::Instant::now();
+        let t1 = t0 + web_time::Duration::from_secs(11);
+        let mut buffer = ReceiveBuffer::default();
+        assert!(buffer.receive(&first[..18], t0).is_empty());
+        let mut suffix = vec![first[18]];
+        suffix.extend_from_slice(&second);
+        let frames = buffer.receive(&suffix, t1);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].received_at, t0);
+        assert_eq!(frames[1].received_at, t1);
+        let mut corrupt = first.clone();
+        corrupt[17] ^= 1;
+        assert!(buffer.receive(&corrupt[..18], t0).is_empty());
+        suffix = vec![corrupt[18]];
+        suffix.extend_from_slice(&second);
+        let frames = buffer.receive(&suffix, t1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].received_at, t1);
+        assert_eq!(frames[0].raw, second);
+    }
+
+    #[test]
+    fn process_buffer_retains_fragmented_and_incomplete_frames() {
+        let expected = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let mut buffer = expected[..7].to_vec();
+        assert!(process_buffer(&mut buffer).is_empty());
+        assert_eq!(buffer, expected[..7]);
+        buffer.extend_from_slice(&expected[7..15]);
+        assert!(process_buffer(&mut buffer).is_empty());
+        assert_eq!(buffer, expected[..15]);
+        buffer.extend_from_slice(&expected[15..]);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_extracts_concatenated_frames() {
+        let first = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let second = report_frame(StatusReportType::DischargeConstantPowerOffReport as u8);
+        let mut buffer = first.clone();
+        buffer.extend_from_slice(&second);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].1, first);
+        assert_eq!(frames[1].1, second);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_discards_garbage_before_valid_frame() {
+        let expected = report_frame(StatusReportType::ChargeConstantCurrentOffReport as u8);
+        let mut buffer = vec![0x00, 0x01, END_BYTE, 0x02];
+        buffer.extend_from_slice(&expected);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_resynchronizes_after_false_start() {
+        let expected = report_frame(StatusReportType::DischargeConstantCurrentOffReport as u8);
+        let mut buffer = vec![START_BYTE, 0x01, 0x02, 0x03, 0x04];
+        buffer.extend_from_slice(&expected);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_allows_end_byte_in_checksum_position() {
+        let mut payload = [0_u8; 16];
+        payload[0] = StatusReportType::DischargeConstantCurrentOffReport as u8;
+        payload[15] = xor_checksum(&payload) ^ END_BYTE;
+        let expected = inbound_frame(payload);
+        assert_eq!(expected[INBOUND_FRAME_SIZE - 2], END_BYTE);
+        assert_eq!(expected[INBOUND_FRAME_SIZE - 1], END_BYTE);
+        let mut buffer = expected.clone();
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+    }
+
+    #[test]
+    fn process_buffer_preserves_nested_frame_with_end_byte_checksum() {
+        let mut payload = [0_u8; 16];
+        payload[0] = StatusReportType::DischargeConstantCurrentOffReport as u8;
+        payload[15] = xor_checksum(&payload) ^ END_BYTE;
+        let expected = inbound_frame(payload);
+        let mut buffer = vec![START_BYTE];
+        buffer.extend_from_slice(&expected);
+
+        let frames = process_buffer(&mut buffer);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn process_buffer_recovers_after_malformed_complete_frame() {
+        let mut malformed_payload = [0_u8; 16];
+        malformed_payload[0] = 0xff;
+        let malformed = inbound_frame(malformed_payload);
+        let expected = report_frame(StatusReportType::DischargeConstantPowerOffReport as u8);
+        let mut buffer = malformed;
+        buffer.extend_from_slice(&expected);
+        let frames = process_buffer(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, expected);
+        assert!(buffer.is_empty());
+    }
 }

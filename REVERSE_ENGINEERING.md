@@ -30,8 +30,17 @@
 
 The device communicates over a CH340 USB-serial adapter (VID `0x1A86`, PID `0x7523`).
 
-- **Serial settings:** 9600 baud, 8E1 (8 data bits, even parity, 1 stop bit)
+- **Validated application settings:** 9600 baud, 8O1 (8 data bits, odd parity, 1 stop bit)
 - **Port:** `/dev/ttyUSB0` on Linux
+
+The earlier **9600 8E1** claim was recorded alongside the historical
+bootloader/recovery research below. It is not a validated application setting,
+and these notes do not independently establish bootloader parity/baud either.
+Do not use that claim for normal control or infer bootloader settings from
+application 8O1. Bootloader settings require separate evidence before operational
+reliance. Application framing/checksums are
+documented in [FRAMES.md](FRAMES.md); application authority is governed by the
+[physical-authority model](docs/physical-authority-model.md).
 
 To enter bootloader mode:
 
@@ -51,7 +60,8 @@ Evidence for STM8:
 - Flat address space starting at `0x0000` (not `0x08000000` like STM32)
 - No ARM vector table at firmware start (`0x9000`)
 - No ARM Thumb instruction patterns found in any dumped region
-- Protocol match is exact: same sync, commands, parity, baud
+- Historical protocol comparison: matching sync and command framing; the
+  parity/baud claim is not independently validated here (see [Connection](#connection))
 
 ### Frame structure
 
@@ -273,6 +283,14 @@ next power cycle, after which the previous stored calibration is restored.
 Both charge and discharge modes send an elapsed-minutes counter to the device
 once per minute using command `0x0A`. The minute count is base240-encoded in
 payload bytes 1–2. The device does not respond beyond its normal report frames.
+The available captures do not show whether this updates only the display,
+affects a configured time cutoff, or acts as a keep-alive. That effect must be
+tested on real hardware; it must not be inferred from the frame cadence alone.
+The server sends timer sync only while connection, hardware activity, and
+backend ownership have remained continuously confirmed. A serial observation
+gap stops elapsed projection and timer sync rather than guessing the missing
+minutes. Timer sync stops at the canonical two-byte base-240 maximum of 57,599
+(`ef ef`) and never emits the unvalidated high byte `0xf0`.
 
 ```text
 1 min → fa 0a 00 01 00 00 00 00 0b f8
@@ -304,10 +322,11 @@ current in mA/10, cutoff voltage in mV/10, time in minutes, all base240.
 200mA, 3.3V cutoff, no time limit → fa 07 00 14 01 5a 00 00 48 f8
 ```
 
-Resume after stop uses command `0x08`. Despite the current
-`StopConstantCurrentDischarge` label in the code, the captured frame includes
-current, cutoff voltage and time parameters — it behaves like a resume/continue
-rather than a plain stop.
+Resume after stop uses command `0x08`. The captured frame includes current,
+cutoff voltage and time parameters — it behaves like a resume/continue rather
+than a plain stop. The application names it `ContinueConstantCurrentDischarge`
+and sends the validated configuration; Continue is explicit new acquisition,
+not restoration of old physical ownership.
 
 ```text
 100mA, 3.3V cutoff, no time limit → fa 08 00 0a 01 5a 00 00 59 f8
@@ -319,8 +338,9 @@ rather than a plain stop.
 
 Settings cannot be adjusted on the fly in this mode. Resume after stop uses
 command `0x18` (`Continue`) with power in W, cutoff voltage in mV/10, and time
-in minutes. The existing `continue_command()` in the code sends hardcoded zeros
-for these parameters and is likely wrong.
+in minutes. The application sends those parameters from the validated configuration
+through `ContinueConstantPowerDischarge`; the earlier note about a hardcoded-zero
+`continue_command()` described an obsolete implementation, not current behavior.
 
 ```text
 1W, 3.3V cutoff, no time limit → fa 18 00 01 01 5a 00 00 42 f8

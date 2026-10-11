@@ -37,16 +37,23 @@ fn main() {
     let web_options = eframe::WebOptions::default();
 
     wasm_bindgen_futures::spawn_local(async {
-        let document = web_sys::window()
-            .expect("No window")
-            .document()
-            .expect("No document");
+        let Some(window) = web_sys::window() else {
+            log::error!("No browser window is available");
+            return;
+        };
+        let Some(document) = window.document() else {
+            log::error!("No browser document is available");
+            return;
+        };
 
-        let canvas = document
-            .get_element_by_id("the_canvas_id")
-            .expect("Failed to find the_canvas_id")
-            .dyn_into::<web_sys::HtmlCanvasElement>()
-            .expect("the_canvas_id was not a HtmlCanvasElement");
+        let Some(canvas) = document.get_element_by_id("the_canvas_id") else {
+            log::error!("Failed to find the_canvas_id");
+            return;
+        };
+        let Ok(canvas) = canvas.dyn_into::<web_sys::HtmlCanvasElement>() else {
+            log::error!("the_canvas_id was not a HtmlCanvasElement");
+            return;
+        };
 
         let start_result = eframe::WebRunner::new()
             .start(
@@ -66,7 +73,7 @@ fn main() {
                     loading_text.set_inner_html(
                         "<p> The app has crashed. See the developer console for details. </p>",
                     );
-                    panic!("Failed to start eframe: {e:?}");
+                    log::error!("Failed to start eframe: {e:?}");
                 }
             }
         }

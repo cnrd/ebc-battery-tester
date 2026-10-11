@@ -87,8 +87,8 @@ impl AboutWindow {
                 );
                 ui.add_space(4.0);
                 ui.hyperlink_to(
-                    "github.com/Kazhuu/ebc-battery-tester",
-                    "https://github.com/Kazhuu/ebc-battery-tester",
+                    "github.com/cnrd/ebc-battery-tester",
+                    "https://github.com/cnrd/ebc-battery-tester",
                 );
                 ui.add_space(4.0);
             });

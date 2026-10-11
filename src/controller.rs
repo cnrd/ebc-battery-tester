@@ -1,0 +1,2893 @@
+//! GUI-independent physical test lifecycle, metrics, and command policy.
+
+use web_time::{Duration, Instant};
+
+use crate::core::{
+    ApiCommand, CalibrationCommand, Capabilities, DeviceState, Sample, TestConfiguration,
+    TestState, TestStatus,
+};
+use crate::device::{self, DeviceMode, ModeReportState, OutboundFrame};
+
+const CAPACITY_MODULUS_MAH: u64 = 57_600;
+const CAPACITY_WRAP_HIGH_WATER: u16 = 43_200;
+const CAPACITY_WRAP_LOW_WATER: u16 = 14_400;
+
+/// Maximum age of physical observation from the current connection.
+///
+/// EBC-A20 reports arrive about every two seconds (ordinary and firmware reports
+/// both carry physical observation). Ten seconds tolerates roughly five missed
+/// reports and ordinary scheduling jitter, not an indefinite open-but-silent link.
+/// At the exact deadline authority expires. This is runtime-only monotonic state.
+pub const REPORT_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(10);
+pub const REPORT_TIMEOUT_REASON: &str = "device reports timed out; physical state is uncertain";
+pub const MODE_CONTRADICTION_REASON: &str = "physical device mode contradicts the owned test";
+pub const ACQUISITION_TIMEOUT_REASON: &str = "physical acquisition timed out; operation is unowned";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerMode {
+    Direct,
+    Server,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhysicalState {
+    Unknown,
+    Active,
+    Inactive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportState {
+    Idle,
+    Active,
+    Finished,
+    InactiveUnknown,
+}
+
+impl From<ModeReportState> for ReportState {
+    fn from(state: ModeReportState) -> Self {
+        match state {
+            ModeReportState::Idle => Self::Idle,
+            ModeReportState::Active => Self::Active,
+            ModeReportState::Finished => Self::Finished,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceReport {
+    pub mode: DeviceMode,
+    pub state: ReportState,
+    pub voltage_mv: u16,
+    pub current_ma: u16,
+    pub capacity_mah: u16,
+    pub model: String,
+    pub firmware_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Measurement {
+    pub elapsed_seconds: u64,
+    pub voltage_mv: u16,
+    pub current_ma: u16,
+    pub capacity_mah: u64,
+    pub energy_wh: f64,
+    pub mode: DeviceMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReportOutcome {
+    pub accepted: bool,
+    pub transitioned_to_inactive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    Idle,
+    RecoveredUncertain,
+    Starting,
+    RunningOwned,
+    // Terminal reason is unresolved, but Active control has already ended.
+    Closing,
+    Stopping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandKind {
+    Start,
+    Stop,
+    Adjust,
+    Resume,
+    Calibration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedCommand {
+    command: ApiCommand,
+    resume_config: Option<TestConfiguration>,
+    frame: Option<OutboundFrame>,
+    kind: CommandKind,
+    connection_generation: u64,
+    authority_generation: u64,
+    operation_epoch: u64,
+    attempt_id: u64,
+    orchestration_epoch: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorityToken {
+    connection: u64,
+    operation: u64,
+    authority: u64,
+}
+
+impl PreparedCommand {
+    pub(crate) fn bind_cycle(mut self, epoch: u64) -> Self {
+        self.orchestration_epoch = Some(epoch);
+        self
+    }
+
+    pub(crate) fn cycle_epoch(self) -> Option<u64> {
+        self.orchestration_epoch
+    }
+
+    pub(crate) fn command(self) -> ApiCommand {
+        self.command
+    }
+
+    pub fn frame(&self) -> Option<OutboundFrame> {
+        self.frame
+    }
+
+    pub fn kind(&self) -> CommandKind {
+        self.kind
+    }
+}
+
+#[derive(Default)]
+struct CalibrationStaging {
+    references: [bool; 4],
+}
+
+impl CalibrationStaging {
+    fn complete(&self) -> bool {
+        self.references.iter().all(|staged| *staged)
+    }
+}
+
+struct TestClock {
+    running_since: Option<Instant>,
+    accumulated: Duration,
+    last_sync_minute: u64,
+}
+
+impl TestClock {
+    fn new(elapsed_seconds: u64) -> Self {
+        Self {
+            running_since: None,
+            accumulated: Duration::from_secs(elapsed_seconds),
+            last_sync_minute: elapsed_seconds / 60,
+        }
+    }
+
+    fn start_fresh(&mut self) {
+        self.running_since = None;
+        self.accumulated = Duration::ZERO;
+        self.last_sync_minute = 0;
+    }
+
+    fn resume(&mut self, now: Instant) {
+        if self.running_since.is_none() {
+            self.running_since = Some(now);
+        }
+    }
+
+    fn stop(&mut self, now: Instant) {
+        if let Some(started) = self.running_since.take() {
+            self.accumulated += now.saturating_duration_since(started);
+        }
+    }
+
+    #[cfg(test)]
+    fn replace(&mut self, elapsed_seconds: u64, running: bool) {
+        self.accumulated = Duration::from_secs(elapsed_seconds);
+        self.running_since = running.then(Instant::now);
+        self.last_sync_minute = elapsed_seconds / 60;
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        self.running_since.map_or(self.accumulated, |started| {
+            self.accumulated + now.saturating_duration_since(started)
+        })
+    }
+
+    fn next_timer_sync(&mut self, now: Instant) -> Option<u16> {
+        let minute = self.elapsed(now).as_secs() / 60;
+        if self.running_since.is_some() && minute > self.last_sync_minute {
+            self.last_sync_minute = minute;
+            (minute <= u64::from(device::MAX_TIMER_SYNC_MINUTES)).then_some(minute as u16)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EnergyReading {
+    elapsed_seconds: f64,
+    power_w: f64,
+}
+
+struct EnergyAccumulator {
+    energy_wh: f64,
+    previous: Option<EnergyReading>,
+}
+
+impl EnergyAccumulator {
+    fn from_state(test: &TestStatus, last_sample: Option<&Sample>) -> Self {
+        let previous = last_sample.map(|sample| EnergyReading {
+            elapsed_seconds: sample.elapsed_seconds as f64,
+            power_w: sample.voltage_mv as f64 * sample.current_ma as f64 / 1_000_000.0,
+        });
+        Self {
+            energy_wh: test.energy_wh,
+            previous,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.energy_wh = 0.0;
+        self.previous = None;
+    }
+
+    fn break_gap(&mut self) {
+        self.previous = None;
+    }
+
+    fn add(&mut self, elapsed_seconds: f64, voltage_mv: u16, current_ma: u16) -> f64 {
+        let power_w = voltage_mv as f64 * current_ma as f64 / 1_000_000.0;
+        if let Some(previous) = self.previous {
+            let delta_seconds = elapsed_seconds - previous.elapsed_seconds;
+            if delta_seconds > 0.0 {
+                self.energy_wh += (previous.power_w + power_w) * 0.5 * delta_seconds / 3600.0;
+            }
+        }
+        self.previous = Some(EnergyReading {
+            elapsed_seconds,
+            power_w,
+        });
+        self.energy_wh
+    }
+}
+
+struct CapacityAccumulator {
+    capacity_mah: u64,
+    previous_raw: Option<u16>,
+}
+
+impl CapacityAccumulator {
+    fn from_state(device: &DeviceState, test: &TestStatus, last_sample: Option<&Sample>) -> Self {
+        let persisted_capacity = test.capacity_mah.unwrap_or(0);
+        let capacity_mah = last_sample.map_or(persisted_capacity, |sample| {
+            sample.capacity_mah.max(persisted_capacity)
+        });
+        let sample_raw = last_sample
+            .and_then(|sample| u16::try_from(sample.capacity_mah % CAPACITY_MODULUS_MAH).ok());
+        let previous_raw = if matches!(
+            test.state,
+            TestState::Starting
+                | TestState::Running
+                | TestState::Stopping
+                | TestState::RecoveredUncertain
+        ) {
+            sample_raw.or(device.capacity_mah)
+        } else {
+            device.capacity_mah.or(sample_raw)
+        };
+        Self {
+            capacity_mah,
+            previous_raw,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.capacity_mah = 0;
+        self.previous_raw = None;
+    }
+
+    fn rebase(&mut self, raw: u16) {
+        self.previous_raw = Some(raw);
+    }
+
+    fn observe(&mut self, raw: u16, allow_wrap: bool) -> u64 {
+        let Some(previous) = self.previous_raw else {
+            self.previous_raw = Some(raw);
+            self.capacity_mah = self.capacity_mah.max(u64::from(raw));
+            return self.capacity_mah;
+        };
+        if raw >= previous {
+            self.capacity_mah = self.capacity_mah.saturating_add(u64::from(raw - previous));
+            self.previous_raw = Some(raw);
+        } else if previous >= CAPACITY_WRAP_HIGH_WATER && raw <= CAPACITY_WRAP_LOW_WATER {
+            if allow_wrap {
+                self.capacity_mah = self
+                    .capacity_mah
+                    .saturating_add(CAPACITY_MODULUS_MAH - u64::from(previous) + u64::from(raw));
+            }
+            self.previous_raw = Some(raw);
+        }
+        self.capacity_mah
+    }
+}
+
+pub struct TestController {
+    mode: ControllerMode,
+    connected: bool,
+    device: DeviceState,
+    test: TestStatus,
+    lifecycle: Lifecycle,
+    stopping_owns_metrics: bool,
+    // Deduplicate only until a new report evaluates this Stop intent. A later
+    // Active report means it is still unconfirmed and an explicit retry may write.
+    stop_awaiting_report: bool,
+    physical: PhysicalState,
+    connection_generation: u64,
+    authority_generation: u64,
+    operation_epoch: u64,
+    next_attempt: std::cell::Cell<u64>,
+    completed_attempt: u64,
+    report_generation: Option<u64>,
+    // Also bounds the initial wait for observation after connecting. A deadline
+    // alone never grants authority: a current-generation report is still required.
+    report_freshness_deadline: Option<Instant>,
+    // Strict receipt-time fence: buffered observations cannot acknowledge later
+    // intent, including timestamp ties on coarse-resolution browser clocks.
+    report_not_before: Option<Instant>,
+    acquisition_deadline: Option<Instant>,
+    resume_capacity_baseline: Option<u16>,
+    calibration_staging: CalibrationStaging,
+    clock: TestClock,
+    energy: EnergyAccumulator,
+    capacity: CapacityAccumulator,
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "runtime identities must never wrap; exhaustion fails closed"
+)]
+impl TestController {
+    fn allocate_attempt(&self) -> u64 {
+        let next = self
+            .next_attempt
+            .get()
+            .checked_add(1)
+            .expect("command attempt identities exhausted");
+        self.next_attempt.set(next);
+        next
+    }
+
+    pub(crate) fn authority_token(&self) -> AuthorityToken {
+        AuthorityToken {
+            connection: self.connection_generation,
+            operation: self.operation_epoch,
+            authority: self.authority_generation,
+        }
+    }
+
+    pub(crate) fn token_is_current(&self, token: AuthorityToken) -> bool {
+        token == self.authority_token() && self.connected
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn safety_token_is_current(&self, token: AuthorityToken) -> bool {
+        token.connection == self.connection_generation
+            && token.operation == self.operation_epoch
+            && self.connected
+    }
+
+    pub(crate) fn completion_is_current(&self, prepared: PreparedCommand) -> bool {
+        prepared.connection_generation == self.connection_generation
+            && prepared.operation_epoch == self.operation_epoch
+            && prepared.attempt_id > self.completed_attempt
+            && self.connected
+    }
+
+    /// Accepted safety intent cancels ordinary control before the write is
+    /// awaited. Retain at most the final-counter attribution, not Active control.
+    pub(crate) fn accept_stop_at(&mut self, prepared: PreparedCommand, now: Instant) {
+        if !matches!(prepared.frame, Some(OutboundFrame::Stop))
+            || !self.completion_is_current(prepared)
+        {
+            return;
+        }
+        if self.lifecycle != Lifecycle::Stopping {
+            self.stopping_owns_metrics = self.lifecycle == Lifecycle::RunningOwned;
+            self.clock.stop(now);
+            self.energy.break_gap();
+            self.acquisition_deadline = None;
+            self.lifecycle = Lifecycle::Stopping;
+            self.test.state = TestState::Stopping;
+            self.authority_generation = self
+                .authority_generation
+                .checked_add(1)
+                .expect("authority generations exhausted");
+            self.update_elapsed_at(now);
+        }
+    }
+
+    #[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
+    pub(crate) fn ingress_context(&self) -> (u64, Option<Instant>) {
+        (self.connection_generation, self.report_not_before)
+    }
+
+    pub fn new(mode: ControllerMode) -> Self {
+        Self::from_state(mode, DeviceState::default(), TestStatus::default(), None)
+    }
+
+    pub fn from_state(
+        mode: ControllerMode,
+        mut device: DeviceState,
+        mut test: TestStatus,
+        last_sample: Option<&Sample>,
+    ) -> Self {
+        // Restored DTOs are history, never evidence of a write or observation.
+        // Sanitize here as well as in persistence so an alternate constructor
+        // caller cannot reconstruct a live acquisition or integration endpoint.
+        device.activity_known = false;
+        device.active = false;
+        let lifecycle = if matches!(
+            test.state,
+            TestState::Starting
+                | TestState::Running
+                | TestState::Stopping
+                | TestState::RecoveredUncertain
+        ) {
+            test.state = TestState::RecoveredUncertain;
+            test.result.get_or_insert_with(|| {
+                "restored physical work is unowned and uncertain".to_owned()
+            });
+            Lifecycle::RecoveredUncertain
+        } else {
+            Lifecycle::Idle
+        };
+        Self {
+            mode,
+            connected: false,
+            clock: TestClock::new(test.elapsed_seconds),
+            energy: EnergyAccumulator::from_state(&test, None),
+            capacity: CapacityAccumulator::from_state(&device, &test, last_sample),
+            device,
+            test,
+            lifecycle,
+            stopping_owns_metrics: false,
+            stop_awaiting_report: false,
+            physical: PhysicalState::Unknown,
+            connection_generation: 0,
+            authority_generation: 0,
+            operation_epoch: 0,
+            next_attempt: std::cell::Cell::new(0),
+            completed_attempt: 0,
+            report_generation: None,
+            report_freshness_deadline: None,
+            report_not_before: None,
+            acquisition_deadline: None,
+            resume_capacity_baseline: None,
+            calibration_staging: CalibrationStaging::default(),
+        }
+    }
+
+    pub fn device(&self) -> &DeviceState {
+        &self.device
+    }
+
+    pub fn test(&self) -> &TestStatus {
+        &self.test
+    }
+
+    pub fn set_device_identity(
+        &mut self,
+        model: Option<String>,
+        firmware_version: Option<String>,
+        voltage_mv: Option<u16>,
+    ) {
+        self.device.model = model;
+        self.device.firmware_version = firmware_version;
+        self.device.voltage_mv = voltage_mv;
+    }
+
+    pub fn set_current_ma(&mut self, current_ma: u16) {
+        self.device.current_ma = Some(current_ma);
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.clock.elapsed(Instant::now())
+    }
+
+    pub fn physical_state(&self) -> PhysicalState {
+        self.physical
+    }
+
+    pub fn is_starting(&self) -> bool {
+        self.lifecycle == Lifecycle::Starting
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.lifecycle == Lifecycle::Stopping
+    }
+
+    pub fn is_running_owned(&self) -> bool {
+        self.lifecycle == Lifecycle::RunningOwned
+    }
+
+    pub fn requires_stop_before_disconnect(&self) -> bool {
+        self.requires_stop_at(Instant::now())
+    }
+
+    fn requires_stop_at(&self, now: Instant) -> bool {
+        (self.connected && !self.has_fresh_report(PhysicalState::Inactive, now))
+            || self.device.active
+            || matches!(
+                self.test.state,
+                TestState::Starting
+                    | TestState::Running
+                    | TestState::Stopping
+                    | TestState::RecoveredUncertain
+            )
+    }
+
+    pub fn begin_connection(&mut self, reason: &str) {
+        self.invalidate_for_gap(reason);
+        self.connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .expect("connection generations exhausted");
+        self.connected = false;
+    }
+
+    pub fn connection_established(&mut self) {
+        self.connection_established_at(Instant::now());
+    }
+
+    pub fn connection_established_at(&mut self, now: Instant) {
+        if self.connected {
+            // Repeated transport status is not a newly observed physical report.
+            return;
+        }
+        self.connected = true;
+        self.report_freshness_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
+        self.report_not_before = Some(now);
+    }
+
+    pub fn disconnect(&mut self, reason: &str) {
+        self.connected = false;
+        self.invalidate_for_gap(reason);
+    }
+
+    pub fn invalidate_for_gap(&mut self, reason: &str) {
+        self.invalidate_for_gap_at(reason, Instant::now());
+    }
+
+    fn invalidate_for_gap_at(&mut self, reason: &str, now: Instant) {
+        self.authority_generation = self
+            .authority_generation
+            .checked_add(1)
+            .expect("authority generations exhausted");
+        let contradiction = self.lifecycle == Lifecycle::Idle
+            && (self.physical == PhysicalState::Active || self.device.active);
+        if matches!(
+            self.lifecycle,
+            Lifecycle::Starting
+                | Lifecycle::RunningOwned
+                | Lifecycle::Closing
+                | Lifecycle::Stopping
+                | Lifecycle::RecoveredUncertain
+        ) || contradiction
+        {
+            self.lifecycle = Lifecycle::RecoveredUncertain;
+            self.test.state = TestState::RecoveredUncertain;
+            self.test.result = Some(reason.to_owned());
+        }
+        self.physical = PhysicalState::Unknown;
+        self.stopping_owns_metrics = false;
+        self.acquisition_deadline = None;
+        self.resume_capacity_baseline = None;
+        self.report_generation = None;
+        self.stop_awaiting_report = false;
+        self.report_freshness_deadline = None;
+        self.device.activity_known = false;
+        self.device.active = false;
+        self.calibration_staging = CalibrationStaging::default();
+        self.clock.stop(now);
+        self.energy.break_gap();
+        self.update_elapsed_at(now);
+    }
+
+    /// One-shot loss of observation, without closing the command transport.
+    /// Call before reports, user intent, and autonomous progression. A later
+    /// report restores observation but cannot restore the revoked lifecycle.
+    pub fn expire_report_freshness(&mut self, now: Instant) -> bool {
+        if self.connected
+            && let Some(deadline) = self.report_freshness_deadline
+            && now >= deadline
+        {
+            // Late ticks (including browser suspension) cannot count elapsed
+            // owned time after the observation deadline.
+            self.invalidate_for_gap_at(REPORT_TIMEOUT_REASON, deadline);
+            return true;
+        }
+        if let Some(deadline) = self.acquisition_deadline
+            && now >= deadline
+        {
+            // Knowledge has its own deadline. Healthy inactive telemetry does
+            // not renew the transmitted intent's attribution window.
+            self.authority_generation = self
+                .authority_generation
+                .checked_add(1)
+                .expect("authority generations exhausted");
+            self.acquisition_deadline = None;
+            self.lifecycle = Lifecycle::RecoveredUncertain;
+            self.test.state = TestState::RecoveredUncertain;
+            self.test.result = Some(ACQUISITION_TIMEOUT_REASON.to_owned());
+            self.calibration_staging = CalibrationStaging::default();
+            self.clock.stop(deadline);
+            self.energy.break_gap();
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub fn replace_authoritative(
+        &mut self,
+        connected: bool,
+        device: DeviceState,
+        test: TestStatus,
+    ) {
+        self.connected = connected;
+        self.physical = if !device.activity_known {
+            PhysicalState::Unknown
+        } else if device.active {
+            PhysicalState::Active
+        } else {
+            PhysicalState::Inactive
+        };
+        self.report_generation = device.activity_known.then_some(self.connection_generation);
+        // Snapshot replacement is not a physical report and cannot refresh age.
+        self.lifecycle = match test.state {
+            TestState::Starting => Lifecycle::Starting,
+            TestState::Running if device.active => Lifecycle::RunningOwned,
+            TestState::Stopping => Lifecycle::Stopping,
+            TestState::RecoveredUncertain => Lifecycle::RecoveredUncertain,
+            _ => Lifecycle::Idle,
+        };
+        self.stopping_owns_metrics = false;
+        let running = test.state == TestState::Running && device.activity_known && device.active;
+        self.stop_awaiting_report = false;
+        self.clock.replace(test.elapsed_seconds, running);
+        self.energy = EnergyAccumulator::from_state(&test, None);
+        self.capacity = CapacityAccumulator::from_state(&device, &test, None);
+        self.device = device;
+        self.test = test;
+    }
+
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities_at(Instant::now())
+    }
+
+    pub fn capabilities_at(&self, now: Instant) -> Capabilities {
+        let fresh_inactive = self.has_fresh_report(PhysicalState::Inactive, now);
+        let fresh_active = self.has_fresh_report(PhysicalState::Active, now);
+        let live_voltage = self.device.voltage_mv.unwrap_or(0) > 0;
+        let start = self.lifecycle == Lifecycle::Idle
+            && fresh_inactive
+            && live_voltage
+            && matches!(
+                self.test.state,
+                TestState::Idle | TestState::Stopped | TestState::Completed
+            );
+        let resume = self.lifecycle == Lifecycle::Idle
+            && fresh_inactive
+            && live_voltage
+            && self.test.state == TestState::Stopped;
+        let show_stop = self.requires_stop_at(now);
+        let stop = show_stop && !self.stop_is_deduplicated_at(now) && self.connected;
+        let adjust = self.lifecycle == Lifecycle::RunningOwned
+            && fresh_active
+            && self.test.state == TestState::Running
+            && self.device.mode == Some(DeviceMode::DischargeConstantCurrent);
+        let calibration_state_allowed = !matches!(
+            self.lifecycle,
+            Lifecycle::RecoveredUncertain | Lifecycle::Starting | Lifecycle::Stopping
+        );
+        let calibrate_voltage = (fresh_inactive
+            || (fresh_active && self.lifecycle == Lifecycle::RunningOwned))
+            && calibration_state_allowed
+            && self.lifecycle != Lifecycle::Closing
+            && live_voltage;
+        let calibrate_current = calibrate_voltage
+            && self.lifecycle == Lifecycle::RunningOwned
+            && fresh_active
+            && self.device.mode == Some(DeviceMode::DischargeConstantCurrent);
+        Capabilities {
+            start,
+            resume,
+            stop,
+            show_stop,
+            adjust,
+            calibrate_voltage,
+            calibrate_current,
+            confirm_calibration: calibrate_voltage && self.calibration_staging.complete(),
+        }
+    }
+
+    /// Validates a semantic command and returns its optional protocol action.
+    ///
+    /// # Errors
+    /// Returns an error when the current connection, report freshness, lifecycle,
+    /// configuration, or calibration state does not permit the command.
+    pub fn prepare_command(&self, command: ApiCommand) -> Result<PreparedCommand, String> {
+        self.prepare_command_at(command, Instant::now())
+    }
+
+    /// Age-aware validation also closes the interval between backend ticks.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe intent or invalid configuration.
+    #[expect(clippy::too_many_lines)]
+    pub fn prepare_command_at(
+        &self,
+        command: ApiCommand,
+        now: Instant,
+    ) -> Result<PreparedCommand, String> {
+        if !self.connected {
+            return Err("device is not connected".to_owned());
+        }
+        let (frame, kind) = match command {
+            ApiCommand::Connect | ApiCommand::Disconnect => {
+                return Err("connection commands are transport-owned".to_owned());
+            }
+            ApiCommand::Start(config) => {
+                if !self.capabilities_at(now).start {
+                    return Err(
+                        "start requires a fresh current-connection inactive report".to_owned()
+                    );
+                }
+                config.validate().map_err(|error| error.to_string())?;
+                (Some(test_frame(&config, false)), CommandKind::Start)
+            }
+            ApiCommand::Adjust(config) => {
+                if !self.capabilities_at(now).adjust {
+                    return Err(
+                        "adjustment requires a confirmed backend-owned running test".to_owned()
+                    );
+                }
+                config.validate().map_err(|error| error.to_string())?;
+                let TestConfiguration::DischargeConstantCurrent {
+                    current_ma,
+                    cutoff_voltage_mv,
+                    cutoff_time_min,
+                } = config
+                else {
+                    return Err("only constant-current discharge can be adjusted".to_owned());
+                };
+                (
+                    Some(OutboundFrame::AdjustConstantCurrentDischarge(
+                        current_ma,
+                        cutoff_voltage_mv,
+                        cutoff_time_min,
+                    )),
+                    CommandKind::Adjust,
+                )
+            }
+            ApiCommand::Stop => {
+                if self.stop_is_deduplicated_at(now) {
+                    (None, CommandKind::Stop)
+                } else {
+                    if !self.capabilities_at(now).stop {
+                        return Err("there is no active or uncertain test to stop".to_owned());
+                    }
+                    (Some(OutboundFrame::Stop), CommandKind::Stop)
+                }
+            }
+            ApiCommand::Resume => {
+                let config = self
+                    .test
+                    .config
+                    .ok_or_else(|| "there is no test configuration to resume".to_owned())?;
+                return self.prepare_resume_at(config, now);
+            }
+            ApiCommand::Calibration(calibration) => {
+                calibration.validate().map_err(|error| error.to_string())?;
+                let capabilities = self.capabilities_at(now);
+                let frame = match calibration {
+                    CalibrationCommand::VoltageLow(value)
+                    | CalibrationCommand::VoltageHigh(value)
+                        if !capabilities.calibrate_voltage =>
+                    {
+                        return Err(
+                            "device must provide fresh live voltage before calibration".to_owned()
+                        );
+                    }
+                    CalibrationCommand::CurrentLow(_) | CalibrationCommand::CurrentHigh(_)
+                        if !capabilities.calibrate_current =>
+                    {
+                        return Err(
+                            "constant-current discharge must be active for current calibration"
+                                .to_owned(),
+                        );
+                    }
+                    CalibrationCommand::Confirm if !capabilities.confirm_calibration => {
+                        return Err(
+                            "all four calibration references must be staged on this connection"
+                                .to_owned(),
+                        );
+                    }
+                    CalibrationCommand::VoltageLow(value) => {
+                        OutboundFrame::CalibrateVoltageLow(value)
+                    }
+                    CalibrationCommand::VoltageHigh(value) => {
+                        OutboundFrame::CalibrateVoltageHigh(value)
+                    }
+                    CalibrationCommand::CurrentLow(value) => {
+                        OutboundFrame::CalibrateCurrentLow(value)
+                    }
+                    CalibrationCommand::CurrentHigh(value) => {
+                        OutboundFrame::CalibrateCurrentHigh(value)
+                    }
+                    CalibrationCommand::Confirm => OutboundFrame::CalibrateConfirm,
+                };
+                (Some(frame), CommandKind::Calibration)
+            }
+        };
+        Ok(PreparedCommand {
+            command,
+            resume_config: None,
+            frame,
+            kind,
+            connection_generation: self.connection_generation,
+            authority_generation: self.authority_generation,
+            operation_epoch: self.operation_epoch,
+            attempt_id: self.allocate_attempt(),
+            orchestration_epoch: None,
+        })
+    }
+
+    /// Validates a resume using the supplied direct-client settings.
+    ///
+    /// # Errors
+    /// Returns an error unless the current test is confirmed stopped and the
+    /// supplied configuration is valid.
+    pub fn prepare_resume(&self, config: TestConfiguration) -> Result<PreparedCommand, String> {
+        self.prepare_resume_at(config, Instant::now())
+    }
+
+    /// # Errors
+    /// Returns an error unless a fresh report confirms a stopped test.
+    pub fn prepare_resume_at(
+        &self,
+        config: TestConfiguration,
+        now: Instant,
+    ) -> Result<PreparedCommand, String> {
+        if !self.capabilities_at(now).resume {
+            return Err("resume requires a confirmed inactive stopped test".to_owned());
+        }
+        config.validate().map_err(|error| error.to_string())?;
+        Ok(PreparedCommand {
+            command: ApiCommand::Resume,
+            resume_config: Some(config),
+            frame: Some(test_frame(&config, true)),
+            kind: CommandKind::Resume,
+            connection_generation: self.connection_generation,
+            authority_generation: self.authority_generation,
+            operation_epoch: self.operation_epoch,
+            attempt_id: self.allocate_attempt(),
+            orchestration_epoch: None,
+        })
+    }
+
+    /// Revalidates immediately before a potentially delayed transport write.
+    /// A real safety Stop frame does not require a fresh observation. A no-frame
+    /// Stop completion only acknowledges existing intent and cannot survive loss
+    /// of the authority under which that intent was prepared.
+    ///
+    /// # Errors
+    /// Returns an error if authority or the physical connection changed.
+    pub fn validate_prepared_at(
+        &self,
+        prepared: PreparedCommand,
+        now: Instant,
+    ) -> Result<(), String> {
+        if !self.completion_is_current(prepared) {
+            return Err("command belongs to an old physical connection".to_owned());
+        }
+        if matches!(prepared.frame, Some(OutboundFrame::Stop)) {
+            return Ok(());
+        }
+        if prepared.authority_generation != self.authority_generation {
+            return Err(REPORT_TIMEOUT_REASON.to_owned());
+        }
+        if prepared.kind == CommandKind::Stop && !self.stop_is_deduplicated_at(now) {
+            // A no-frame acknowledgement is never a substitute for a real retry
+            // once observation expires, even before the next backend tick.
+            return Err(REPORT_TIMEOUT_REASON.to_owned());
+        }
+        self.prepare_command_at(prepared.command, now).map(|_| ())
+    }
+
+    pub fn commit_command(
+        &mut self,
+        prepared: PreparedCommand,
+        started_at_utc: Option<String>,
+    ) -> bool {
+        self.commit_command_at(prepared, started_at_utc, Instant::now())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one completion boundary validates and commits exact command semantics"
+    )]
+    pub fn commit_command_at(
+        &mut self,
+        prepared: PreparedCommand,
+        started_at_utc: Option<String>,
+        now: Instant,
+    ) -> bool {
+        // A retired connection's completion has zero authority, even to expire
+        // or move the new session's receipt fence.
+        if !self.completion_is_current(prepared) {
+            return false;
+        }
+        self.expire_report_freshness(now);
+        if prepared.frame.is_some()
+            && matches!(
+                prepared.kind,
+                CommandKind::Start | CommandKind::Resume | CommandKind::Stop
+            )
+        {
+            // Even a late successful write may have affected the hardware. An
+            // observation received during/before that write cannot confirm it.
+            // Adjust/calibration do not establish a new lifecycle: their queued
+            // fresh reports must still observe (and possibly contradict) the
+            // existing owned run rather than being discarded at completion.
+            self.report_not_before = Some(now);
+        }
+        let authorized = self.validate_prepared_at(prepared, now).is_ok();
+        // Outcome handling consumes the attempt even when semantic authority
+        // was revoked. A duplicate late success has zero later live effects.
+        self.completed_attempt = prepared.attempt_id;
+        if !authorized {
+            // The frame may already have reached hardware. Do not treat a late
+            // successful write as fresh intent with newly owned authority.
+            if !matches!(
+                prepared.kind,
+                CommandKind::Adjust | CommandKind::Calibration
+            ) {
+                self.invalidate_for_gap_at(REPORT_TIMEOUT_REASON, now);
+            }
+            if matches!(
+                prepared.kind,
+                CommandKind::Start | CommandKind::Resume | CommandKind::Stop
+            ) {
+                self.lifecycle = Lifecycle::RecoveredUncertain;
+                self.test.state = TestState::RecoveredUncertain;
+                self.test.result = Some(REPORT_TIMEOUT_REASON.to_owned());
+            }
+            return false;
+        }
+        match prepared.command {
+            ApiCommand::Start(config) => {
+                self.resume_capacity_baseline = None;
+                self.operation_epoch = self
+                    .operation_epoch
+                    .checked_add(1)
+                    .expect("operation identities exhausted");
+                self.clock.start_fresh();
+                self.energy.reset();
+                self.capacity.reset();
+                self.lifecycle = Lifecycle::Starting;
+                self.acquisition_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
+                self.stopping_owns_metrics = false;
+                self.physical = PhysicalState::Unknown;
+                self.report_generation = None;
+                self.device.activity_known = false;
+                self.device.active = false;
+                self.device.mode = Some(config.mode());
+                self.test.state = TestState::Starting;
+                self.test.config = Some(config);
+                self.test.started_at_utc = started_at_utc;
+                self.test.elapsed_seconds = 0;
+                self.test.result = None;
+                self.test.capacity_mah = None;
+                self.test.energy_wh = 0.0;
+            }
+            ApiCommand::Stop if self.lifecycle != Lifecycle::Stopping => {
+                self.acquisition_deadline = None;
+                self.clock.stop(now);
+                self.stopping_owns_metrics = self.lifecycle == Lifecycle::RunningOwned;
+                self.lifecycle = Lifecycle::Stopping;
+                self.test.state = TestState::Stopping;
+                self.test.result = None;
+                self.energy.break_gap();
+                self.update_elapsed_at(now);
+            }
+            ApiCommand::Adjust(config) => self.test.config = Some(config),
+            ApiCommand::Resume => {
+                self.operation_epoch = self
+                    .operation_epoch
+                    .checked_add(1)
+                    .expect("operation identities exhausted");
+                // Only a current inactive counter supplies the new segment's
+                // baseline. It never imports raw growth during revoked work.
+                if let Some(raw) = self.device.capacity_mah {
+                    self.capacity.rebase(raw);
+                    self.resume_capacity_baseline = Some(raw);
+                }
+                self.test.config = prepared.resume_config;
+                self.lifecycle = Lifecycle::Starting;
+                self.acquisition_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
+                self.stopping_owns_metrics = false;
+                self.physical = PhysicalState::Unknown;
+                self.report_generation = None;
+                self.device.activity_known = false;
+                self.device.active = false;
+                self.test.state = TestState::Starting;
+                self.test.result = None;
+            }
+            ApiCommand::Calibration(command) => match command {
+                CalibrationCommand::VoltageLow(_) => {
+                    self.calibration_staging.references[0] = true;
+                }
+                CalibrationCommand::VoltageHigh(_) => {
+                    self.calibration_staging.references[1] = true;
+                }
+                CalibrationCommand::CurrentLow(_) => {
+                    self.calibration_staging.references[2] = true;
+                }
+                CalibrationCommand::CurrentHigh(_) => {
+                    self.calibration_staging.references[3] = true;
+                }
+                CalibrationCommand::Confirm => {
+                    self.calibration_staging = CalibrationStaging::default();
+                }
+            },
+            ApiCommand::Connect | ApiCommand::Disconnect | ApiCommand::Stop => {}
+        }
+        if prepared.kind == CommandKind::Stop && prepared.frame.is_some() {
+            self.stop_awaiting_report = true;
+        }
+        true
+    }
+
+    pub fn command_write_failed(&mut self, kind: CommandKind, reason: &str) {
+        self.disconnect(reason);
+        let operation = match kind {
+            CommandKind::Start => "start",
+            CommandKind::Resume => "resume",
+            CommandKind::Stop => "stop",
+            CommandKind::Adjust | CommandKind::Calibration => return,
+        };
+        self.lifecycle = Lifecycle::RecoveredUncertain;
+        self.test.state = TestState::RecoveredUncertain;
+        self.test.result = Some(format!(
+            "{operation} outcome is unknown after a write failure: {reason}"
+        ));
+    }
+
+    #[cfg(test)]
+    pub fn report(&mut self, report: DeviceReport) -> (ReportOutcome, Option<Measurement>) {
+        self.report_at(report, Instant::now())
+    }
+
+    /// Apply an observation using its transport receipt time, not dequeue time.
+    /// Callers must also retain connection identity across asynchronous queues.
+    pub fn report_received_at(
+        &mut self,
+        report: DeviceReport,
+        received_at: Instant,
+        now: Instant,
+    ) -> (ReportOutcome, Option<Measurement>) {
+        self.expire_report_freshness(now);
+        if received_at > now
+            || now >= received_at + REPORT_FRESHNESS_TIMEOUT
+            || self
+                .report_not_before
+                .is_some_and(|floor| received_at <= floor)
+        {
+            return (ReportOutcome::default(), None);
+        }
+        self.apply_report_at(report, received_at)
+    }
+
+    #[cfg(test)]
+    pub fn report_at(
+        &mut self,
+        report: DeviceReport,
+        now: Instant,
+    ) -> (ReportOutcome, Option<Measurement>) {
+        self.apply_report_at(report, now)
+    }
+
+    #[expect(clippy::too_many_lines)]
+    fn apply_report_at(
+        &mut self,
+        report: DeviceReport,
+        now: Instant,
+    ) -> (ReportOutcome, Option<Measurement>) {
+        // Even the first report processed after a suspended event loop must not
+        // bridge an expired observation gap with the old ownership intact.
+        self.expire_report_freshness(now);
+        if !self.connected {
+            return (ReportOutcome::default(), None);
+        }
+        if (matches!(self.lifecycle, Lifecycle::RunningOwned | Lifecycle::Closing)
+            || (self.lifecycle == Lifecycle::Starting && report.state == ReportState::Active)
+            || (self.lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics))
+            && self
+                .test
+                .config
+                .is_some_and(|config| config.mode() != report.mode)
+        {
+            // Revoke ownership before attributing any measurements. Keep the
+            // fresh live observation below; it is not proof of owned work.
+            // While awaiting the first Active, inactive reports may still name
+            // the prior operation's mode; they neither confirm nor revoke Start.
+            self.invalidate_for_gap_at(MODE_CONTRADICTION_REASON, now);
+        }
+        self.report_freshness_deadline = Some(now + REPORT_FRESHNESS_TIMEOUT);
+        let previous_lifecycle = self.lifecycle;
+        // Neither a wire write nor a still-Active report confirms inactivity.
+        // This affects pending intent only, never restores owned metrics/time.
+        self.stop_awaiting_report = false;
+        let active = report.state == ReportState::Active;
+        self.report_generation = Some(self.connection_generation);
+        self.physical = if active {
+            PhysicalState::Active
+        } else {
+            PhysicalState::Inactive
+        };
+        self.device.mode = Some(report.mode);
+        self.device.activity_known = true;
+        self.device.active = active;
+        self.device.voltage_mv = Some(report.voltage_mv);
+        self.device.current_ma = Some(report.current_ma);
+        self.device.capacity_mah = Some(report.capacity_mah);
+        self.device.model = Some(report.model);
+        if report.firmware_version.is_some() {
+            self.device.firmware_version = report.firmware_version;
+        }
+
+        let mut outcome = ReportOutcome {
+            accepted: true,
+            ..ReportOutcome::default()
+        };
+        let measurement = if active {
+            let owns_metrics = match previous_lifecycle {
+                Lifecycle::Starting => {
+                    if let Some(baseline) = self.resume_capacity_baseline.take()
+                        && report.capacity_mah < baseline
+                        && !(baseline >= CAPACITY_WRAP_HIGH_WATER
+                            && report.capacity_mah <= CAPACITY_WRAP_LOW_WATER)
+                    {
+                        // A reset at reacquisition cannot supply an invented
+                        // cross-gap increment. Begin at this counter; later
+                        // owned deltas remain attributable.
+                        self.capacity.rebase(report.capacity_mah);
+                    }
+                    self.acquisition_deadline = None;
+                    self.lifecycle = Lifecycle::RunningOwned;
+                    self.stopping_owns_metrics = false;
+                    self.test.state = TestState::Running;
+                    self.test.result = None;
+                    self.clock.resume(now);
+                    true
+                }
+                Lifecycle::RunningOwned => {
+                    self.clock.resume(now);
+                    true
+                }
+                Lifecycle::Idle | Lifecycle::Closing => {
+                    self.calibration_staging = CalibrationStaging::default();
+                    self.authority_generation = self
+                        .authority_generation
+                        .checked_add(1)
+                        .expect("authority identities exhausted");
+                    self.lifecycle = Lifecycle::RecoveredUncertain;
+                    self.test.state = TestState::RecoveredUncertain;
+                    self.test.result = Some(
+                        "hardware reports an active test not owned by this backend".to_owned(),
+                    );
+                    self.clock.stop(now);
+                    self.energy.break_gap();
+                    false
+                }
+                Lifecycle::Stopping | Lifecycle::RecoveredUncertain => {
+                    self.clock.stop(now);
+                    self.energy.break_gap();
+                    false
+                }
+            };
+            if owns_metrics {
+                let elapsed = self.clock.elapsed(now);
+                let capacity_mah = self.capacity.observe(report.capacity_mah, true);
+                let (capacity_mah, energy_wh) = if self.mode == ControllerMode::Server {
+                    (
+                        capacity_mah,
+                        self.energy.add(
+                            elapsed.as_secs_f64(),
+                            report.voltage_mv,
+                            report.current_ma,
+                        ),
+                    )
+                } else {
+                    (
+                        capacity_mah,
+                        report.voltage_mv as f64 * capacity_mah as f64 / 1_000_000.0,
+                    )
+                };
+                self.test.capacity_mah = Some(capacity_mah);
+                self.test.energy_wh = energy_wh;
+                Some(Measurement {
+                    elapsed_seconds: elapsed.as_secs(),
+                    voltage_mv: report.voltage_mv,
+                    current_ma: report.current_ma,
+                    capacity_mah,
+                    energy_wh,
+                    mode: report.mode,
+                })
+            } else {
+                None
+            }
+        } else {
+            self.clock.stop(now);
+            self.energy.break_gap();
+            self.update_elapsed_at(now);
+            let owns_metrics = previous_lifecycle == Lifecycle::RunningOwned
+                || (previous_lifecycle == Lifecycle::Stopping && self.stopping_owns_metrics);
+            if owns_metrics {
+                let owned_capacity = self.capacity.observe(report.capacity_mah, true);
+                self.test.capacity_mah = Some(owned_capacity);
+                if self.mode == ControllerMode::Direct {
+                    self.test.energy_wh =
+                        report.voltage_mv as f64 * owned_capacity as f64 / 1_000_000.0;
+                }
+            } else if previous_lifecycle != Lifecycle::Starting {
+                self.capacity.rebase(report.capacity_mah);
+            }
+            match previous_lifecycle {
+                Lifecycle::RecoveredUncertain => {
+                    self.lifecycle = Lifecycle::Idle;
+                    self.stopping_owns_metrics = false;
+                    self.test.state = TestState::Stopped;
+                    self.test.result.get_or_insert_with(|| {
+                        "recovered previous test; hardware reports inactive".to_owned()
+                    });
+                    outcome.transitioned_to_inactive = true;
+                }
+                Lifecycle::Starting | Lifecycle::Idle => {}
+                Lifecycle::RunningOwned | Lifecycle::Closing => match report.state {
+                    ReportState::Finished => {
+                        self.lifecycle = Lifecycle::Idle;
+                        self.stopping_owns_metrics = false;
+                        self.test.state = TestState::Completed;
+                        self.test.result = Some("device reported test complete".to_owned());
+                        outcome.transitioned_to_inactive = true;
+                    }
+                    ReportState::Idle => {
+                        self.lifecycle = Lifecycle::Idle;
+                        self.stopping_owns_metrics = false;
+                        self.test.state = TestState::Stopped;
+                        self.test.result = Some("device reported test idle".to_owned());
+                        outcome.transitioned_to_inactive = true;
+                    }
+                    ReportState::InactiveUnknown => {
+                        if previous_lifecycle == Lifecycle::RunningOwned {
+                            self.authority_generation = self
+                                .authority_generation
+                                .checked_add(1)
+                                .expect("authority identities exhausted");
+                        }
+                        self.lifecycle = Lifecycle::Closing;
+                    }
+                    ReportState::Active => unreachable!(),
+                },
+                Lifecycle::Stopping => {
+                    self.lifecycle = Lifecycle::Idle;
+                    self.stopping_owns_metrics = false;
+                    self.test.state = TestState::Stopped;
+                    self.test.result = Some("stop confirmed by hardware".to_owned());
+                    outcome.transitioned_to_inactive = true;
+                }
+            }
+            None
+        };
+        self.update_elapsed_at(now);
+        (outcome, measurement)
+    }
+
+    pub fn next_timer_sync(&mut self) -> Option<u16> {
+        self.next_timer_sync_at(Instant::now())
+    }
+
+    pub fn next_timer_sync_at(&mut self, now: Instant) -> Option<u16> {
+        if self.timer_sync_authorized_at(now) {
+            self.clock.next_timer_sync(now)
+        } else {
+            None
+        }
+    }
+
+    pub fn timer_sync_authorized_at(&self, now: Instant) -> bool {
+        self.lifecycle == Lifecycle::RunningOwned
+            && self.has_fresh_report(PhysicalState::Active, now)
+            && self.test.state == TestState::Running
+    }
+
+    pub fn update_elapsed(&mut self) {
+        self.update_elapsed_at(Instant::now());
+    }
+
+    pub fn update_elapsed_at(&mut self, now: Instant) {
+        self.test.elapsed_seconds = self.clock.elapsed(now).as_secs();
+    }
+
+    #[cfg(all(test, feature = "gui"))]
+    pub(crate) fn set_elapsed_for_test(&mut self, seconds: u64) {
+        self.clock.accumulated = Duration::from_secs(seconds);
+    }
+
+    fn stop_is_deduplicated_at(&self, now: Instant) -> bool {
+        // Unknown observation cannot confirm whether a submitted Stop worked.
+        // Explicit retries remain wire actions without granting fresh authority.
+        self.lifecycle == Lifecycle::Stopping
+            && self.stop_awaiting_report
+            && (self.has_fresh_report(PhysicalState::Active, now)
+                || self.has_fresh_report(PhysicalState::Inactive, now))
+    }
+
+    fn has_fresh_report(&self, physical: PhysicalState, now: Instant) -> bool {
+        self.connected
+            && self
+                .report_freshness_deadline
+                .is_some_and(|deadline| now < deadline)
+            && self.report_generation == Some(self.connection_generation)
+            && self.physical == physical
+            && self.device.activity_known
+    }
+}
+
+pub fn test_frame(config: &TestConfiguration, resume: bool) -> OutboundFrame {
+    match (*config, resume) {
+        (
+            TestConfiguration::DischargeConstantCurrent {
+                current_ma,
+                cutoff_voltage_mv,
+                cutoff_time_min,
+            },
+            false,
+        ) => OutboundFrame::StartConstantCurrentDischarge(
+            current_ma,
+            cutoff_voltage_mv,
+            cutoff_time_min,
+        ),
+        (
+            TestConfiguration::DischargeConstantCurrent {
+                current_ma,
+                cutoff_voltage_mv,
+                cutoff_time_min,
+            },
+            true,
+        ) => OutboundFrame::ContinueConstantCurrentDischarge(
+            current_ma,
+            cutoff_voltage_mv,
+            cutoff_time_min,
+        ),
+        (
+            TestConfiguration::DischargeConstantPower {
+                power_w,
+                cutoff_voltage_mv,
+                cutoff_time_min,
+            },
+            false,
+        ) => {
+            OutboundFrame::StartConstantPowerDischarge(power_w, cutoff_voltage_mv, cutoff_time_min)
+        }
+        (
+            TestConfiguration::DischargeConstantPower {
+                power_w,
+                cutoff_voltage_mv,
+                cutoff_time_min,
+            },
+            true,
+        ) => OutboundFrame::ContinueConstantPowerDischarge(
+            power_w,
+            cutoff_voltage_mv,
+            cutoff_time_min,
+        ),
+        (
+            TestConfiguration::ChargeConstantVoltage {
+                current_ma,
+                voltage_mv,
+                cutoff_current_ma,
+            },
+            false,
+        ) => OutboundFrame::StartConstantVoltageCharge(current_ma, voltage_mv, cutoff_current_ma),
+        (
+            TestConfiguration::ChargeConstantVoltage {
+                current_ma,
+                voltage_mv,
+                cutoff_current_ma,
+            },
+            true,
+        ) => {
+            OutboundFrame::ContinueConstantVoltageCharge(current_ma, voltage_mv, cutoff_current_ma)
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "controller tests should fail fast")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continue_segments_reconnect_wrap_and_reset_without_importing_raw_history() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for (baseline, first, expected) in
+                [(50, 51, 11), (57_599, 0, 11), (50, 0, 10), (0, 1, 11)]
+            {
+                let t0 = Instant::now();
+                let mut c = connected_at(mode, t0);
+                c.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut c, ApiCommand::Start(config()), t0);
+                c.report_at(report(ReportState::Active, 10), t0);
+                c.begin_connection("replacement");
+                c.connection_established_at(t0 + Duration::from_secs(1));
+                c.report_at(
+                    report(ReportState::Idle, baseline),
+                    t0 + Duration::from_secs(2),
+                );
+                commit_at(&mut c, ApiCommand::Resume, t0 + Duration::from_secs(2));
+                let first = c
+                    .report_at(
+                        report(ReportState::Active, first),
+                        t0 + Duration::from_secs(3),
+                    )
+                    .1
+                    .expect("new acquisition");
+                assert_eq!(first.capacity_mah, expected);
+                let next = c
+                    .report_at(
+                        report(
+                            ReportState::Active,
+                            if baseline == 50 && expected == 11 {
+                                52
+                            } else if baseline == 0 {
+                                2
+                            } else {
+                                1
+                            },
+                        ),
+                        t0 + Duration::from_secs(4),
+                    )
+                    .1
+                    .expect("new increment");
+                assert_eq!(next.capacity_mah, expected + 1);
+                if mode == ControllerMode::Direct {
+                    assert!((next.energy_wh - (expected + 1) as f64 * 0.004).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_retired_attempt_has_zero_effect_on_independently_owned_replacement() {
+        let t0 = Instant::now();
+        let mut c = connected_at(ControllerMode::Server, t0);
+        let old = c
+            .prepare_command_at(ApiCommand::Stop, t0)
+            .expect("old real Stop");
+        c.begin_connection("replace");
+        c.connection_established_at(t0);
+        c.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut c, ApiCommand::Start(config()), t0);
+        c.report_at(report(ReportState::Active, 1), t0);
+        let state = c.test.clone();
+        let device = c.device.clone();
+        let fence = c.report_not_before;
+        let deadline = c.report_freshness_deadline;
+        assert!(!c.commit_command_at(old, None, t0 + Duration::from_secs(100)));
+        assert_eq!(c.test, state);
+        assert_eq!(c.device, device);
+        assert_eq!(c.report_not_before, fence);
+        assert_eq!(c.report_freshness_deadline, deadline);
+        assert!(c.is_running_owned());
+    }
+
+    #[test]
+    fn continue_excludes_unowned_raw_capacity_in_both_modes() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for contradiction in [false, true] {
+                let t0 = Instant::now();
+                let mut c = connected_at(mode, t0);
+                c.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut c, ApiCommand::Start(config()), t0);
+                c.report_at(report(ReportState::Active, 10), t0);
+                if contradiction {
+                    let mut wrong = report(ReportState::Active, 50);
+                    wrong.mode = DeviceMode::DischargeConstantPower;
+                    c.report_at(wrong, t0 + Duration::from_secs(1));
+                } else {
+                    c.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT);
+                }
+                let recovered = t0 + Duration::from_secs(11);
+                c.report_at(report(ReportState::Idle, 50), recovered);
+                commit_at(&mut c, ApiCommand::Resume, recovered);
+                let first = c
+                    .report_at(
+                        report(ReportState::Active, 51),
+                        recovered + Duration::from_secs(1),
+                    )
+                    .1
+                    .expect("new owned segment");
+                assert_eq!(first.capacity_mah, 11, "unowned +40 must not be imported");
+                let next = c
+                    .report_at(
+                        report(ReportState::Active, 52),
+                        recovered + Duration::from_secs(2),
+                    )
+                    .1
+                    .expect("owned increment");
+                assert_eq!(next.capacity_mah, 12);
+                if mode == ControllerMode::Direct {
+                    assert!((first.energy_wh - 0.044).abs() < 1e-10);
+                    assert!((next.energy_wh - 0.048).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_expires_at_write_deadline_despite_fresh_inactive_reports() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            let t0 = Instant::now();
+            let mut c = TestController::new(mode);
+            c.begin_connection("connect");
+            c.connection_established_at(t0);
+            c.report_at(report(ReportState::Idle, 0), t0);
+            let start = c
+                .prepare_command_at(ApiCommand::Start(config()), t0)
+                .expect("Start");
+            assert!(c.commit_command_at(start, None, t0));
+            for second in 1..10 {
+                c.report_at(
+                    report(ReportState::Idle, 0),
+                    t0 + Duration::from_secs(second),
+                );
+                assert!(c.is_starting());
+            }
+            c.report_at(report(ReportState::Active, 1), t0 + Duration::from_secs(10));
+            assert!(!c.is_running_owned(), "equality must abandon acquisition");
+            assert!(!c.is_starting());
+            assert_eq!(c.test().capacity_mah, None);
+            assert!(c.device().active);
+        }
+    }
+
+    #[test]
+    fn firmware_inactive_closes_control_without_losing_terminal_classification() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for terminal in [
+                ReportState::Active,
+                ReportState::Finished,
+                ReportState::Idle,
+            ] {
+                let mut c = controller();
+                c.mode = mode;
+                commit(&mut c, ApiCommand::Start(config()));
+                c.report(report(ReportState::Active, 10));
+                c.report(report(ReportState::InactiveUnknown, 11));
+                assert!(
+                    !c.is_running_owned(),
+                    "inactive firmware is not dormant ownership"
+                );
+                assert!(!c.timer_sync_authorized_at(Instant::now()));
+                assert!(!c.capabilities().start);
+                let (_, measurement) = c.report(report(terminal, 12));
+                assert!(measurement.is_none());
+                assert!(!c.is_running_owned());
+                if terminal == ReportState::Finished {
+                    assert_eq!(c.test().state, TestState::Completed);
+                } else if terminal == ReportState::Idle {
+                    assert_eq!(c.test().state, TestState::Stopped);
+                } else {
+                    assert_eq!(c.test().capacity_mah, Some(11));
+                    assert!(c.capabilities().stop);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unowned_active_and_confirm_calibration_have_identical_guards() {
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            let mut c = controller();
+            c.mode = mode;
+            assert!(
+                c.prepare_command(ApiCommand::Calibration(CalibrationCommand::Confirm))
+                    .is_err()
+            );
+            c.report(report(ReportState::Active, 50));
+            assert!(!c.capabilities().calibrate_voltage);
+            assert!(
+                c.prepare_command(ApiCommand::Calibration(CalibrationCommand::VoltageLow(
+                    4000
+                )))
+                .is_err()
+            );
+            assert!(c.capabilities().stop);
+        }
+    }
+
+    fn controller() -> TestController {
+        let mut controller = TestController::new(ControllerMode::Server);
+        controller.begin_connection("connect");
+        controller.connection_established();
+        controller.report(report(ReportState::Idle, 0));
+        controller
+    }
+
+    fn config() -> TestConfiguration {
+        TestConfiguration::DischargeConstantCurrent {
+            current_ma: 1000,
+            cutoff_voltage_mv: 3000,
+            cutoff_time_min: 0,
+        }
+    }
+
+    fn report(state: ReportState, capacity_mah: u16) -> DeviceReport {
+        DeviceReport {
+            mode: DeviceMode::DischargeConstantCurrent,
+            state,
+            voltage_mv: 4000,
+            current_ma: if state == ReportState::Active {
+                1000
+            } else {
+                0
+            },
+            capacity_mah,
+            model: "EBC-A20".to_owned(),
+            firmware_version: None,
+        }
+    }
+
+    fn commit(controller: &mut TestController, command: ApiCommand) {
+        let prepared = controller
+            .prepare_command(command)
+            .expect("prepare command");
+        controller.commit_command(prepared, None);
+    }
+
+    fn connected_at(mode: ControllerMode, now: Instant) -> TestController {
+        let mut controller = TestController::new(mode);
+        controller.begin_connection("connect");
+        controller.connection_established_at(now);
+        controller
+    }
+
+    #[test]
+    fn unknown_and_stale_inactive_stop_eligibility_is_independent_of_run_metadata() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            for state in [TestState::Idle, TestState::Stopped, TestState::Completed] {
+                let mut controller = connected_at(mode, t0);
+                controller.test.state = state;
+                for now in [
+                    t0,
+                    t0 + REPORT_FRESHNESS_TIMEOUT,
+                    t0 + Duration::from_secs(60),
+                ] {
+                    controller.expire_report_freshness(now);
+                    assert!(controller.capabilities_at(now).stop);
+                    let stop = controller
+                        .prepare_command_at(ApiCommand::Stop, now)
+                        .expect("unknown Stop");
+                    assert!(matches!(stop.frame(), Some(OutboundFrame::Stop)));
+                    assert!(controller.commit_command_at(stop, None, now));
+                    assert!(!controller.device.activity_known);
+                    assert!(!controller.is_running_owned());
+                }
+                controller.report_at(report(ReportState::Idle, 0), t0);
+                assert!(!controller.capabilities_at(t0).stop);
+                assert!(
+                    controller
+                        .capabilities_at(t0 + REPORT_FRESHNESS_TIMEOUT)
+                        .stop
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receive_age_is_inclusive_and_pre_command_reports_cannot_acknowledge_intent() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            for age in [
+                REPORT_FRESHNESS_TIMEOUT
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("deadline minus one nanosecond"),
+                REPORT_FRESHNESS_TIMEOUT,
+                REPORT_FRESHNESS_TIMEOUT + Duration::from_nanos(1),
+            ] {
+                let mut controller = connected_at(
+                    mode,
+                    t0.checked_sub(Duration::from_nanos(1))
+                        .expect("connection before receipt"),
+                );
+                let (outcome, _) =
+                    controller.report_received_at(report(ReportState::Idle, 0), t0, t0 + age);
+                assert_eq!(outcome.accepted, age < REPORT_FRESHNESS_TIMEOUT);
+                assert_eq!(
+                    controller.capabilities_at(t0 + age).start,
+                    age < REPORT_FRESHNESS_TIMEOUT
+                );
+                assert!(
+                    controller
+                        .capabilities_at(t0 + REPORT_FRESHNESS_TIMEOUT)
+                        .stop
+                );
+            }
+            let mut controller = connected_at(
+                mode,
+                t0.checked_sub(Duration::from_nanos(1))
+                    .expect("connection before receipt"),
+            );
+            controller.report_received_at(report(ReportState::Idle, 0), t0, t0);
+            let start = controller
+                .prepare_command_at(ApiCommand::Start(config()), t0)
+                .expect("prepare");
+            let committed_at = t0 + Duration::from_secs(1);
+            assert!(controller.commit_command_at(start, None, committed_at));
+            for state in [ReportState::Idle, ReportState::Active] {
+                assert!(
+                    !controller
+                        .report_received_at(report(state, 30), t0, committed_at)
+                        .0
+                        .accepted
+                );
+                assert_eq!(controller.test.state, TestState::Starting);
+                assert!(
+                    !controller
+                        .report_received_at(report(state, 30), committed_at, committed_at)
+                        .0
+                        .accepted,
+                    "a timestamp tie cannot acknowledge a command"
+                );
+            }
+            let post_command = committed_at + Duration::from_nanos(1);
+            assert!(
+                controller
+                    .report_received_at(report(ReportState::Active, 1), post_command, post_command)
+                    .1
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_queued_contradiction_during_non_lifecycle_write_revokes_existing_ownership() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for command in [
+                ApiCommand::Adjust(config()),
+                ApiCommand::Calibration(CalibrationCommand::VoltageLow(4000)),
+            ] {
+                let mut controller = connected_at(mode, t0);
+                controller.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut controller, ApiCommand::Start(config()), t0);
+                controller.report_at(report(ReportState::Active, 1), t0 + Duration::from_secs(1));
+                let prepared = controller
+                    .prepare_command_at(command, t0 + Duration::from_secs(2))
+                    .expect("non-lifecycle write");
+                assert!(controller.commit_command_at(prepared, None, t0 + Duration::from_secs(4)));
+                let mut contradiction = report(ReportState::Active, 30);
+                contradiction.mode = DeviceMode::DischargeConstantPower;
+                let (outcome, measurement) = controller.report_received_at(
+                    contradiction,
+                    t0 + Duration::from_secs(3),
+                    t0 + Duration::from_secs(4),
+                );
+                assert!(
+                    outcome.accepted,
+                    "fresh pre-completion reports still observe the existing physical run"
+                );
+                assert!(measurement.is_none());
+                assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+                assert!(controller.device.active);
+                assert!(!controller.timer_sync_authorized_at(t0 + Duration::from_secs(4)));
+                assert_eq!(controller.test.capacity_mah, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn starting_ignores_other_mode_inactive_reports_until_expected_active_confirmation() {
+        let t0 = Instant::now();
+        let configs = [
+            config(),
+            TestConfiguration::DischargeConstantPower {
+                power_w: 25,
+                cutoff_voltage_mv: 3000,
+                cutoff_time_min: 0,
+            },
+            TestConfiguration::ChargeConstantVoltage {
+                current_ma: 1000,
+                voltage_mv: 4200,
+                cutoff_current_ma: 100,
+            },
+        ];
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for wanted in configs {
+                for observed in configs {
+                    for state in [
+                        ReportState::Idle,
+                        ReportState::Finished,
+                        ReportState::InactiveUnknown,
+                    ] {
+                        let mut controller = connected_at(mode, t0);
+                        controller.report_at(report(ReportState::Idle, 0), t0);
+                        commit_at(&mut controller, ApiCommand::Start(wanted), t0);
+                        let mut inactive = report(state, 30);
+                        inactive.mode = observed.mode();
+                        let at = t0 + Duration::from_secs(1);
+                        let (outcome, measurement) =
+                            controller.report_received_at(inactive, at, at);
+                        assert!(outcome.accepted);
+                        assert!(measurement.is_none());
+                        assert_eq!(
+                            controller.test.state,
+                            TestState::Starting,
+                            "inactive reports of a prior mode cannot resolve pending Start"
+                        );
+                        assert_eq!(controller.test.capacity_mah, None);
+                        assert!(controller.capabilities_at(at).stop);
+                        let mut active = report(ReportState::Active, 1);
+                        active.mode = wanted.mode();
+                        let at = t0 + Duration::from_secs(2);
+                        assert!(controller.report_received_at(active, at, at).1.is_some());
+                        assert!(controller.is_running_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit_at(controller: &mut TestController, command: ApiCommand, now: Instant) {
+        let prepared = controller
+            .prepare_command_at(command, now)
+            .expect("prepare");
+        controller.commit_command_at(prepared, None, now);
+    }
+
+    #[test]
+    fn no_frame_stop_loses_authorization_at_deadline_even_without_expiry_tick() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut controller, ApiCommand::Start(config()), t0);
+        controller.report_at(report(ReportState::Active, 1), t0);
+        commit_at(&mut controller, ApiCommand::Stop, t0);
+        let before = t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1));
+        let ack = controller
+            .prepare_command_at(ApiCommand::Stop, before)
+            .expect("no-frame Stop");
+        assert!(ack.frame().is_none());
+        assert!(controller.validate_prepared_at(ack, before).is_ok());
+        let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+        assert!(controller.validate_prepared_at(ack, boundary).is_err());
+        assert!(controller.capabilities_at(boundary).stop);
+        let retry = controller
+            .prepare_command_at(ApiCommand::Stop, boundary)
+            .expect("real retry");
+        assert!(matches!(retry.frame(), Some(OutboundFrame::Stop)));
+        assert!(controller.commit_command_at(retry, None, boundary));
+        assert!(!controller.device().activity_known);
+        assert!(!controller.is_running_owned());
+    }
+
+    #[test]
+    fn report_authority_expires_at_exact_boundary_once_in_both_modes() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            let mut controller = connected_at(mode, t0);
+            assert!(!controller.device.activity_known);
+            assert!(!controller.capabilities_at(t0).start);
+            controller.report_at(report(ReportState::Idle, 0), t0);
+            assert!(controller.capabilities_at(t0).start);
+            let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+            assert!(!controller.expire_report_freshness(
+                t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1))
+            ));
+            assert!(controller.device.activity_known);
+            assert!(controller.expire_report_freshness(boundary));
+            assert_eq!(controller.physical_state(), PhysicalState::Unknown);
+            assert!(!controller.device.activity_known);
+            assert!(controller.connected);
+            assert!(!controller.capabilities_at(boundary).start);
+            let state = controller.test.clone();
+            assert!(!controller.expire_report_freshness(boundary + Duration::from_secs(100)));
+            assert_eq!(controller.test, state);
+            controller.report_at(
+                report(ReportState::Idle, 0),
+                boundary + Duration::from_secs(101),
+            );
+            assert!(controller.device.activity_known);
+            assert!(
+                controller
+                    .capabilities_at(boundary + Duration::from_secs(101))
+                    .start
+            );
+        }
+    }
+
+    #[test]
+    fn initial_observation_wait_is_bounded_but_never_grants_authority() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        assert!(controller.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT));
+        assert!(!controller.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT));
+        assert!(!controller.capabilities_at(t0).start);
+    }
+
+    #[test]
+    fn repeated_connected_status_cannot_extend_report_authority() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        controller.connection_established_at(t0 + Duration::from_secs(9));
+        assert!(controller.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT));
+        controller.connection_established_at(t0 + Duration::from_secs(20));
+        assert_eq!(controller.report_freshness_deadline, None);
+        assert!(
+            !controller
+                .capabilities_at(t0 + Duration::from_secs(20))
+                .start
+        );
+    }
+
+    #[test]
+    fn first_idle_report_after_initial_deadline_restores_only_observation() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        let late = t0 + REPORT_FRESHNESS_TIMEOUT;
+        assert!(
+            controller
+                .report_at(report(ReportState::Idle, 0), late)
+                .1
+                .is_none()
+        );
+        assert!(controller.device.activity_known);
+        assert_eq!(controller.test.state, TestState::Idle);
+        assert!(controller.capabilities_at(late).start);
+        assert!(!controller.is_running_owned());
+    }
+
+    #[test]
+    fn snapshot_constructor_cannot_recreate_transmitted_intent_or_running_authority() {
+        let now = Instant::now();
+        for mode in [ControllerMode::Direct, ControllerMode::Server] {
+            for state in [TestState::Starting, TestState::Running, TestState::Stopping] {
+                let device = DeviceState {
+                    activity_known: true,
+                    active: true,
+                    ..DeviceState::default()
+                };
+                let test = TestStatus {
+                    state,
+                    config: Some(config()),
+                    capacity_mah: Some(10),
+                    energy_wh: 1.0,
+                    ..TestStatus::default()
+                };
+                let mut controller = TestController::from_state(mode, device, test, None);
+                controller.connection_established_at(now);
+                let (_, measurement) = controller.report_received_at(
+                    report(ReportState::Active, 50),
+                    now + Duration::from_secs(1),
+                    now + Duration::from_secs(1),
+                );
+                assert!(
+                    measurement.is_none(),
+                    "a historical status is not a successful new acquisition"
+                );
+                assert!(!controller.is_running_owned());
+                assert_eq!(controller.test.capacity_mah, Some(10));
+                assert_eq!(controller.test.energy_wh, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn contradictory_inactive_preserves_the_revocation_reason() {
+        let now = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, now);
+        controller.report_at(report(ReportState::Idle, 0), now);
+        commit_at(&mut controller, ApiCommand::Start(config()), now);
+        controller.report_at(report(ReportState::Active, 10), now);
+        let mut contrary = report(ReportState::Idle, 50);
+        contrary.mode = DeviceMode::DischargeConstantPower;
+        controller.report_at(contrary, now + Duration::from_secs(1));
+        assert!(controller.device.activity_known && !controller.device.active);
+        assert!(!controller.is_running_owned());
+        assert_eq!(
+            controller.test.result.as_deref(),
+            Some(MODE_CONTRADICTION_REASON)
+        );
+    }
+
+    #[test]
+    fn denied_lifecycle_completion_is_consumed_before_any_replay() {
+        let now = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, now);
+        controller.report_at(report(ReportState::Idle, 0), now);
+        let prepared = controller
+            .prepare_command_at(ApiCommand::Start(config()), now)
+            .expect("Start token");
+        let late = now + REPORT_FRESHNESS_TIMEOUT;
+        assert!(!controller.commit_command_at(prepared, None, late));
+        controller.report_at(report(ReportState::Idle, 10), late + Duration::from_secs(1));
+        let device = controller.device.clone();
+        let test = controller.test.clone();
+        let fence = controller.report_not_before;
+        assert!(!controller.commit_command_at(prepared, None, late + Duration::from_secs(2)));
+        assert_eq!(
+            controller.device, device,
+            "retired completion cannot revoke recovered knowledge"
+        );
+        assert_eq!(controller.test, test);
+        assert_eq!(controller.report_not_before, fence);
+    }
+
+    #[test]
+    fn delayed_command_commits_cannot_restore_revoked_authority() {
+        let t0 = Instant::now();
+        let late = t0 + REPORT_FRESHNESS_TIMEOUT;
+        for command in [
+            ApiCommand::Start(config()),
+            ApiCommand::Resume,
+            ApiCommand::Adjust(config()),
+            ApiCommand::Calibration(CalibrationCommand::VoltageLow(1000)),
+        ] {
+            let mut controller = connected_at(ControllerMode::Server, t0);
+            controller.report_at(report(ReportState::Idle, 0), t0);
+            if matches!(command, ApiCommand::Resume | ApiCommand::Adjust(_)) {
+                commit_at(&mut controller, ApiCommand::Start(config()), t0);
+                controller.report_at(report(ReportState::Active, 0), t0);
+                if command == ApiCommand::Resume {
+                    commit_at(&mut controller, ApiCommand::Stop, t0);
+                    controller.report_at(report(ReportState::Idle, 0), t0);
+                }
+            }
+            let prepared = controller
+                .prepare_command_at(command, t0)
+                .expect("prepare before gap");
+            controller.expire_report_freshness(late);
+            // A restored observation does not reauthorize the old prepared write.
+            controller.report_at(report(ReportState::Idle, 0), late);
+            assert!(controller.validate_prepared_at(prepared, late).is_err());
+            assert!(!controller.commit_command_at(prepared, None, late));
+            if matches!(command, ApiCommand::Adjust(_) | ApiCommand::Calibration(_)) {
+                // These writes do not establish a lifecycle fence. The recovered
+                // Idle is independent valid knowledge, not renewed ownership.
+                assert!(controller.device.activity_known);
+                assert_eq!(controller.physical_state(), PhysicalState::Inactive);
+            } else {
+                assert!(!controller.device.activity_known);
+            }
+            assert!(!controller.is_running_owned());
+            assert_eq!(controller.calibration_staging.references, [false; 4]);
+            if matches!(command, ApiCommand::Start(_) | ApiCommand::Resume) {
+                assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+                assert_eq!(
+                    controller.test.result.as_deref(),
+                    Some(REPORT_TIMEOUT_REASON)
+                );
+                assert!(
+                    controller
+                        .report_at(report(ReportState::Active, 1), late)
+                        .1
+                        .is_none()
+                );
+                assert!(!controller.is_running_owned());
+            }
+        }
+    }
+
+    #[test]
+    fn no_frame_stop_cannot_commit_after_expiry_in_either_mode() {
+        let t0 = Instant::now();
+        let boundary = t0 + REPORT_FRESHNESS_TIMEOUT;
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            let mut controller = connected_at(mode, t0);
+            controller.report_at(report(ReportState::Idle, 0), t0);
+            commit_at(&mut controller, ApiCommand::Start(config()), t0);
+            controller.report_at(report(ReportState::Active, 0), t0);
+            let first = controller
+                .prepare_command_at(ApiCommand::Stop, t0)
+                .expect("first Stop");
+            assert!(matches!(first.frame(), Some(OutboundFrame::Stop)));
+            assert!(controller.commit_command_at(first, None, t0));
+            let before = t0 + REPORT_FRESHNESS_TIMEOUT.saturating_sub(Duration::from_nanos(1));
+            let repeated = controller
+                .prepare_command_at(ApiCommand::Stop, before)
+                .expect("repeated Stop");
+            assert!(repeated.frame().is_none());
+            assert!(controller.commit_command_at(repeated, None, before));
+            assert_eq!(controller.test.state, TestState::Stopping);
+            let repeated = controller
+                .prepare_command_at(ApiCommand::Stop, before)
+                .expect("new no-frame attempt at the same deadline");
+            assert!(!controller.commit_command_at(repeated, None, boundary));
+            assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+            assert_eq!(
+                controller.test.result.as_deref(),
+                Some(REPORT_TIMEOUT_REASON)
+            );
+            assert!(!controller.device.activity_known);
+            assert_eq!(controller.physical_state(), PhysicalState::Unknown);
+            assert!(!controller.expire_report_freshness(boundary));
+            let test = controller.test.clone();
+            assert!(!controller.commit_command_at(repeated, None, boundary));
+            assert_eq!(controller.test, test);
+            let retry = controller
+                .prepare_command_at(ApiCommand::Stop, boundary)
+                .expect("new safety Stop");
+            assert!(matches!(retry.frame(), Some(OutboundFrame::Stop)));
+            assert!(controller.validate_prepared_at(retry, boundary).is_ok());
+            assert!(controller.commit_command_at(retry, None, boundary));
+            assert_eq!(controller.test.state, TestState::Stopping);
+            assert!(!controller.stopping_owns_metrics);
+            assert!(!controller.device.activity_known);
+        }
+    }
+
+    #[test]
+    fn prepared_commands_are_connection_scoped_but_safety_stop_survives_report_expiry() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        let old_start = controller
+            .prepare_command_at(ApiCommand::Start(config()), t0)
+            .expect("start");
+        controller.begin_connection("reconnect");
+        controller.connection_established_at(t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        assert!(controller.validate_prepared_at(old_start, t0).is_err());
+        let replacement = controller.test.clone();
+        assert!(!controller.commit_command_at(old_start, None, t0));
+        assert_eq!(
+            controller.test, replacement,
+            "old completion must not mutate replacement"
+        );
+        controller.report_at(report(ReportState::Active, 0), t0);
+        let stop = controller
+            .prepare_command_at(ApiCommand::Stop, t0)
+            .expect("Stop");
+        assert!(controller.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT));
+        assert!(
+            controller
+                .validate_prepared_at(stop, t0 + REPORT_FRESHNESS_TIMEOUT)
+                .is_ok()
+        );
+        assert!(controller.commit_command_at(stop, None, t0 + REPORT_FRESHNESS_TIMEOUT));
+        assert_eq!(controller.test.state, TestState::Stopping);
+        assert!(!controller.stopping_owns_metrics);
+        assert!(!controller.device.activity_known);
+    }
+
+    #[test]
+    fn running_timeout_revokes_metrics_and_recovery_never_reclaims_ownership() {
+        let t0 = Instant::now();
+        for mode in [ControllerMode::Server, ControllerMode::Direct] {
+            for recovered in [ReportState::Active, ReportState::Idle] {
+                let mut controller = connected_at(mode, t0);
+                controller.report_at(report(ReportState::Idle, 0), t0);
+                commit_at(&mut controller, ApiCommand::Start(config()), t0);
+                assert!(
+                    controller
+                        .report_at(report(ReportState::Active, 10), t0)
+                        .1
+                        .is_some()
+                );
+                assert!(controller.is_running_owned());
+                let capacity = controller.test.capacity_mah;
+                let energy = controller.test.energy_wh;
+                assert!(controller.expire_report_freshness(t0 + Duration::from_secs(65)));
+                assert!(!controller.is_running_owned());
+                assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+                assert_eq!(
+                    controller.test.result.as_deref(),
+                    Some(REPORT_TIMEOUT_REASON)
+                );
+                assert_eq!(
+                    controller.test.elapsed_seconds,
+                    REPORT_FRESHNESS_TIMEOUT.as_secs()
+                );
+                assert!(
+                    controller
+                        .prepare_command_at(ApiCommand::Stop, t0 + Duration::from_secs(65))
+                        .is_ok()
+                );
+                assert!(
+                    controller
+                        .report_at(report(recovered, 50), t0 + Duration::from_secs(100))
+                        .1
+                        .is_none()
+                );
+                assert!(controller.device.activity_known);
+                assert!(!controller.is_running_owned());
+                assert_eq!(controller.test.capacity_mah, capacity);
+                assert!((controller.test.energy_wh - energy).abs() < f64::EPSILON);
+                assert_eq!(
+                    controller.test.elapsed_seconds,
+                    REPORT_FRESHNESS_TIMEOUT.as_secs()
+                );
+                assert_eq!(
+                    controller.test.state,
+                    if recovered == ReportState::Active {
+                        TestState::RecoveredUncertain
+                    } else {
+                        TestState::Stopped
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_report_after_event_loop_pause_expires_before_consumption() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut controller, ApiCommand::Start(config()), t0);
+        controller.report_at(report(ReportState::Active, 0), t0);
+        assert!(
+            controller
+                .report_at(
+                    report(ReportState::Active, 100),
+                    t0 + REPORT_FRESHNESS_TIMEOUT
+                )
+                .1
+                .is_none()
+        );
+        assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+    }
+
+    #[test]
+    fn starting_and_stopping_silence_never_fabricate_confirmation() {
+        let t0 = Instant::now();
+        for stopping in [false, true] {
+            let mut controller = connected_at(ControllerMode::Server, t0);
+            controller.report_at(report(ReportState::Idle, 0), t0);
+            commit_at(&mut controller, ApiCommand::Start(config()), t0);
+            if stopping {
+                controller.report_at(report(ReportState::Active, 0), t0);
+                commit_at(&mut controller, ApiCommand::Stop, t0);
+            }
+            assert!(controller.expire_report_freshness(t0 + REPORT_FRESHNESS_TIMEOUT));
+            assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+            assert!(
+                controller
+                    .prepare_command_at(ApiCommand::Stop, t0 + REPORT_FRESHNESS_TIMEOUT)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn command_age_gates_work_even_before_periodic_expiry() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        let stale = t0 + REPORT_FRESHNESS_TIMEOUT;
+        assert!(controller.device.activity_known); // no tick has run
+        for command in [
+            ApiCommand::Start(config()),
+            ApiCommand::Calibration(CalibrationCommand::VoltageLow(1000)),
+            ApiCommand::Calibration(CalibrationCommand::Confirm),
+        ] {
+            assert!(controller.prepare_command_at(command, stale).is_err());
+        }
+        commit_at(&mut controller, ApiCommand::Start(config()), t0);
+        controller.report_at(report(ReportState::Active, 0), t0);
+        for command in [
+            ApiCommand::Adjust(config()),
+            ApiCommand::Calibration(CalibrationCommand::CurrentLow(100)),
+        ] {
+            assert!(controller.prepare_command_at(command, stale).is_err());
+        }
+        assert!(
+            controller
+                .prepare_command_at(ApiCommand::Stop, stale)
+                .is_ok()
+        );
+        commit_at(&mut controller, ApiCommand::Stop, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        assert!(
+            controller
+                .prepare_command_at(ApiCommand::Resume, stale)
+                .is_err()
+        );
+        assert!(controller.prepare_resume_at(config(), stale).is_err());
+    }
+
+    #[test]
+    fn new_connection_cannot_inherit_report_deadline_or_authority() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        let generation = controller.connection_generation;
+        controller.begin_connection("reconnect");
+        assert_eq!(controller.report_freshness_deadline, None);
+        controller.connection_established_at(t0 + Duration::from_secs(1));
+        assert_ne!(controller.connection_generation, generation);
+        assert!(
+            !controller
+                .capabilities_at(t0 + Duration::from_secs(1))
+                .start
+        );
+        controller.report_at(report(ReportState::Idle, 0), t0 + Duration::from_secs(2));
+        assert!(
+            controller
+                .capabilities_at(t0 + Duration::from_secs(2))
+                .start
+        );
+        controller.disconnect("disconnect");
+        controller.report_at(report(ReportState::Idle, 0), t0 + Duration::from_secs(3));
+        assert_eq!(controller.report_freshness_deadline, None);
+        assert!(!controller.device.activity_known);
+    }
+
+    #[test]
+    fn timeout_breaks_energy_gap_until_explicit_owned_resume() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut controller, ApiCommand::Start(config()), t0);
+        controller.report_at(report(ReportState::Active, 0), t0); // A
+        controller.report_at(report(ReportState::Active, 1), t0 + Duration::from_secs(2)); // B
+        let energy = controller.test.energy_wh;
+        assert!((energy - 4.0 * 2.0 / 3600.0).abs() < f64::EPSILON);
+        assert!(controller.expire_report_freshness(t0 + Duration::from_secs(12)));
+        assert!(controller.energy.previous.is_none());
+        controller.report_at(
+            report(ReportState::Active, 40),
+            t0 + Duration::from_secs(100),
+        ); // C
+        controller.report_at(
+            report(ReportState::Active, 41),
+            t0 + Duration::from_secs(102),
+        );
+        assert!((controller.test.energy_wh - energy).abs() < f64::EPSILON);
+        controller.report_at(report(ReportState::Idle, 41), t0 + Duration::from_secs(103));
+        commit_at(
+            &mut controller,
+            ApiCommand::Resume,
+            t0 + Duration::from_secs(103),
+        );
+        controller.report_at(
+            report(ReportState::Active, 42),
+            t0 + Duration::from_secs(104),
+        );
+        assert!((controller.test.energy_wh - energy).abs() < f64::EPSILON);
+        controller.report_at(
+            report(ReportState::Active, 43),
+            t0 + Duration::from_secs(106),
+        );
+        assert!((controller.test.energy_wh - energy * 2.0).abs() < f64::EPSILON);
+        assert_eq!(controller.test.capacity_mah, Some(3));
+    }
+
+    #[test]
+    fn timer_sync_checks_age_and_requires_explicit_ownership_after_recovery() {
+        let t0 = Instant::now();
+        let mut controller = connected_at(ControllerMode::Server, t0);
+        controller.report_at(report(ReportState::Idle, 0), t0);
+        commit_at(&mut controller, ApiCommand::Start(config()), t0);
+        controller.report_at(report(ReportState::Active, 0), t0);
+        controller.clock.accumulated = Duration::from_secs(49);
+        assert_eq!(
+            controller.next_timer_sync_at(t0 + Duration::from_secs(9)),
+            None
+        );
+        assert_eq!(
+            controller.next_timer_sync_at(t0 + Duration::from_secs(11)),
+            None
+        );
+        controller.expire_report_freshness(t0 + Duration::from_secs(11));
+        controller.report_at(report(ReportState::Active, 2), t0 + Duration::from_secs(12));
+        assert_eq!(
+            controller.next_timer_sync_at(t0 + Duration::from_secs(12)),
+            None
+        );
+        controller.report_at(report(ReportState::Idle, 2), t0 + Duration::from_secs(13));
+        commit_at(
+            &mut controller,
+            ApiCommand::Resume,
+            t0 + Duration::from_secs(13),
+        );
+        controller.report_at(report(ReportState::Active, 3), t0 + Duration::from_secs(14));
+        assert_eq!(
+            controller.next_timer_sync_at(t0 + Duration::from_secs(15)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn start_and_resume_ignore_buffered_inactive_until_active() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Idle, 50));
+        controller.report(report(ReportState::InactiveUnknown, 50));
+        assert_eq!(controller.test.state, TestState::Starting);
+        assert_eq!(controller.test.capacity_mah, None);
+        controller.report(report(ReportState::Active, 1));
+        assert_eq!(controller.test.state, TestState::Running);
+
+        commit(&mut controller, ApiCommand::Stop);
+        controller.report(report(ReportState::Idle, 1));
+        commit(&mut controller, ApiCommand::Resume);
+        controller.report(report(ReportState::Idle, 1));
+        assert_eq!(controller.test.state, TestState::Starting);
+        controller.report(report(ReportState::Active, 2));
+        assert_eq!(controller.test.state, TestState::Running);
+    }
+
+    #[test]
+    fn normal_report_states_preserve_terminal_meaning() {
+        for (state, expected) in [
+            (ReportState::Idle, TestState::Stopped),
+            (ReportState::Finished, TestState::Completed),
+        ] {
+            let mut controller = controller();
+            commit(&mut controller, ApiCommand::Start(config()));
+            controller.report(report(ReportState::Active, 1));
+            controller.report(report(state, 2));
+            assert_eq!(controller.test.state, expected);
+        }
+
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        controller.report(report(ReportState::InactiveUnknown, 2));
+        assert_eq!(controller.test.state, TestState::Running);
+    }
+
+    #[test]
+    fn observation_gap_revokes_ownership_and_timer_sync() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        assert_eq!(controller.next_timer_sync(), None);
+        controller.report(report(ReportState::Active, 1));
+        controller.clock.accumulated = Duration::from_secs(60);
+        assert_eq!(controller.next_timer_sync(), Some(1));
+        controller.invalidate_for_gap("gap");
+        assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+        assert_eq!(controller.next_timer_sync(), None);
+    }
+
+    #[test]
+    fn running_state_command_write_failures_are_explicitly_uncertain() {
+        let mut start = controller();
+        start.command_write_failed(CommandKind::Start, "injected failure");
+        assert_eq!(start.test.state, TestState::RecoveredUncertain);
+        assert!(
+            start
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("start outcome is unknown"))
+        );
+
+        let mut resume = controller();
+        commit(&mut resume, ApiCommand::Start(config()));
+        resume.report(report(ReportState::Active, 1));
+        commit(&mut resume, ApiCommand::Stop);
+        resume.report(report(ReportState::Idle, 1));
+        resume.command_write_failed(CommandKind::Resume, "injected failure");
+        assert_eq!(resume.test.state, TestState::RecoveredUncertain);
+        assert!(
+            resume
+                .test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resume outcome is unknown"))
+        );
+
+        let mut stop = controller();
+        commit(&mut stop, ApiCommand::Start(config()));
+        stop.report(report(ReportState::Active, 1));
+        stop.command_write_failed(CommandKind::Stop, "injected failure");
+        assert_eq!(stop.test.state, TestState::RecoveredUncertain);
+        assert!(
+            stop.test
+                .result
+                .as_deref()
+                .is_some_and(|reason| reason.contains("stop outcome is unknown"))
+        );
+    }
+
+    #[test]
+    fn failed_adjust_and_calibration_writes_revoke_trust_without_committing() {
+        let mut adjust = controller();
+        commit(&mut adjust, ApiCommand::Start(config()));
+        adjust.report(report(ReportState::Active, 1));
+        let original = adjust.test.config;
+        adjust.command_write_failed(CommandKind::Adjust, "injected failure");
+        assert_eq!(adjust.test.state, TestState::RecoveredUncertain);
+        assert_eq!(adjust.test.config, original);
+        assert!(!adjust.connected);
+        assert!(!adjust.device.activity_known);
+
+        let mut calibration = controller();
+        commit(
+            &mut calibration,
+            ApiCommand::Calibration(CalibrationCommand::VoltageLow(1000)),
+        );
+        assert!(calibration.calibration_staging.references[0]);
+        calibration.command_write_failed(CommandKind::Calibration, "injected failure");
+        assert_eq!(
+            calibration.calibration_staging.references,
+            [false, false, false, false]
+        );
+        assert!(!calibration.connected);
+        assert!(!calibration.device.activity_known);
+    }
+
+    #[test]
+    fn timer_sync_stops_at_canonical_bound() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        controller.clock.accumulated =
+            Duration::from_secs(u64::from(device::MAX_TIMER_SYNC_MINUTES) * 60);
+        assert_eq!(
+            controller.next_timer_sync(),
+            Some(device::MAX_TIMER_SYNC_MINUTES)
+        );
+        controller.clock.accumulated += Duration::from_secs(60);
+        assert_eq!(controller.next_timer_sync(), None);
+    }
+
+    #[test]
+    fn capacity_wraps_only_with_owned_metrics_and_ignores_stale_values() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 57_590));
+        controller.report(report(ReportState::Active, 5));
+        assert_eq!(controller.test.capacity_mah, Some(57_605));
+        controller.report(report(ReportState::Active, 4));
+        assert_eq!(controller.test.capacity_mah, Some(57_605));
+    }
+
+    #[test]
+    fn energy_integration_is_deterministic_and_uses_trapezoids() {
+        let mut energy = EnergyAccumulator {
+            energy_wh: 0.0,
+            previous: None,
+        };
+        assert!((energy.add(0.0, 10_000, 1_000) - 0.0).abs() < f64::EPSILON);
+        assert!((energy.add(3600.0, 10_000, 2_000) - 15.0).abs() < f64::EPSILON);
+        assert!((energy.add(3600.0, 10_000, 3_000) - 15.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn capacity_supports_multiple_wraps_and_uncertain_recovery() {
+        let mut capacity = CapacityAccumulator {
+            capacity_mah: 0,
+            previous_raw: None,
+        };
+        capacity.observe(0, true);
+        for _ in 0..5 {
+            capacity.observe(57_599, true);
+            capacity.observe(0, true);
+        }
+        assert_eq!(capacity.capacity_mah, 288_000);
+
+        let mut uncertain = CapacityAccumulator {
+            capacity_mah: 57_599,
+            previous_raw: Some(57_599),
+        };
+        assert_eq!(uncertain.observe(2, false), 57_599);
+        assert_eq!(uncertain.observe(12, false), 57_609);
+    }
+
+    #[test]
+    fn reconnect_requires_a_new_report_before_commands() {
+        let mut controller = controller();
+        assert!(controller.capabilities().start);
+        assert!(
+            controller
+                .prepare_command(ApiCommand::Calibration(CalibrationCommand::VoltageLow(
+                    1000
+                )))
+                .is_ok()
+        );
+
+        controller.begin_connection("reconnect");
+        controller.connection_established();
+        assert!(!controller.capabilities().start);
+        assert!(
+            controller
+                .prepare_command(ApiCommand::Calibration(CalibrationCommand::VoltageLow(
+                    1000
+                )))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovered_active_stays_uncertain_until_inactive() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        let (_, owned) = controller.report(report(ReportState::Active, 10));
+        assert!(owned.is_some());
+        controller.clock.accumulated = Duration::from_secs(49);
+        controller.update_elapsed();
+        let owned_elapsed = controller.test.elapsed_seconds;
+        let owned_capacity = controller.test.capacity_mah;
+        let owned_energy = controller.test.energy_wh;
+        controller.invalidate_for_gap("serial gap");
+        controller.begin_connection("reconnect");
+        controller.connection_established();
+
+        let mut first_unowned = report(ReportState::Active, 20);
+        first_unowned.voltage_mv = 3900;
+        first_unowned.current_ma = 900;
+        let (_, measurement) = controller.report(first_unowned);
+        assert!(measurement.is_none());
+        assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+        assert_eq!(controller.device.voltage_mv, Some(3900));
+        assert_eq!(controller.device.current_ma, Some(900));
+        assert_eq!(controller.device.capacity_mah, Some(20));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        let mut second_unowned = report(ReportState::Active, 30);
+        second_unowned.voltage_mv = 3800;
+        second_unowned.current_ma = 800;
+        let (_, measurement) = controller.report(second_unowned);
+        assert!(measurement.is_none());
+        assert_eq!(controller.device.voltage_mv, Some(3800));
+        assert_eq!(controller.device.current_ma, Some(800));
+        assert_eq!(controller.device.capacity_mah, Some(30));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+        assert_eq!(controller.next_timer_sync(), None);
+        assert!(
+            controller
+                .prepare_command(ApiCommand::Start(config()))
+                .is_err()
+        );
+
+        controller.report(report(ReportState::Idle, 40));
+        assert_eq!(controller.test.state, TestState::Stopped);
+        assert_eq!(controller.device.capacity_mah, Some(40));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+        assert!(controller.capabilities().start);
+
+        controller.report(report(ReportState::Idle, 50));
+        assert_eq!(controller.device.capacity_mah, Some(50));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        commit(&mut controller, ApiCommand::Resume);
+        let (_, resumed) = controller.report(report(ReportState::Active, 51));
+        assert!(resumed.is_some());
+        assert_eq!(
+            controller.test.capacity_mah,
+            owned_capacity.map(|capacity| capacity + 1)
+        );
+    }
+
+    #[test]
+    fn stop_from_uncertain_state_preserves_last_owned_metrics() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.clock.accumulated = Duration::from_secs(49);
+        let (_, owned) = controller.report(report(ReportState::Active, 13));
+        assert!(owned.is_some());
+        let owned_elapsed = controller.test.elapsed_seconds;
+        let owned_capacity = controller.test.capacity_mah;
+        let owned_energy = controller.test.energy_wh;
+
+        controller.invalidate_for_gap("serial gap");
+        controller.begin_connection("reconnect");
+        controller.connection_established();
+        for capacity in [40, 45] {
+            let (_, measurement) = controller.report(report(ReportState::Active, capacity));
+            assert!(measurement.is_none());
+        }
+        assert_eq!(controller.test.state, TestState::RecoveredUncertain);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+
+        commit(&mut controller, ApiCommand::Stop);
+        assert_eq!(controller.test.state, TestState::Stopping);
+        let (outcome, measurement) = controller.report(report(ReportState::Idle, 50));
+
+        assert!(outcome.transitioned_to_inactive);
+        assert!(measurement.is_none());
+        assert_eq!(controller.test.state, TestState::Stopped);
+        assert_eq!(
+            controller.test.result.as_deref(),
+            Some("stop confirmed by hardware")
+        );
+        assert_eq!(controller.device.capacity_mah, Some(50));
+        assert_eq!(controller.test.elapsed_seconds, owned_elapsed);
+        assert_eq!(controller.test.capacity_mah, owned_capacity);
+        assert!((controller.test.energy_wh - owned_energy).abs() < f64::EPSILON);
+
+        commit(&mut controller, ApiCommand::Resume);
+        let (_, resumed) = controller.report(report(ReportState::Active, 51));
+        assert!(resumed.is_some());
+        assert_eq!(
+            controller.test.capacity_mah,
+            owned_capacity.map(|capacity| capacity + 1)
+        );
+    }
+
+    #[test]
+    fn stop_from_owned_run_accounts_final_inactive_capacity() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        let (_, owned) = controller.report(report(ReportState::Active, 57_599));
+        assert!(owned.is_some());
+
+        commit(&mut controller, ApiCommand::Stop);
+        assert_eq!(controller.test.state, TestState::Stopping);
+        let (outcome, measurement) = controller.report(report(ReportState::Idle, 2));
+
+        assert!(outcome.transitioned_to_inactive);
+        assert!(measurement.is_none());
+        assert_eq!(controller.test.state, TestState::Stopped);
+        assert_eq!(controller.device.capacity_mah, Some(2));
+        assert_eq!(controller.test.capacity_mah, Some(57_602));
+    }
+
+    #[test]
+    fn authoritative_stopped_replacement_rebases_continue_metrics() {
+        let mut controller = controller();
+        controller.replace_authoritative(
+            true,
+            DeviceState {
+                mode: Some(DeviceMode::DischargeConstantCurrent),
+                activity_known: true,
+                active: false,
+                voltage_mv: Some(3_800),
+                current_ma: Some(0),
+                capacity_mah: Some(50),
+                ..DeviceState::default()
+            },
+            TestStatus {
+                state: TestState::Stopped,
+                config: Some(config()),
+                elapsed_seconds: 49,
+                capacity_mah: Some(10),
+                energy_wh: 0.25,
+                ..TestStatus::default()
+            },
+        );
+
+        commit(&mut controller, ApiCommand::Resume);
+        let (_, measurement) = controller.report(report(ReportState::Active, 51));
+
+        assert!(measurement.is_some());
+        assert_eq!(controller.test.capacity_mah, Some(11));
+        assert!((controller.test.energy_wh - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn first_active_report_confirms_start_even_with_zero_current() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        let mut active = report(ReportState::Active, 1);
+        active.current_ma = 0;
+
+        let (_, measurement) = controller.report(active);
+
+        assert_eq!(controller.test.state, TestState::Running);
+        assert_eq!(measurement.expect("owned measurement").current_ma, 0);
+    }
+
+    #[test]
+    fn completed_remains_latched_through_following_idle_report() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        controller.report(report(ReportState::Finished, 2));
+        let mut idle = report(ReportState::Idle, 2);
+        idle.current_ma = 1_000;
+
+        controller.report(idle);
+
+        assert_eq!(controller.test.state, TestState::Completed);
+    }
+
+    #[test]
+    fn stop_confirmation_does_not_require_zero_current() {
+        let mut controller = controller();
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        commit(&mut controller, ApiCommand::Stop);
+        let mut idle = report(ReportState::Idle, 2);
+        idle.current_ma = 1_000;
+
+        controller.report(idle);
+
+        assert_eq!(controller.test.state, TestState::Stopped);
+    }
+
+    #[test]
+    fn server_confirmation_requires_all_staged_calibration_values() {
+        let mut controller = controller();
+        for command in [
+            CalibrationCommand::VoltageLow(1000),
+            CalibrationCommand::VoltageHigh(4000),
+        ] {
+            commit(&mut controller, ApiCommand::Calibration(command));
+        }
+        assert!(
+            controller
+                .prepare_command(ApiCommand::Calibration(CalibrationCommand::Confirm))
+                .is_err()
+        );
+
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        for command in [
+            CalibrationCommand::CurrentLow(500),
+            CalibrationCommand::CurrentHigh(2000),
+        ] {
+            commit(&mut controller, ApiCommand::Calibration(command));
+        }
+        assert!(
+            controller
+                .prepare_command(ApiCommand::Calibration(CalibrationCommand::Confirm))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn direct_resume_uses_the_supplied_current_settings() {
+        let mut controller = TestController::new(ControllerMode::Direct);
+        controller.begin_connection("connect");
+        controller.connection_established();
+        controller.report(report(ReportState::Idle, 0));
+        commit(&mut controller, ApiCommand::Start(config()));
+        controller.report(report(ReportState::Active, 1));
+        commit(&mut controller, ApiCommand::Stop);
+        controller.report(report(ReportState::Idle, 1));
+
+        let updated = TestConfiguration::DischargeConstantPower {
+            power_w: 25,
+            cutoff_voltage_mv: 3200,
+            cutoff_time_min: 30,
+        };
+        let prepared = controller
+            .prepare_resume(updated)
+            .expect("prepare resume with current form settings");
+        let actual: [u8; device::OUTBOUND_FRAME_SIZE] =
+            prepared.frame().expect("resume frame").into();
+        let expected: [u8; device::OUTBOUND_FRAME_SIZE] = test_frame(&updated, true).into();
+        assert_eq!(actual, expected);
+        assert!(controller.commit_command(prepared, None));
+        let mut active = report(ReportState::Active, 2);
+        active.mode = updated.mode();
+        assert!(controller.report(active).1.is_some());
+        assert_eq!(controller.test().config, Some(updated));
+    }
+}
